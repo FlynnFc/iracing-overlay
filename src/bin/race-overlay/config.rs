@@ -52,9 +52,6 @@ pub struct OverlayConfig {
     /// Settings for the Radar Bars widget.
     #[serde(default)]
     pub radar: RadarConfig,
-    /// Settings for the Pit Stall widget.
-    #[serde(default)]
-    pub pit_stall: PitStallConfig,
     /// Settings for the Faster Class widget.
     #[serde(default)]
     pub faster_class: FasterClassConfig,
@@ -208,7 +205,6 @@ impl OverlayConfig {
             Panel::Relative => self.relative.visible,
             Panel::Standings => self.standings.visible,
             Panel::RadarBars => self.radar.visible,
-            Panel::PitStall => self.pit_stall.visible,
             Panel::FasterClass => self.faster_class.visible,
         }
     }
@@ -224,13 +220,11 @@ impl OverlayConfig {
         self.relative.pos = default_pos();
         self.standings.pos = default_standings_pos();
         self.radar.pos = default_radar_pos();
-        self.pit_stall.pos = default_pit_stall_pos();
         self.faster_class.pos = default_faster_class_pos();
         for watch_pos in [
             &mut self.relative.watch_pos,
             &mut self.standings.watch_pos,
             &mut self.radar.watch_pos,
-            &mut self.pit_stall.watch_pos,
             &mut self.faster_class.watch_pos,
         ] {
             *watch_pos = None;
@@ -244,15 +238,9 @@ impl OverlayConfig {
     /// there is only one layout and nothing to explain.
     #[must_use]
     pub fn has_watch_layout(&self) -> bool {
-        [
-            self.relative.watch_pos,
-            self.standings.watch_pos,
-            self.radar.watch_pos,
-            self.pit_stall.watch_pos,
-            self.faster_class.watch_pos,
-        ]
-        .iter()
-        .any(Option::is_some)
+        [self.relative.watch_pos, self.standings.watch_pos, self.radar.watch_pos, self.faster_class.watch_pos]
+            .iter()
+            .any(Option::is_some)
     }
 
     /// The `visible` flag of one panel, for the tray menu to flip.
@@ -261,7 +249,6 @@ impl OverlayConfig {
             Panel::Relative => &mut self.relative.visible,
             Panel::Standings => &mut self.standings.visible,
             Panel::RadarBars => &mut self.radar.visible,
-            Panel::PitStall => &mut self.pit_stall.visible,
             Panel::FasterClass => &mut self.faster_class.visible,
         }
     }
@@ -424,7 +411,6 @@ impl Default for OverlayConfig {
             relative: RelativeConfig::default(),
             standings: StandingsConfig::default(),
             radar: RadarConfig::default(),
-            pit_stall: PitStallConfig::default(),
             faster_class: FasterClassConfig::default(),
             only_show_when_iracing_focused: default_true(),
             iracing_process_name: default_iracing_process_name(),
@@ -918,8 +904,8 @@ pub struct StandingsConfig {
     /// Size multiplier for this panel — see [`default_scale`].
     #[serde(default = "default_scale")]
     pub scale: f32,
-    /// Whether to show the endurance columns — current stint, stops still
-    /// owed, and measured pit-stop times. The strategy line across the
+    /// Whether to show the endurance columns — current stint, completed
+    /// pit stops, and projected net position. The strategy line across the
     /// card's foot — laps left, stops to go, net position — shows in every
     /// race whatever this is set to.
     #[serde(default)]
@@ -1092,40 +1078,6 @@ fn default_radar_bar_gap() -> f32 {
     465.0
 }
 
-/// Settings for the Pit Stall widget.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PitStallConfig {
-    /// Top-left window position, in screen pixels.
-    #[serde(default = "default_pit_stall_pos")]
-    pub pos: [f32; 2],
-    /// Position while watching — see [`RelativeConfig::watch_pos`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub watch_pos: Option<[f32; 2]>,
-    /// There is nothing to opt out of in the usual case — the widget hides
-    /// itself for all but a few seconds a stop — so this defaults on.
-    #[serde(default = "default_true")]
-    pub visible: bool,
-    /// What an empty bar means, in metres from the perfect stopping point.
-    /// See [`DEFAULT_RANGE_M`].
-    #[serde(default = "default_pit_stall_range_m")]
-    pub range_m: f32,
-    /// Size multiplier for this panel — see [`default_scale`].
-    #[serde(default = "default_scale")]
-    pub scale: f32,
-}
-
-impl Default for PitStallConfig {
-    fn default() -> Self {
-        Self {
-            pos: default_pit_stall_pos(),
-            watch_pos: None,
-            visible: true,
-            range_m: default_pit_stall_range_m(),
-            scale: default_scale(),
-        }
-    }
-}
-
 /// Settings for the Faster Class widget — see `plans/faster-class.md`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FasterClassConfig {
@@ -1189,43 +1141,6 @@ fn default_alert_secs() -> f32 {
 /// what persists.
 fn default_faster_class_pos() -> [f32; 2] {
     [900.0, 60.0]
-}
-
-/// How far from the marks an empty Pit Stall bar means, in metres.
-///
-/// Shorter than the range the widget appears at, deliberately. The bar is a
-/// closeness gauge rather than a position on the lane, and the fill is linear,
-/// so this figure is the zoom: the box's own band is its half-width against
-/// this — the top twenty-fifth of the capsule at the default. Stretched to the
-/// full appearance range instead, that band would be a sixtieth of the bar and
-/// the last few metres, which are the only ones a driver is placing the car in,
-/// would be a sliver.
-///
-/// Set against `pit_stall::APPEAR_RANGE_M` so the level is already moving
-/// through most of the time the bar is on screen: the widget arrives empty and
-/// settled, then starts rising well before the braking point rather than
-/// waiting until the car is nearly parked. Raise it for a bar that starts
-/// moving sooner still, lower it for one that magnifies the final metre.
-///
-/// The bar's own height does not change with this, so raising it slows the
-/// fill: the same capsule now spans twice the lane it used to, and the level
-/// creeps up rather than jumping through the last stalls.
-pub const DEFAULT_RANGE_M: f32 = 50.0;
-
-/// See [`DEFAULT_RANGE_M`].
-fn default_pit_stall_range_m() -> f32 {
-    DEFAULT_RANGE_M
-}
-
-/// Right of centre on a common 1920x1080 display, clear of the other panels.
-///
-/// A tall capsule needs a column rather than a strip, and the right-hand side
-/// keeps it off the Relative and Standings stack on the left while staying
-/// inboard of the screen edge, where a driver looking at their crew would
-/// still catch it. A one-time seed like every panel position: wherever it is
-/// dragged to is what persists.
-fn default_pit_stall_pos() -> [f32; 2] {
-    [1680.0, 240.0]
 }
 
 // Relative and Standings are stacked in the same left-hand column with a
@@ -1522,6 +1437,16 @@ mod tests {
         assert!((cfg.radar.pos[0] - 10.0).abs() < f32::EPSILON);
         assert!((cfg.radar.range_ms - 500.0).abs() < f32::EPSILON);
         assert!((cfg.radar.car_length_m - 4.7).abs() < f32::EPSILON);
+    }
+
+    /// Retired widget settings are ignored so an existing configuration keeps
+    /// every still-supported panel instead of failing to load.
+    #[test]
+    fn configs_with_the_retired_pit_stall_section_still_load() {
+        let cfg: OverlayConfig = toml::from_str("[relative]\nwidth = 812.0\n[pit_stall]\npos = [10.0, 20.0]\nvisible = false\nrange_m = 25.0\n")
+            .expect("retired widget settings must be ignored");
+        assert!((cfg.relative.width - 812.0).abs() < f32::EPSILON);
+        assert!(cfg.standings.visible);
     }
 
     /// The overlay writes panel positions and `--bind` writes binds, each

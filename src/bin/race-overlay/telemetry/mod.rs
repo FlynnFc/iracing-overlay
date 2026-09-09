@@ -9,7 +9,6 @@ pub mod irating;
 pub mod net_position;
 pub mod pit;
 pub mod pit_model;
-pub mod pit_stall;
 pub mod pit_window;
 pub mod race_plan;
 pub mod radar;

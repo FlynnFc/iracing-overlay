@@ -25,7 +25,6 @@ $panels = @{
   standings   = 'standings'
   radar       = 'radar'
   fasterclass = 'faster_class'
-  pitstall    = 'pit_stall'
 }
 
 function Write-ShotConfig {
@@ -160,8 +159,6 @@ try {
   Invoke-Shot -Name 'radar-default'       -Panel radar -Scale 0.6
   Invoke-Shot -Name 'radar-numbers'       -Panel radar -Scale 0.6 -PanelLines "show_numbers = true"
   Invoke-Shot -Name 'fasterclass-default' -Panel fasterclass
-  Invoke-Shot -Name 'pitstall-approach'   -Panel pitstall -State 'pitroad'
-  Invoke-Shot -Name 'pitstall-inbox'      -Panel pitstall -State 'inbox'
 
   # --- Themes --------------------------------------------------------------
   Invoke-Shot -Name 'theme-panel'      -Panel relative -Top "theme = 'panel'"

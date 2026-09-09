@@ -120,7 +120,6 @@ pub fn find_asset_dir(name: &str) -> Option<std::path::PathBuf> {
         .find(|dir| dir.is_dir())
 }
 pub mod logos;
-pub mod pit_stall;
 pub mod radar_bars;
 pub mod relative;
 pub mod settings;

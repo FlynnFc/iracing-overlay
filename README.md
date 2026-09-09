@@ -1,6 +1,6 @@
 # Race Overlay
 
-An iRacing overlay for endurance and multi-class racing: five draggable panels, a wheel-driven black box,
+An iRacing overlay for endurance and multi-class racing: four draggable panels, a wheel-driven black box,
 and a team-sync layer that lets a crew chief watch — and adjust — the car they are not sitting in.
 
 Every screenshot here is rendered by the overlay itself from a fixed demo snapshot, so what is shown is
@@ -10,7 +10,7 @@ exactly what the code draws.
 
 **Contents** — [Relative](#relative) · [Black box](#black-box) · [Standings](#standings) ·
 [Radar bars](#radar-bars) · [Faster class](#faster-class) ·
-[Pit stall](#pit-stall) · [Status border](#status-border) · [Strategy](#strategy--fuel) ·
+[Status border](#status-border) · [Strategy](#strategy--fuel) ·
 [Team sync](#team-sync) · [Danger drivers](#danger-drivers) · [Seat layouts](#seat-layouts) ·
 [Stream mode](#stream-mode) · [CPU](#cpu-behaviour) · [Themes](#themes) · [Settings](#settings-window) ·
 [Binds](#wheel-binds) · [Command line](#command-line)
@@ -22,8 +22,8 @@ exactly what the code draws.
 A single always-on-top window covering the screen, drawing panels over iRacing and passing every click
 through to the sim except where a panel actually is.
 
-- **Five panels**, each independently positioned, scaled and switched off: Relative, Standings, Radar Bars,
-  Faster Class and Pit Stall.
+- **Four panels**, each independently positioned, scaled and switched off: Relative, Standings, Radar Bars
+  and Faster Class.
 - **A black box** sharing the Relative's frame — six pages walked with wheel buttons, with real pit service
   control (fuel, tyres, pressures, tearoff, fast repair).
 - **Estimates are labelled and honest.** Anything projected says so, and anything the sim has not published is
@@ -113,7 +113,7 @@ than the table silently being different.
 
 | | |
 |---|---|
-| <img src="docs/features/img/standings-endurance.png" alt="Endurance columns" width="400"> | **Endurance columns** — stint length, stops still owed, and the position each car is projected to finish in once everyone has taken theirs. Being a stop up on a rival is worth more than any plausible pace difference. |
+| <img src="docs/features/img/standings-endurance.png" alt="Endurance columns" width="400"> | **Endurance columns** — stint length, completed pit stops, and projected finishing position. The race summary below separately shows estimated stops still to go. |
 | <img src="docs/features/img/standings-tyres.png" alt="Compound column" width="400"> | **Compound column and stint laps.** The compound letter appears only when the session publishes compounds; wets are ringed blue. |
 
 ---
@@ -137,15 +137,6 @@ drawn on the bar, position already says which side a car is on.
 A quicker car is coming. The card appears at a configurable gap and turns red at a closer one, optionally
 flashing. In a multi-class race the Relative does show this — as one row among eight, read foveally — and
 being lifted out of it is the point.
-
----
-
-## Pit stall
-
-| | |
-|---|---|
-| <img src="docs/features/img/pitstall-approach.png" alt="Approaching the stall" width="220"> | <img src="docs/features/img/pitstall-inbox.png" alt="Stopped in the box" width="220"> |
-| **On the way in.** The bar empties as the marks come up; a shorter configured range magnifies the last metre. | **In the box.** An overshoot is a reverse, a crew that will not come out, or a penalty. |
 
 ---
 
@@ -346,7 +337,7 @@ panel behind the window is the preview — and are saved once they settle.
 | Standings | Visibility, scale, name-column width, other classes, stint laps, compound column, position change, endurance mode, pit-loss and tyre-change thresholds. |
 | Logos | Manufacturer mark style and colour, with every known brand drawn as it will appear and a per-brand override. |
 | Radar Bars | Car length, range in car lengths and in time, bar size, the gap between the capsules, gaps in metres. |
-| Faster Class / Pit Stall | Each panel's own switches — including the Faster Class warn/alert gaps and flash. |
+| Faster Class | Visibility, scale, warn/alert gaps and flash. |
 | Black Box | Auto Fuel and its margin, and whether the tyre bars show temperatures or wear. |
 | Team Sync | On/off, **host the relay from this PC** and its port, relay URL, invite code, and the pit-control consent. |
 | Binds | One row per wheel action, with press-to-capture. A control already bound elsewhere is taken anyway and the clash shown on both rows. |

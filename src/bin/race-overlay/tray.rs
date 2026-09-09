@@ -25,13 +25,12 @@ pub enum Panel {
     RadarBars,
     /// The warning that a quicker class is coming up behind.
     FasterClass,
-    PitStall,
 }
 
 impl Panel {
     /// Every panel, in the order the menu lists them — top of the screen to
     /// bottom, roughly, as the default layout places them.
-    pub const ALL: [Self; 5] = [Self::Standings, Self::Relative, Self::RadarBars, Self::FasterClass, Self::PitStall];
+    pub const ALL: [Self; 4] = [Self::Standings, Self::Relative, Self::RadarBars, Self::FasterClass];
 
     /// The menu entry's text.
     pub fn label(self) -> &'static str {
@@ -40,7 +39,6 @@ impl Panel {
             Self::Standings => "Standings",
             Self::RadarBars => "Radar Bars",
             Self::FasterClass => "Faster Class",
-            Self::PitStall => "Pit Stall",
         }
     }
 }

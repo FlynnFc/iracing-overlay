@@ -28,6 +28,7 @@
 //! Nothing here renders local intent: see [`crate::telemetry::pit`].
 
 pub mod pages;
+mod fuel_service;
 
 use std::time::{Duration, Instant};
 
@@ -228,13 +229,11 @@ const WORKINGS_SIZE: f32 = 13.0;
 /// The Fuel page, band by band down the card — see [`draw_fuel`].
 const FUEL_SIDE_MARGIN: f32 = 20.0;
 const FUEL_TOP_PAD: f32 = 10.0;
-/// The line over the tank: the `ADD` label, and the `FINISH` flag's tab.
+/// The line over the tank and the `FINISH` flag's tab.
 const FUEL_HEAD_HEIGHT: f32 = 26.0;
-/// The tank itself, the lanes either side of it for the stepper's chevrons,
-/// and the figures written inside its segments.
+/// The tank itself and the figures written inside its segments.
 const TANK_HEIGHT: f32 = 56.0;
 const TANK_ROUNDING: f32 = 8.0;
-const TANK_CHEVRON_LANE: f32 = 26.0;
 const TANK_VALUE_SIZE: f32 = 30.0;
 const TANK_VALUE_PAD: f32 = 16.0;
 /// The finish flag: a tab over the tank at the litres the race needs, with
@@ -250,8 +249,7 @@ const FUEL_FIGURES_HEIGHT: f32 = 62.0;
 const FUEL_FIGURE_SIZE: f32 = 34.0;
 const FUEL_FIGURE_GAP: f32 = 40.0;
 
-/// The arm strip: fuel, tearoff, fast repair and Auto Fuel, lit or not.
-const ARM_TILES: usize = 4;
+/// Other pit services: tearoff, fast repair and Auto Fuel, lit or not.
 const ARM_STRIP_HEIGHT: f32 = 56.0;
 const ARM_TILE_GAP: f32 = 10.0;
 const ARM_TILE_ROUNDING: f32 = 6.0;
@@ -576,6 +574,9 @@ pub enum RowKind {
     Toggle { checked: bool, control: Control },
     /// A number with `<` `>` arrows.
     Stepper { value: String, control: Control },
+    /// One refuelling instruction: turn to set litres, press to arm or clear.
+    /// Auto Fuel keeps the quantity read-only while retaining the service toggle.
+    Fuel { litres: i16, armed: bool, automatic: bool },
     /// One wheel of the car: whether it is being changed, and to what
     /// pressure. Both on one control, because a press and a turn are already
     /// separate actions — landing on a corner and pressing arms it, turning
@@ -588,7 +589,7 @@ impl RowKind {
     /// Whether the cursor can land here. Readings can't be changed, so
     /// stopping on one would be a dead end the driver has to click past.
     fn is_selectable(&self) -> bool {
-        matches!(self, Self::Toggle { .. } | Self::Stepper { .. } | Self::Corner { .. })
+        matches!(self, Self::Toggle { .. } | Self::Stepper { .. } | Self::Fuel { .. } | Self::Corner { .. })
     }
 
     #[must_use]
@@ -598,6 +599,7 @@ impl RowKind {
                 Some(*control)
             }
             Self::Static { .. } => None,
+            Self::Fuel { .. } => Some(Control::Fuel),
         }
     }
 }
@@ -663,11 +665,6 @@ pub enum Shape {
         /// Standing change-all-below policy, when one is active.
         wear_threshold_pct: Option<u8>,
     },
-    /// The tank as a tank, with everything this stop will do to it lit beneath.
-    ///
-    /// `controls` runs `[add, fuel, tearoff, fast repair, auto]` — the load
-    /// first because it is the number the page exists to set, then the four
-    /// things a stop either does or doesn't.
     /// A run of value-over-label tiles and nothing else, for a page that is
     /// entirely readings — see [`draw_tiles`].
     Tiles(Vec<Tile>),
@@ -697,6 +694,9 @@ pub enum Shape {
         /// `telemetry::race_plan::burn_to_skip_a_stop`.
         skip_hint: Option<String>,
     },
+    /// A refuelling instruction above its tank and range readouts.
+    /// The driver also gets tearoff, fast repair and Auto Fuel controls;
+    /// a crew view includes the driver's name in the fuel control.
     Fuel {
         gauge: FuelGauge,
         /// How many fast repairs are left, under the tile that arms one. Page
@@ -1044,7 +1044,15 @@ impl BlackBox {
             (Control::AutoFuel | Control::BoxBox, _) => return None,
             _ => {}
         }
-        let service = snapshot.map(|s| s.pit_service)?;
+        let snapshot = snapshot?;
+        let mut service = snapshot.pit_service;
+        // A spectator is forming a remote request from the synced service,
+        // not sending a command to their local sim. Allow construction here;
+        // the app routes it over team sync and the receiving driver still
+        // has to be seated with crew control enabled.
+        if matches!(snapshot.seat, Seat::Spectating(_)) {
+            service.in_car = true;
+        }
         pages::request_for(action, control, &row.kind, &service)
     }
 
@@ -1490,7 +1498,7 @@ pub fn draw(
     config: &RelativeConfig,
     layout: &PageLayout,
     options: super::RowOptions,
-    synced: Option<&crate::sync::store::SyncedCar>,
+    _synced: Option<&crate::sync::store::SyncedCar>,
     pages: PageSet,
 ) -> Vec<Click> {
     let page = state.page();
@@ -1542,15 +1550,7 @@ pub fn draw(
                     draw_rows(ui, metrics, controls, cursor, &mut clicks);
                 }
                 Shape::Fuel { gauge, fast_repairs, margin_laps } => {
-                    if synced.is_some() {
-                        // Crew controls may start with a read-only driver
-                        // identity. They do not have the driver's fixed
-                        // [load, fuel, tearoff, repair, auto] tile positions.
-                        draw_fuel(ui, metrics, &[], cursor, *gauge, fast_repairs, None, &mut clicks);
-                        draw_rows(ui, metrics, controls, cursor, &mut clicks);
-                    } else {
-                        draw_fuel(ui, metrics, controls, cursor, *gauge, fast_repairs, *margin_laps, &mut clicks);
-                    }
+                    draw_fuel(ui, metrics, controls, cursor, *gauge, fast_repairs, *margin_laps, &mut clicks);
                 }
             }
             // The compound rides on the Tires footer: it is a fact about the
@@ -2111,20 +2111,8 @@ fn draw_window_strip(ui: &Ui, metrics: Metrics, rect: Rect, window: &crate::tele
     }
 }
 
-/// The tank as a tank: what is in it, what this stop adds, where the finish
-/// sits — and the four things a stop either does or doesn't, lit beneath.
-///
-/// The tank is the hero. Solid paper is the fuel on board; hatch is what the
-/// stop will add — planned, not yet real — and a shortfall against the
-/// finish is an alert-red hatch with the litres it is short written inside.
-/// Both quantities are written inside their own segments, so the number and
-/// the length are one object. Whether you are putting in enough is then a
-/// matter of where two edges sit, not of subtracting two numbers on the way
-/// into the pit lane.
-///
-/// `controls` runs `[add, fuel, tearoff, fast repair, auto]` — see
-/// [`Shape::Fuel`]. `margin_laps` is Auto Fuel's margin while it is on, which
-/// rides on the `AUTO` plate rather than taking a row of its own.
+/// The next-stop fuel instruction sits above the tank and range it changes.
+/// Driver and crew use the same control; other driver services sit below.
 #[expect(clippy::too_many_arguments, reason = "one page, drawn in one place; a struct would only rename the list")]
 fn draw_fuel(
     ui: &mut Ui,
@@ -2136,9 +2124,15 @@ fn draw_fuel(
     margin_laps: Option<f32>,
     clicks: &mut Vec<Click>,
 ) {
-    let arm_height = if controls.is_empty() { 0.0 } else { ARM_STRIP_HEIGHT };
-    let height =
-        FUEL_TOP_PAD + FUEL_HEAD_HEIGHT + TANK_HEIGHT + FUEL_LEGEND_HEIGHT + FUEL_FIGURES_HEIGHT + arm_height;
+    let tiles: Vec<(usize, &Row)> = controls.iter().enumerate()
+        .filter(|(_, row)| matches!(row.kind, RowKind::Toggle { .. }))
+        .collect();
+    let arm_height = if tiles.is_empty() { 0.0 } else { ARM_STRIP_HEIGHT };
+    let has_capacity = gauge.capacity_litres.is_some_and(|litres| litres > 0.0);
+    let legend_height = if has_capacity { FUEL_LEGEND_HEIGHT } else { 0.0 };
+    let service_height = fuel_service::HEIGHT + fuel_service::GAP;
+    let height = FUEL_TOP_PAD + service_height + FUEL_HEAD_HEIGHT + TANK_HEIGHT
+        + legend_height + FUEL_FIGURES_HEIGHT + arm_height;
     let (rect, _response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), metrics.px(height)), egui::Sense::hover());
     let inner = rect.shrink2(metrics.vec2(FUEL_SIDE_MARGIN, 0.0));
@@ -2147,50 +2141,35 @@ fn draw_fuel(
     };
 
     let mut top = rect.top() + metrics.px(FUEL_TOP_PAD);
+    let service = band(top, fuel_service::HEIGHT);
+    let driver = controls.iter().find_map(|row| match &row.kind {
+        RowKind::Static { value } => Some(value.as_str()),
+        _ => None,
+    });
+    if let Some((index, row)) = controls.iter().enumerate().find(|(_, row)| matches!(row.kind, RowKind::Fuel { .. })) {
+        fuel_service::draw(ui, metrics, service, &row.kind, index, cursor == index, driver, clicks);
+    }
+    top += metrics.px(service_height);
     let head = band(top, FUEL_HEAD_HEIGHT);
     top += metrics.px(FUEL_HEAD_HEIGHT);
-    let lane = band(top, TANK_HEIGHT);
+    let tank = band(top, TANK_HEIGHT);
     top += metrics.px(TANK_HEIGHT);
-    let legend = band(top, FUEL_LEGEND_HEIGHT);
-    top += metrics.px(FUEL_LEGEND_HEIGHT);
+    let legend = band(top, legend_height);
+    top += metrics.px(legend_height);
     let figures = band(top, FUEL_FIGURES_HEIGHT);
     top += metrics.px(FUEL_FIGURES_HEIGHT);
-    let strip = band(top, ARM_STRIP_HEIGHT);
+    let strip = band(top, arm_height);
 
-    // The load is the tank: a stepper while the driver sets it, a readout
-    // while Auto Fuel does. Only a stepper gets chevrons and the cursor.
-    let steppable = matches!(controls.first().map(|row| &row.kind), Some(RowKind::Stepper { .. }));
-    let selected = steppable && cursor == 0;
-    paint_text(
-        ui,
-        egui::pos2(head.left(), head.center().y),
-        egui::Align2::LEFT_CENTER,
-        RichText::new("ADD").size(metrics.px(TYRE_LABEL_SIZE)).strong().color(if selected {
-            text_primary()
-        } else {
-            text_secondary()
-        }),
-    );
-    let tank = lane.shrink2(metrics.vec2(TANK_CHEVRON_LANE, 0.0));
+    paint_text(ui, egui::pos2(head.left(), head.center().y), egui::Align2::LEFT_CENTER,
+        RichText::new("TANK & RANGE").size(metrics.px(TYRE_LABEL_SIZE)).strong().color(text_secondary()));
     let shortfall = draw_tank(ui, metrics, tank, head, gauge);
-    if steppable {
-        draw_tank_chevrons(ui, metrics, lane, selected, clicks);
-    }
-    if selected {
-        paint_cursor_ring(ui, metrics, tank, metrics.px(TANK_ROUNDING));
-    }
-
-    draw_fuel_legend(ui, metrics, legend, shortfall);
+    if has_capacity { draw_fuel_legend(ui, metrics, legend, shortfall); }
     draw_fuel_figures(ui, metrics, figures, gauge);
 
-    // The whole stop as a row of lit blocks. On an in-lap this is the question
-    // the page is actually being asked — what have I armed? — and it is
-    // answered by a pattern rather than by four ticks at four heights of a
-    // list.
-    let tiles: Vec<&Row> = controls.iter().skip(1).take(ARM_TILES).collect();
-    #[expect(clippy::cast_precision_loss, reason = "four tiles, far inside f32's exact range")]
+    // Other driver services keep their own tiles below the fuel picture.
+    #[expect(clippy::cast_precision_loss, reason = "three tiles, far inside f32's exact range")]
     let step = (strip.width() + metrics.px(ARM_TILE_GAP)) / tiles.len().max(1) as f32;
-    for (slot, row) in tiles.iter().enumerate() {
+    for (slot, &(index, row)) in tiles.iter().enumerate() {
         #[expect(clippy::cast_precision_loss, reason = "see above")]
         let left = strip.left() + step * slot as f32;
         let tile = Rect::from_min_max(
@@ -2208,7 +2187,6 @@ fn draw_fuel(
             "Auto" => margin.as_deref(),
             _ => None,
         };
-        let index = slot + 1;
         draw_arm_tile(ui, metrics, tile, &row.label, note, lit, cursor == index);
         // The plate toggles; on the AUTO plate, while it is on, its two ends
         // step the margin — the same split a turn of the rotary makes.
@@ -2245,32 +2223,6 @@ fn draw_fuel(
 /// How much of an `AUTO` plate's width, at each end, steps the margin.
 const ARM_TILE_STEP_WIDTH: f32 = 28.0;
 
-/// The stepper's chevrons, in the lanes either side of the tank.
-///
-/// The whole lane beside the tank is the click target, not the glyph.
-fn draw_tank_chevrons(ui: &Ui, metrics: Metrics, lane: Rect, selected: bool, clicks: &mut Vec<Click>) {
-    let middle = lane.center().y;
-    for (x, name, action) in [
-        (lane.left() + metrics.px(TANK_CHEVRON_LANE / 2.0), "chevron-left", Action::Decrement),
-        (lane.right() - metrics.px(TANK_CHEVRON_LANE / 2.0), "chevron-right", Action::Increment),
-    ] {
-        // The whole lane beside the tank is the target, not the glyph.
-        let target = Rect::from_center_size(egui::pos2(x, middle), metrics.vec2(TANK_CHEVRON_LANE, TANK_HEIGHT));
-        let hovered = hit(ui, target, ("fuel", name), clicks, Click::Control { index: 0, action });
-        let arrows = if selected || hovered { text_primary() } else { text_secondary() };
-        let arrow = Rect::from_center_size(egui::pos2(x, middle), metrics.vec2(CHEVRON_SIZE, CHEVRON_SIZE));
-        if !super::icons::svg(ui, arrow, name, arrows) {
-            let glyph = if name == "chevron-left" { "\u{2039}" } else { "\u{203A}" };
-            paint_text(
-                ui,
-                egui::pos2(x, middle),
-                egui::Align2::CENTER_CENTER,
-                RichText::new(glyph).size(metrics.px(ROW_SIZE + 4.0)).strong().color(arrows),
-            );
-        }
-    }
-}
-
 /// A white focus ring locates the control the next wheel action will change.
 /// Its neutral colour keeps focus distinct from an amber armed service.
 /// Instrument retains its olive cursor.
@@ -2297,12 +2249,14 @@ fn draw_tank(ui: &Ui, metrics: Metrics, tank: Rect, head: Rect, gauge: FuelGauge
     ui.painter().rect_filled(tank, rounding, super::CONTROL_PLATE);
 
     let Some(capacity) = gauge.capacity_litres.filter(|litres| *litres > 0.0) else {
-        paint_text(
-            ui,
-            tank.center(),
-            egui::Align2::CENTER_CENTER,
-            RichText::new("no tank size yet").size(metrics.px(TYRE_LABEL_SIZE)).color(text_tertiary()),
-        );
+        // The crew knows the actual tank reading even without its capacity.
+        // Show the measured quantity, with no invented scale or empty gauge.
+        paint_text(ui, egui::pos2(tank.left() + metrics.px(16.0), tank.center().y), egui::Align2::LEFT_CENTER,
+            super::readout(format!("{:.0} L", gauge.in_tank_litres), metrics.px(TANK_VALUE_SIZE)).color(text_primary()));
+        paint_text(ui, egui::pos2(tank.left() + metrics.px(100.0), tank.center().y), egui::Align2::LEFT_CENTER,
+            RichText::new("on board").size(metrics.px(TYRE_LABEL_SIZE)).color(text_secondary()));
+        paint_text(ui, egui::pos2(tank.right() - metrics.px(16.0), tank.center().y), egui::Align2::RIGHT_CENTER,
+            RichText::new("tank size unavailable").size(metrics.px(11.0)).color(text_tertiary()));
         return None;
     };
     let at = |litres: f32| tank.left() + tank.width() * (litres / capacity).clamp(0.0, 1.0);
@@ -2351,7 +2305,7 @@ fn draw_tank(ui: &Ui, metrics: Metrics, tank: Rect, head: Rect, gauge: FuelGauge
             let text = super::readout(format!("-{short:.0} L"), metrics.px(TANK_VALUE_SIZE)).color(theme::alert());
             paint_inside(ui, metrics, gap, text);
         }
-        let label = if beyond_the_tank { "FINISH \u{25B8}" } else { "FINISH" };
+        let label = if beyond_the_tank { "FINISH >" } else { "FINISH" };
         let tab_text =
             RichText::new(label).size(metrics.px(FINISH_TAB_SIZE)).strong().color(Color32::from_black_alpha(230));
         let tab_width = text_width(ui, tab_text.clone()) + metrics.px(FINISH_TAB_PAD * 2.0);
@@ -3194,7 +3148,7 @@ fn draw_row(ui: &mut Ui, metrics: Metrics, row: &Row, style: RowStyle) {
         RowKind::Stepper { value, .. } => draw_stepper(ui, metrics, rect, split, value, style.selected),
         // A wheel belongs in the car's geometry and is never laid out as a
         // row; it reaches this arm only if a page is built wrong.
-        RowKind::Corner { .. } => {}
+        RowKind::Corner { .. } | RowKind::Fuel { .. } => {}
     }
 }
 
@@ -3380,6 +3334,38 @@ mod tests {
             tyre_pressures_kpa: [165.0; 4],
             tyres: None,
         }
+    }
+
+    #[test]
+    fn fuel_uses_one_wheel_stop_and_crew_clicks_form_remote_requests() {
+        let mut snapshot = crate::demo::snapshot();
+        snapshot.pit_service.fuel_armed = true;
+        snapshot.pit_service.fuel_amount_litres = 40.0;
+        let relative = RelativeConfig::default();
+        for crew in [false, true] {
+            let mut settings = crate::config::BlackBoxConfig::default();
+            snapshot.seat = if crew { Seat::Spectating(Arc::from("Teammate")) } else { Seat::Driving };
+            snapshot.pit_service.in_car = !crew;
+            let synced = crew.then(synced_fuel_only);
+            let rows = pages::fuel(&snapshot, &settings, None, synced.as_ref()).controls;
+            assert_eq!(rows.iter().filter(|row| row.kind.control() == Some(Control::Fuel)).count(), 1);
+            assert_eq!(rows.iter().filter(|row| row.kind.is_selectable()).count(), if crew { 1 } else { 4 });
+            let mut box_ = BlackBox::new();
+            box_.page = Page::Fuel;
+            box_.settle_cursor(&rows);
+            let fuel_index = box_.cursor;
+            assert_eq!(box_.apply(Action::Increment, &rows, Some(&snapshot), &mut settings, &relative, all_pages()), Some(PitRequest::SetFuel(41)));
+            assert_eq!(box_.click(Click::Control { index: fuel_index, action: Action::Toggle }, &rows, Some(&snapshot), &mut settings, &relative, all_pages()), Some(PitRequest::ClearFuel));
+            assert_eq!(box_.apply(Action::Decrement, &rows, Some(&snapshot), &mut settings, &relative, all_pages()), Some(PitRequest::SetFuel(39)));
+            box_.apply(Action::Next, &rows, Some(&snapshot), &mut settings, &relative, all_pages());
+            assert_eq!(box_.cursor, 1, "the next wheel stop stays on crew fuel or moves to the driver's tearoff");
+        }
+        snapshot.seat = Seat::OutOfCar;
+        let mut settings = crate::config::BlackBoxConfig::default();
+        let rows = pages::fuel(&snapshot, &settings, None, None).controls;
+        let mut box_ = BlackBox::new();
+        box_.page = Page::Fuel;
+        assert_eq!(box_.apply(Action::Increment, &rows, Some(&snapshot), &mut settings, &relative, all_pages()), None);
     }
 
     /// Once team sync is feeding the driver's real fuel, the Fuel page comes

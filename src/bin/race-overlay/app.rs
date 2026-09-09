@@ -2,8 +2,8 @@
 
 //! The overlay's [`EguiOverlay`] implementation: drains telemetry
 //! snapshots, sizes the window to the primary monitor on the first frame,
-//! draws the five independently draggable panels (Relative, Standings,
-//! Radar Bars, Faster Class, Pit Stall), and toggles mouse
+//! draws the four independently draggable panels (Relative, Standings,
+//! Radar Bars, Faster Class), and toggles mouse
 //! passthrough automatically based on whether the pointer is over interactive
 //! content.
 
@@ -26,7 +26,7 @@ use crate::input;
 use crate::telemetry::pit::PitRequest;
 use crate::telemetry::snapshot::TelemetrySnapshot;
 use crate::tray::Tray;
-use crate::ui::{blackbox, faster_class, pit_stall, radar_bars, settings, standings};
+use crate::ui::{blackbox, faster_class, radar_bars, settings, standings};
 
 /// Fallback size if GLFW can't report a primary monitor (should not happen
 /// in practice, but a blank/tiny window would be a confusing failure mode).
@@ -860,13 +860,12 @@ impl OverlayApp {
         let danger = self.config.danger.clone();
         let standings_config = self.config.standings.clone();
         let radar_config = self.config.radar.clone();
-        let pit_stall_config = self.config.pit_stall.clone();
         let faster_class_config = self.config.faster_class.clone();
 
         // Every panel is drawn bare: each widget owns its own card
         // chrome, because the designs are not one card each. Standings
         // is two cards plus a status gutter outside them, and Relative a
-        // gutter plus a card; Radar Bars and Pit Stall have deliberately
+        // gutter plus a card; Radar Bars has deliberately
         // never had any.
         //
         // The Relative is page one of the black box rather than a panel
@@ -987,16 +986,6 @@ impl OverlayApp {
             }
         }
 
-        if panel_visible(selected_preview, crate::tray::Panel::PitStall, layout_mode, self.config.pit_stall.visible) {
-            let pos = active_pos(seat_layout, &mut self.config.pit_stall.pos, &mut self.config.pit_stall.watch_pos);
-            let drag = draggable_panel(egui_context, "pit_stall", pos, |ui| {
-                pit_stall::draw(ui, latest, &pit_stall_config);
-            });
-            held |= drag.held;
-            if drag.stopped {
-                self.persist();
-            }
-        }
         held
     }
 }
@@ -1924,7 +1913,7 @@ mod tests {
     #[test]
     fn settings_preview_is_exclusive_and_leaves_normal_visibility_intact() {
         use crate::tray::Panel;
-        let panels = [Panel::Relative, Panel::Standings, Panel::RadarBars, Panel::FasterClass, Panel::PitStall];
+        let panels = [Panel::Relative, Panel::Standings, Panel::RadarBars, Panel::FasterClass];
         for selected in panels {
             for panel in panels {
                 for layout in [false, true] {

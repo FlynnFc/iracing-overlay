@@ -70,13 +70,22 @@ pub fn request_for(action: Action, control: Control, kind: &RowKind, service: &P
     match control {
         Control::Fuel => {
             if action == Action::Toggle {
-                // Toggling fuel off is `ClearFuel`; toggling it on re-sends
-                // the amount the sim already has, which is what arms the box.
+                // Arm the amount on the control, including the Auto plan;
+                // the sim may still hold the previous stop's load on track.
+                let amount = match kind {
+                    RowKind::Fuel { litres, .. } => *litres,
+                    _ => round_litres(service.fuel_amount_litres),
+                };
                 return Some(if service.fuel_armed {
                     PitRequest::ClearFuel
                 } else {
-                    PitRequest::SetFuel(round_litres(service.fuel_amount_litres))
+                    PitRequest::SetFuel(amount)
                 });
+            }
+            // The same wheel selection can toggle service in Auto mode, but
+            // its amount belongs to the planner until Auto Fuel is turned off.
+            if matches!(kind, RowKind::Fuel { automatic: true, .. }) {
+                return None;
             }
             let current = round_litres(service.fuel_amount_litres);
             let next = current.saturating_add(step * FUEL_STEP).clamp(0, MAX_FUEL_LITRES);
@@ -163,10 +172,8 @@ pub const MAX_MARGIN_LAPS: f32 = 10.0;
 /// compute the load from measured consumption and arm it through the ordinary
 /// fuel command. Everything else on the page is the sim's own state.
 ///
-/// While Auto Fuel is on, the Add row is shown but not selectable — it is a
-/// readout of what Auto Fuel has armed, and letting the cursor land on a
-/// number that would be overwritten a frame later invites exactly one bug
-/// report.
+/// Refuelling is one wheel selection: a turn changes litres and a press
+/// arms or clears the service. Auto Fuel makes only the amount read-only.
 #[must_use]
 pub fn fuel(
     snapshot: &TelemetrySnapshot,
@@ -188,29 +195,24 @@ pub fn fuel(
     // number whenever Auto Fuel has nothing of its own.
     let armed = round_litres(service.fuel_amount_litres);
     let adding = if settings.auto_fuel && synced.is_none() { auto_fuel_litres.unwrap_or(armed) } else { armed };
-    let add = format!("{adding} L");
+    let automatic = settings.auto_fuel && synced.is_none();
+    let refuel = Row {
+        label: "Next stop".to_owned(),
+        kind: RowKind::Fuel { litres: adding, armed: service.fuel_armed, automatic },
+    };
 
-    // The load first: it is the number this page exists to set, and everything
-    // under it is a consequence of it. While Auto Fuel is on it is a readout
-    // instead — letting the cursor land on a figure that gets overwritten a
-    // frame later invites exactly one bug report.
-    //
-    // A spectator gets live fuel controls too — the app routes their presses
-    // over the wire to the driver's overlay (behind that driver's consent) —
-    // but only the two the synced echo reflects: the load and its arm. Auto
-    // Fuel is the driver's own, and tearoff / fast repair aren't in the echo.
+    // Driver provenance is a reading inside the same control, so the wheel
+    // skips it and lands on the single refuelling instruction.
     let controls = if let Some(car) = synced {
         let mut rows = Vec::new();
         if let Some(driver) = &car.driver {
-            rows.push(reading("Via", format!("\u{25C9} {driver}")));
+            rows.push(reading("Driver", driver.clone()));
         }
-        rows.push(stepper("Add", add, Control::Fuel));
-        rows.push(toggle("Fuel", service.fuel_armed, Control::Fuel));
+        rows.push(refuel);
         rows
     } else {
         vec![
-            if settings.auto_fuel { reading("Add", add) } else { stepper("Add", add, Control::Fuel) },
-            toggle("Fuel", service.fuel_armed, Control::Fuel),
+            refuel,
             toggle("Tearoff", service.tearoff_armed, Control::Tearoff),
             toggle("Fast Repair", service.fast_repair_armed, Control::FastRepair),
             toggle("Auto", settings.auto_fuel, Control::AutoFuel),
@@ -229,8 +231,13 @@ pub fn fuel(
     // load as the tank rises to meet it; drawn as level-plus-load the hatch
     // slides right instead of being consumed. The latched end level pins the
     // far edge, and what is left to go in is the distance to it.
-    let adding_litres =
-        service.refuel_target_litres.map_or(f32::from(adding), |target| (target - service.fuel_level_litres).max(0.0));
+    let adding_litres = if service.fuel_armed || automatic {
+        service.refuel_target_litres.map_or(f32::from(adding), |target| (target - service.fuel_level_litres).max(0.0))
+    } else {
+        // The sim remembers the last amount after fuel is unticked. Keep it
+        // editable, but do not count an unarmed load towards the finish.
+        0.0
+    };
     let after_the_stop = service.fuel_level_litres + adding_litres;
 
     PageLayout {
@@ -607,6 +614,48 @@ mod tests {
 
         let idle = in_car_service();
         assert_eq!(request_for(Action::Toggle, Control::Fuel, &kind, &idle), Some(PitRequest::SetFuel(40)));
+    }
+
+    #[test]
+    fn skipped_fuel_keeps_the_editable_amount_but_does_not_extend_range() {
+        let mut snapshot = crate::demo::snapshot();
+        snapshot.pit_service.fuel_armed = false;
+        snapshot.pit_service.fuel_amount_litres = 40.0;
+        let layout = fuel(&snapshot, &crate::config::BlackBoxConfig::default(), None, None);
+        assert!(matches!(layout.controls[0].kind, RowKind::Fuel { litres: 40, armed: false, automatic: false }));
+        let Shape::Fuel { gauge, .. } = layout.shape else { panic!("fuel page") };
+        assert!(gauge.adding_litres.abs() < f32::EPSILON);
+        assert!(gauge.laps_after_stop.is_none());
+    }
+
+    #[test]
+    fn automatic_fuel_shows_the_plan_and_rejects_manual_amount_changes() {
+        let mut snapshot = crate::demo::snapshot();
+        snapshot.pit_service = PitService { fuel_armed: false, ..in_car_service() };
+        let settings = crate::config::BlackBoxConfig { auto_fuel: true, ..Default::default() };
+        let layout = fuel(&snapshot, &settings, Some(55), None);
+        let kind = &layout.controls[0].kind;
+        assert!(matches!(kind, RowKind::Fuel { litres: 55, armed: false, automatic: true }));
+        for action in [Action::Increment, Action::Decrement] {
+            assert_eq!(request_for(action, Control::Fuel, kind, &snapshot.pit_service), None);
+        }
+        assert_eq!(request_for(Action::Toggle, Control::Fuel, kind, &snapshot.pit_service), Some(PitRequest::SetFuel(55)));
+        let Shape::Fuel { gauge, .. } = layout.shape else { panic!("fuel page") };
+        assert!((gauge.adding_litres - 55.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn pumping_shows_only_the_fuel_left_to_add() {
+        let mut snapshot = crate::demo::snapshot();
+        snapshot.pit_service = PitService {
+            fuel_armed: true,
+            fuel_level_litres: 30.0,
+            refuel_target_litres: Some(52.0),
+            ..in_car_service()
+        };
+        let layout = fuel(&snapshot, &crate::config::BlackBoxConfig::default(), None, None);
+        let Shape::Fuel { gauge, .. } = layout.shape else { panic!("fuel page") };
+        assert!((gauge.adding_litres - 22.0).abs() < f32::EPSILON);
     }
 
     /// Turning a wheel sets its pressure, by a whole psi — see

@@ -3,7 +3,7 @@
 //! Renders the Standings as one continuous, softly layered timing table.
 //!
 //! One card, three bands: the drivers, their timing (gap, fastest, last), and
-//! — in endurance mode — their strategy (stint, stops owed, projected net
+//! — in endurance mode — their strategy (stint, completed stops, projected net
 //! position), each band a step lighter than the one before so a row reads as
 //! one unbroken line across all three. A status gutter sits outside the card.
 //!
@@ -103,7 +103,7 @@ fn name_width(config: &StandingsConfig) -> f32 {
     }
 }
 /// The strategy band's width, added only when endurance mode is on. Narrow,
-/// because two of its three columns are glyphs rather than figures.
+/// with a stint bar, completed stop count and projected position delta.
 const ENDURANCE_WIDTH: f32 = 170.0;
 /// Height of the strategy line beneath the table in endurance mode: tall
 /// enough for readout numerals, because it is the panel's verdict.
@@ -113,7 +113,7 @@ const SUMMARY_VALUE_SIZE: f32 = 26.0;
 const SUMMARY_TAG_HEIGHT: f32 = 24.0;
 
 /// The strategy band's columns, from its left edge: the stint bar, the stop
-/// pips, the net delta.
+/// count, the net delta.
 const STINT_X: f32 = 12.0;
 const STINT_BAR_SIZE: (f32, f32) = (56.0, 8.0);
 /// The bar shortened to make room for the lap count beside it, when that is
@@ -123,11 +123,6 @@ const STINT_LAPS_GAP: f32 = 5.0;
 const STINT_LAPS_SIZE: f32 = 11.0;
 const STOPS_X: f32 = 80.0;
 const NET_X: f32 = 128.0;
-/// One stop still owed, as a dot; past [`MAX_PIPS`] a row of dots stops
-/// being a pattern the eye counts and the number takes over.
-const PIP_DIAMETER: f32 = 8.0;
-const PIP_GAP: f32 = 3.0;
-const MAX_PIPS: i32 = 4;
 const GUTTER_GAP: f32 = 8.0;
 const GUTTER_WIDTH: f32 = 32.0;
 
@@ -390,9 +385,9 @@ pub fn draw(ui: &mut Ui, snapshot: Option<&TelemetrySnapshot>, config: &Standing
     let tumble = row_offsets(ui, metrics, &rows);
 
     let endurance = snapshot.endurance;
-    // Strategy columns are meaningless outside a race — nobody pits to a
-    // plan in qualifying — so `auto` requires one. `on` still forces them,
-    // for anyone who wants to look at the numbers in practice.
+    // Auto offers the extra columns for endurance races. On also exposes
+    // measured stint lengths and completed stops during practice; NET stays
+    // unknown without a race finish to project.
     let show_endurance = match config.endurance_mode {
         EnduranceMode::On => true,
         EnduranceMode::Off => false,
@@ -400,9 +395,9 @@ pub fn draw(ui: &mut Ui, snapshot: Option<&TelemetrySnapshot>, config: &Standing
     };
     // The strategy line across the card's foot is not gated with the columns:
     // laps left, stops to go and the net position are worth the row in any
-    // race, including with the endurance columns switched off. Outside a race
-    // it only appears when `on` forces the columns, same as they do.
-    let show_summary = show_endurance || snapshot.relative_meta.session_kind.is_race();
+    // race, including with the endurance columns switched off. Practice and
+    // qualifying never get a race-finish summary, even with the columns On.
+    let show_summary = snapshot.relative_meta.session_kind.is_race();
     // The tyre column is opt-in twice over: the config switch, and the sim
     // actually publishing a compound for at least one car — without that the
     // column would be a strip of empty circles all session.
@@ -1324,7 +1319,7 @@ fn draw_strategy_top_bar(ui: &Ui, metrics: Metrics, rect: Rect) {
 }
 
 /// One row of the strategy band: how far into its stint this car is, how
-/// many stops it still owes, and where its strategy is projected to leave it.
+/// many stops it has completed, and where its strategy is projected to leave it.
 ///
 /// Three columns that each vary row to row. The old strip printed laps,
 /// stops and measured pit time as figures, and in a steady race every row
@@ -1397,30 +1392,14 @@ fn draw_strategy_row(
         );
     }
 
-    // Stops still owed, one dot each; an empty ring is none; nothing at all
-    // while it isn't known.
-    if let Some(stops) = entry.stops_remaining {
-        let radius = metrics.px(PIP_DIAMETER / 2.0);
-        if stops <= 0 {
-            let centre = egui::pos2(columns[1].1 + radius, middle);
-            ui.painter().circle_stroke(centre, radius - 0.5, egui::Stroke::new(metrics.px(1.5), ink));
-        } else if stops > MAX_PIPS {
-            // A long race: past four, dots have to be counted rather than
-            // seen, and a number is quicker.
-            paint_text(
-                ui,
-                egui::pos2(columns[1].1, middle),
-                egui::Align2::LEFT_CENTER,
-                RichText::new(stops.to_string()).monospace().size(metrics.px(TIME_SIZE)).strong().color(ink),
-            );
-        } else {
-            for slot in 0..stops {
-                #[expect(clippy::cast_precision_loss, reason = "at most a handful of pips")]
-                let x = columns[1].1 + radius + (metrics.px(PIP_DIAMETER + PIP_GAP)) * slot as f32;
-                ui.painter().circle_filled(egui::pos2(x, middle), radius, ink);
-            }
-        }
-    }
+    // A completed service is one stop. Remaining-stop forecasts belong in
+    // the race summary and must never replace this observed count.
+    paint_text(
+        ui,
+        egui::pos2(columns[1].1, middle),
+        egui::Align2::LEFT_CENTER,
+        RichText::new(entry.pit_stops.max(0).to_string()).monospace().size(metrics.px(TIME_SIZE)).strong().color(ink),
+    );
 
     // The projected finish as a delta from where the car is now: "does the
     // strategy gain or lose me places?", not "what number will I be?".
@@ -1717,6 +1696,68 @@ mod tests {
             tow_secs: None,
             tyre: None,
             race_position_change: None,
+        }
+    }
+
+    #[test]
+    fn the_stops_column_renders_completed_stops_even_when_nine_more_are_projected() {
+        let ctx = egui::Context::default();
+        crate::app::install_fonts(&ctx);
+        for completed in [0, 1, 2, 10] {
+            let mut car = entry(1, 0.0, 0);
+            car.pit_stops = completed;
+            car.stops_remaining = Some(9);
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    draw_strategy_row(
+                        ui,
+                        Metrics::new(1.0),
+                        Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(ENDURANCE_WIDTH, ROW_HEIGHT)),
+                        &Row::Driver(&car),
+                        RowStyle { odd: false, rounding: Rounding::ZERO },
+                        Some(7),
+                        false,
+                    );
+                });
+            });
+            let text: Vec<&str> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            }).collect();
+            assert!(text.contains(&completed.to_string().as_str()), "completed {completed}: {text:?}");
+            assert!(!text.contains(&"9"), "the forecast belongs in the summary, not this column");
+        }
+    }
+
+    #[test]
+    fn only_races_show_the_remaining_stop_summary_even_with_endurance_columns_forced_on() {
+        let ctx = egui::Context::default();
+        crate::app::install_fonts(&ctx);
+        let config = StandingsConfig { endurance_mode: EnduranceMode::On, show_tyres: false, ..Default::default() };
+        let danger = std::collections::BTreeMap::new();
+        let options = super::super::RowOptions { show_off_tracks: false, show_flags: false, danger: &danger, fuel_target: None };
+        for kind in [SessionKind::Race, SessionKind::Practice, SessionKind::Qualifying, SessionKind::Warmup, SessionKind::Unknown] {
+            let mut snapshot = crate::demo::snapshot();
+            snapshot.relative_meta.session_kind = kind;
+            // Deliberately retain a stale race forecast: the session kind
+            // still has to prevent it being presented as a practice target.
+            snapshot.endurance.stops_remaining = Some(9);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1200.0))),
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| draw(ui, Some(&snapshot), &config, options));
+            });
+            let text: Vec<&str> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            }).collect();
+            assert_eq!(text.contains(&"STOPS TO GO"), kind.is_race(), "{kind:?}");
+            assert!(text.contains(&"Stops"), "measured stops remain available in {kind:?}");
+            if kind.is_race() {
+                assert!(text.contains(&"9"), "the race summary retains its remaining-stop estimate");
+            }
         }
     }
 

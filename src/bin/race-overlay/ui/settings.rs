@@ -21,7 +21,7 @@ use egui::{Color32, Context, RichText, Slider, Stroke, Ui};
 use super::{CAUTION, launcher_page, logos};
 use crate::config::{
     BlackBoxConfig, EnduranceMode, FasterClassConfig, LogoConfig, LogoShape, LogoStyle, LogoVariant, OverlayConfig,
-    PitStallConfig, RadarConfig, RelativeConfig, StandingsConfig, SyncConfig, TyreBars,
+    RadarConfig, RelativeConfig, StandingsConfig, SyncConfig, TyreBars,
 };
 use crate::input::{Action, Actions};
 
@@ -72,8 +72,6 @@ const BAR_HEIGHT_RANGE: std::ops::RangeInclusive<f32> = 300.0..=1000.0;
 /// The channel between the two capsules, in design pixels: from touching to
 /// wider than a triple-screen cockpit view.
 const BAR_GAP_RANGE: std::ops::RangeInclusive<f32> = 0.0..=1200.0;
-/// What an empty Pit Stall bar means, in metres.
-const PIT_STALL_RANGE_M: std::ops::RangeInclusive<f32> = 10.0..=200.0;
 /// How far behind a quicker class is when the Faster Class card appears, in
 /// seconds. One is already on the bumper; the top is as far as the telemetry
 /// thread scans.
@@ -106,7 +104,6 @@ enum Page {
     Logos,
     RadarBars,
     FasterClass,
-    PitStall,
     BlackBox,
     TeamSync,
     Binds,
@@ -114,14 +111,13 @@ enum Page {
 }
 
 impl Page {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 10] = [
         Self::General,
         Self::BlackBox,
         Self::Relative,
         Self::Standings,
         Self::RadarBars,
         Self::FasterClass,
-        Self::PitStall,
         Self::Logos,
         Self::Binds,
         Self::TeamSync,
@@ -136,7 +132,6 @@ impl Page {
             Self::Logos => "Logos",
             Self::RadarBars => "Radar Bars",
             Self::FasterClass => "Faster Class",
-            Self::PitStall => "Pit Stall",
             Self::BlackBox => "Black Box",
             Self::TeamSync => "Team Sync",
             Self::Binds => "Controls",
@@ -152,7 +147,6 @@ impl Page {
             Self::Logos => "Choose how each manufacturer appears on track.",
             Self::RadarBars => "Tune your view of the space beside the car.",
             Self::FasterClass => "Know when quicker traffic is approaching.",
-            Self::PitStall => "A clear guide to your marks in the pit box.",
             Self::BlackBox => "Set your fuel strategy and pit information.",
             Self::TeamSync => "Keep your crew connected throughout the race.",
             Self::Binds => "Keep the controls you need within reach.",
@@ -168,7 +162,6 @@ impl Page {
             Self::Logos => "logos",
             Self::RadarBars => "radar-bars",
             Self::FasterClass => "faster-class",
-            Self::PitStall => "pit-stall",
             Self::BlackBox => "black-box",
             Self::TeamSync => "team-sync",
             Self::Binds => "binds",
@@ -218,7 +211,6 @@ impl SettingsWindow {
             Page::Standings => Some(crate::tray::Panel::Standings),
             Page::RadarBars => Some(crate::tray::Panel::RadarBars),
             Page::FasterClass => Some(crate::tray::Panel::FasterClass),
-            Page::PitStall => Some(crate::tray::Panel::PitStall),
             _ => None,
         }
     }
@@ -403,7 +395,7 @@ pub fn draw(
                             let tab = match window.page {
                                 Page::Relative | Page::Standings => panel_tabs(ui, window.page.slug(), Some("Columns")),
                                 Page::BlackBox => panel_tabs(ui, window.page.slug(), Some("Pages")),
-                                Page::RadarBars | Page::FasterClass | Page::PitStall => {
+                                Page::RadarBars | Page::FasterClass => {
                                     panel_tabs(ui, window.page.slug(), None)
                                 }
                                 _ => PanelTab::Layout,
@@ -425,7 +417,6 @@ pub fn draw(
                                             Page::Logos => logos_page(ui, &mut config.logos, window),
                                             Page::RadarBars => radar(ui, &mut config.radar, tab),
                                             Page::FasterClass => faster_class(ui, &mut config.faster_class, tab),
-                                            Page::PitStall => pit_stall(ui, &mut config.pit_stall, tab),
                                             Page::BlackBox => black_box(ui, config, tab),
                                             Page::TeamSync => team_sync(ui, &mut config.sync, host),
                                             Page::Binds => binds(ui, config, window, actions, now),
@@ -540,7 +531,6 @@ fn general(ui: &mut Ui, config: &mut OverlayConfig, watching: bool, window: &mut
                                 crate::tray::Panel::Standings => Page::Standings,
                                 crate::tray::Panel::RadarBars => Page::RadarBars,
                                 crate::tray::Panel::FasterClass => Page::FasterClass,
-                                crate::tray::Panel::PitStall => Page::PitStall,
                             };
                         }
                     });
@@ -937,28 +927,6 @@ fn faster_class(ui: &mut Ui, config: &mut FasterClassConfig, tab: PanelTab) -> O
     if reset_page(ui) {
         let (pos, watch_pos) = (config.pos, config.watch_pos);
         *config = FasterClassConfig { pos, watch_pos, ..FasterClassConfig::default() };
-        outcome.changed = true;
-    }
-    outcome
-}
-
-fn pit_stall(ui: &mut Ui, config: &mut PitStallConfig, tab: PanelTab) -> Outcome {
-    let mut outcome = Outcome::default();
-    if tab == PanelTab::Layout {
-        section_label(ui, "DISPLAY & POSITION");
-        outcome.changed |= ui.checkbox(&mut config.visible, "Show during normal use").changed();
-        outcome.changed |= scale(ui, &mut config.scale);
-        outcome.changed |= position(ui, &mut config.pos, &mut config.watch_pos);
-    }
-    if tab == PanelTab::Content {
-        outcome.changed |= ui
-            .add(Slider::new(&mut config.range_m, PIT_STALL_RANGE_M).suffix(" m").text("Range"))
-            .on_hover_text("What an empty bar means, in metres from your marks. Lower magnifies the last metre.")
-            .changed();
-    }
-    if reset_page(ui) {
-        let (pos, watch_pos) = (config.pos, config.watch_pos);
-        *config = PitStallConfig { pos, watch_pos, ..PitStallConfig::default() };
         outcome.changed = true;
     }
     outcome

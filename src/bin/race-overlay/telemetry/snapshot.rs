@@ -794,34 +794,6 @@ pub struct FuelUse {
     pub lap_fraction: Option<f32>,
 }
 
-/// How far the car is from the perfect stopping point in its own pit box.
-///
-/// Defaults to invisible, which is what every state that cannot answer the
-/// question — off pit road, spectating, no stall published — produces. See
-/// [`super::pit_stall`] for how each field is arrived at.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PitStallSnapshot {
-    /// Whether the widget should draw at all this tick.
-    pub visible: bool,
-    /// Signed distance from the perfect stopping point, in metres: negative
-    /// short of the box, positive past it.
-    ///
-    /// Always populated, because the marker has to go somewhere. Where the
-    /// metres scale had to be guessed this is a proportion wearing a
-    /// distance's units — good enough to place a marker, not good enough to
-    /// print, which is what `readout_m` is for.
-    pub error_m: f32,
-    /// The same figure, but only when the scale behind it was measured or read
-    /// from the track's own length rather than assumed.
-    ///
-    /// `None` means draw the bar and print nothing beside it.
-    pub readout_m: Option<f32>,
-    /// `PlayerCarInPitStall`: the sim's own word that the car is in its box.
-    pub in_box: bool,
-    /// Half-width of the green zone, in metres.
-    pub green_half_width_m: f32,
-}
-
 /// Where the player is relative to the car the widgets are about.
 ///
 /// Every player scalar iRacing publishes — `FuelLevel`, tyre temperatures,
@@ -884,8 +856,6 @@ pub struct TelemetrySnapshot {
     /// Quicker-class cars coming up behind; see [`FasterClassSnapshot`].
     pub faster_class: FasterClassSnapshot,
     pub weather: WeatherSnapshot,
-    /// Where the car is relative to its own pit box; see [`PitStallSnapshot`].
-    pub pit_stall: PitStallSnapshot,
     /// Session-wide endurance projections; see [`EnduranceMeta`].
     pub endurance: EnduranceMeta,
     /// `None` until there's enough data (gap-to-leader for the player and

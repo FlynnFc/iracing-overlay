@@ -227,8 +227,7 @@ pub struct DriverInfo {
     ///
     /// A `DriverInfo` field rather than a per-driver one: iRacing publishes
     /// only your own stall, never anybody else's. Zero when the session has
-    /// no pit lane, which the Pit Stall widget reads as "no target" and hides
-    /// itself for.
+    /// no pit lane.
     #[serde(rename = "DriverPitTrkPct", default)]
     pub driver_pit_trk_pct: f32,
     /// The player's car's tank, in litres, and the fraction of it this
@@ -483,11 +482,11 @@ DriverInfo:
         assert_eq!(parse_track_length("4.5 furlongs"), None);
     }
 
-    /// The Pit Stall widget's entire target. A session with no pit lane
-    /// publishes zero here, which has to survive parsing as zero rather than
-    /// as an error that loses the rest of the driver info with it.
+    /// A session with no pit lane publishes zero here, which has to survive
+    /// parsing as zero rather than as an error that loses the rest of the
+    /// driver info with it.
     #[test]
-    fn pit_stall_position_parses_and_defaults_to_zero() {
+    fn driver_pit_position_parses_and_defaults_to_zero() {
         let yaml = r"
 DriverInfo:
   DriverCarIdx: 32

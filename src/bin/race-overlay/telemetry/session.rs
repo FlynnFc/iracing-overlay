@@ -25,7 +25,7 @@ use super::snapshot::{
     RelativeMeta, StandingsEntry, TelemetrySnapshot, TrackWetness, TyreInfo, TyreState, WeatherSnapshot,
     track_location_from_raw,
 };
-use super::{endurance, faster_class, irating, pit, pit_model, pit_stall, radar, relative, sof, standings, weather};
+use super::{endurance, faster_class, irating, pit, pit_model, radar, relative, sof, standings, weather};
 
 /// How long to wait for iRacing to appear before checking again.
 const SESSION_WAIT: Duration = Duration::from_secs(5);
@@ -573,9 +573,6 @@ struct SessionTrackers {
     lap_fuel_use: LapFuelUse,
     /// What the pit lane costs here, measured from every visit to it.
     pit_loss: pit_model::PitLossTracker,
-    /// Where the car is relative to its own pit box, and whether that is worth
-    /// showing yet.
-    pit_stall: pit_stall::PitStallTracker,
     /// The player's rolling pace, which every lap and stop projection divides
     /// by.
     player_pace: LapPace,
@@ -979,8 +976,8 @@ struct TelemetryVars {
     /// The player's own car heading, so wind direction can be shown
     /// relative to the car instead of an absolute (and less useful) bearing.
     yaw: Option<Var>,
-    /// Ground speed in m/s, which the Pit Stall bar measures the pit lane's
-    /// real metres-per-percent from — see [`pit_stall::MetresPerPct`].
+    /// Ground speed in m/s, used to distinguish a stopped pit service from a
+    /// drive-through.
     speed: Option<Var>,
     /// Whether the car is sitting in the garage with the setup screen up, so
     /// the overlay can get out of the way of it.
@@ -2458,10 +2455,7 @@ unsafe fn build_snapshot(
     // in. Erring the other way is free — `pace_secs` can never read quicker than
     // the driver's own best lap, so the laps left can never come out short.
     let laps_by_clock = endurance::laps_remaining(session_time_remain_secs, pace_secs, me_lap_dist_pct);
-    let laps_remaining = match (laps_by_count, laps_by_clock) {
-        (Some(count), Some(clock)) => Some(count.min(clock)),
-        (count, clock) => count.or(clock),
-    };
+    let laps_remaining = race_laps_remaining(session_kind, laps_by_count, laps_by_clock);
     let relative_meta = RelativeMeta {
         sof,
         session_kind,
@@ -2667,22 +2661,6 @@ unsafe fn build_snapshot(
             pressure_kpa: stop_kpa.map_or_else(|| f32_of_opt(&bb.tyre_cold_pressure[i]).unwrap_or(0.0), |kpa| kpa[i]),
         }),
     };
-    // The Pit Stall bar is the one widget that is always about the player's
-    // own car rather than the focus car: `DriverPitTrkPct` describes the
-    // player's stall and nobody else's, so a spectator watching a car in the
-    // pit lane would otherwise be shown that car measured against their own
-    // empty box. Every read below is therefore indexed by `player_car_idx`.
-    let pit_stall = trackers.pit_stall.update(pit_stall::PitStallTick {
-        lap_dist_pct: player_idx.and_then(|i| lap_dist_pcts.get(i)).copied(),
-        target_pct: info.pit_stall_pct,
-        speed_mps: f32_of_opt(&vars.speed),
-        track_length_m: info.track_length_m,
-        session_time_secs,
-        on_pit_road: matches!(player_track_location, TrackLocation::InPitStall | TrackLocation::ApproachingPits),
-        in_box: player_in_pit_stall,
-        // The bar is for whoever is steering; a team-mate's stop is theirs.
-        is_driving: driving,
-    });
     let adjustments = CarAdjustments {
         brake_bias: f32_of_opt(&bb.brake_bias),
         abs: f32_of_opt(&bb.abs),
@@ -2744,7 +2722,6 @@ unsafe fn build_snapshot(
         radar,
         faster_class,
         weather,
-        pit_stall,
         pit_projection,
         pit_service,
         tyres,
@@ -2892,6 +2869,23 @@ fn live_net_gaps(
         }
     }
     gaps
+}
+
+/// The race's remaining laps, using whichever finish limit arrives first.
+/// A practice or qualifying clock is access to the track, not a race distance
+/// every car must complete. It must never create fuel or stop-to-finish plans.
+fn race_laps_remaining(
+    session_kind: SessionKind,
+    laps_by_count: Option<i32>,
+    laps_by_clock: Option<i32>,
+) -> Option<i32> {
+    if !session_kind.is_race() {
+        return None;
+    }
+    match (laps_by_count, laps_by_clock) {
+        (Some(count), Some(clock)) => Some(count.min(clock)),
+        (count, clock) => count.or(clock),
+    }
 }
 
 /// Fills in every entry's endurance projection and returns the session-level
@@ -6304,6 +6298,81 @@ mod tests {
 
         assert_eq!(reading.last_pit_secs, Some(95.0), "the last stop is reported as it was");
         assert_eq!(reading.avg_pit_secs, Some(25.0), "the typical stop is not");
+    }
+
+    /// A seven-lap run followed by one service: the point at which practice
+    /// used to acquire a fictitious nine-stop race strategy for the field.
+    fn field_after_seven_lap_stop() -> [StandingsEntry; 2] {
+        let mut stint = StintState::default();
+        let reading = run_stint(&mut stint, &[(0.0, 0, false), (700.0, 7, true), (725.0, 7, true), (730.0, 7, false)]);
+        assert_eq!(reading.completed_stops, 1);
+        assert_eq!(reading.avg_laps, Some(7));
+        let mut pitted = test_entry(10, 0, 100.0);
+        pitted.is_focus = true;
+        pitted.pit_stops = reading.completed_stops;
+        pitted.current_stint_laps = reading.current_laps;
+        pitted.avg_stint_laps = reading.avg_laps;
+        let mut rival = test_entry(10, 0, 100.0);
+        rival.car_idx = 1;
+        rival.class_position = 2;
+        rival.current_stint_laps = 7;
+        [pitted, rival]
+    }
+
+    #[test]
+    fn a_practice_pit_exit_never_creates_race_stop_projections() {
+        for kind in [SessionKind::Practice, SessionKind::Qualifying, SessionKind::Warmup, SessionKind::Unknown] {
+            let mut standings = field_after_seven_lap_stop();
+            let clock = endurance::laps_remaining(Some(7000.0), 100.0, Some(0.0));
+            let mut multi_stop = false;
+            let meta = annotate_endurance(
+                &mut standings,
+                race_laps_remaining(kind, None, clock),
+                30.0,
+                Some(10),
+                &mut multi_stop,
+                pit_model::PitModel::default(),
+                &HashMap::from([(0, 0.0), (1, 10.0)]),
+            );
+            assert!(standings.iter().all(|entry| entry.stops_remaining.is_none()), "{kind:?}: no stops to a race finish");
+            assert!(standings.iter().all(|entry| entry.projected_class_position.is_none()));
+            assert!(meta.laps_remaining.is_none());
+            assert!(!multi_stop);
+            assert_eq!(standings[0].pit_stops, 1, "the completed stop is still counted");
+            assert_eq!(standings[0].avg_stint_laps, Some(7), "practice still measures stints");
+        }
+    }
+
+    #[test]
+    fn a_race_still_projects_stops_from_the_same_seven_lap_stint() {
+        let mut standings = field_after_seven_lap_stop();
+        let clock = endurance::laps_remaining(Some(7000.0), 100.0, Some(0.0));
+        annotate_endurance(
+            &mut standings,
+            race_laps_remaining(SessionKind::Race, None, clock),
+            30.0,
+            Some(10),
+            &mut false,
+            pit_model::PitModel::default(),
+            &HashMap::from([(0, 0.0), (1, 10.0)]),
+        );
+        assert_eq!(standings[0].stops_remaining, Some(9));
+        assert_eq!(standings[1].stops_remaining, Some(10));
+        assert_eq!(standings[0].pit_stops, 1);
+        assert_eq!(standings[1].pit_stops, 0);
+    }
+
+    #[test]
+    fn race_laps_respect_lap_limits_and_the_earlier_of_both_limits() {
+        for (count, clock, expected) in [
+            (Some(20), None, Some(20)),
+            (Some(12), Some(20), Some(12)),
+            (Some(20), Some(12), Some(12)),
+            (Some(0), Some(1), Some(0)),
+            (None, None, None),
+        ] {
+            assert_eq!(race_laps_remaining(SessionKind::Race, count, clock), expected);
+        }
     }
 
     /// A car that hasn't pitted yet has no history, but projecting it with

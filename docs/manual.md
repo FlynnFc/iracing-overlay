@@ -11,7 +11,7 @@ Windows apps for iRacing, written in Rust:
   **Launcher** settings page (skipping whatever is already running). It finds
   the programs on your machine itself.
 - **race-overlay.exe** — a transparent, click-through overlay drawn over
-  iRacing, with five draggable widgets and a wheel-driven black box. The
+  iRacing, with four draggable widgets and a wheel-driven black box. The
   visual system is the one in `plans/standings-and-blackbox-redesign.md`:
   ink cards, three type faces (Inter for text, IBM Plex Mono for lap times,
   Barlow Condensed for a number that stands alone), one colour per meaning
@@ -20,7 +20,7 @@ Windows apps for iRacing, written in Rust:
     class SOF) with each class's leaders plus a window around your own
     position — the top three, then the car ahead of you and the car behind;
     their timing (gap, fastest, last); and, in endurance mode, their
-    strategy — a stint bar, one pip per stop still owed, the projected net
+    strategy — a stint bar, completed pit stops, the projected net
     position — over a strategy line that says laps left, stops to go,
     projected finish, and whether a rival is on fewer stops. A status
     gutter sits outside the card. Before a race starts the header shows the
@@ -58,20 +58,11 @@ Windows apps for iRacing, written in Rust:
     race, and doesn't need setting up: which class is quicker comes from
     iRacing's own class ranking, falling back to the quickest lap each class
     has actually set.
-  - **Pit Stall** — a capsule that fills as you close on your own pit box:
-    solid for the road covered, hatched for the road still to come, the box
-    a block at the top, and the metres to go in large type beside it. It
-    goes green once you're on the marks and red if you drive through them,
-    reading `M LONG` until you've reversed back in. Appears in the last
-    100 m of the lane and goes the moment you come to a stop in the box, so
-    it's never up during the stop itself. Needs no setup: it targets
-    iRacing's own stall position and measures the lane's real scale from
-    your speed on the way in.
   - **Black box** — six pages on one card, paged from the wheel or by
-    clicking the tab rail across the top: the Relative above, Fuel (the tank
-    drawn as a tank — solid for what is in it, hatched for what the stop
-    adds, a `FINISH` flag at what the race needs — and the four things a
-    stop either does or doesn't, lit amber when armed), Tires (each corner's
+    clicking the tab rail across the top: the Relative above, Fuel (one
+    **Next stop** control to set litres and arm refuelling, above the tank
+    and range; turn the wheel to change the amount, press to arm or skip.
+    Auto Fuel owns the amount while enabled), Tires (each corner's
     pressure to set over what came off it at the last stop: the tread as
     three bars, wear, hot pressure), Pit Window (which lap to box on, with
     the traffic and the fuel saving each lap either side would cost), In-Car
@@ -87,7 +78,7 @@ Windows apps for iRacing, written in Rust:
 
   **Open Settings** opens a window over the overlay with every option below in
   it — show/hide and scale per panel, the Relative's car counts, the
-  Standings' class and endurance options, the radar and pit-stall ranges,
+  Standings' class and endurance options, the radar range,
   the Faster Class warning and alert distances,
   Auto Fuel and its margin. Layout, Content and Columns/Pages tabs keep controls
   separate. Selecting a widget previews only that widget at its saved position;
@@ -157,7 +148,7 @@ programs when the overlay starts** to get the same from double-clicking
   widget's position, `visible` flag (also set on Settings > General), and
   `scale`, plus how many cars Relative
   shows ahead/behind, the Radar Bars' `range_ms`/`car_length_m`/`range_cars`,
-  the Pit Stall bar's `range_m`, and the wheel binds (set from the settings
+  and the wheel binds (set from the settings
   window's Binds page, or by `--bind <action>` for scripting). Created
   automatically on first run/drag; no need to hand-author it.
 
@@ -166,16 +157,6 @@ programs when the overlay starts** to get the same from double-clicking
   rebuild — took every bind and panel position with it. An older file found
   there is moved into place automatically on the next run and the original
   renamed to `race-overlay.toml.moved`.
-
-  `[pit_stall] range_m` is what an empty bar means, in metres from your
-  marks, and so also how much the bar magnifies the final metres. `50.0` by
-  default; raise it for a bar that starts moving further out and fills more
-  slowly, lower it to magnify the last metre. The bar's own size doesn't
-  change with it, so this is purely how much lane one capsule spans.
-
-  Note that this is a *default*: a `race-overlay.toml` written by an earlier
-  version already has its own `range_m` and keeps it. Delete that line (or set
-  it to `50.0`) to pick up the new one.
 
   `[radar] car_length_m` (`4.7`) is both the scale the bars are drawn at and
   where overlap begins, since the SDK publishes no car length. Raise it for a
@@ -221,13 +202,15 @@ programs when the overlay starts** to get the same from double-clicking
   Black box page.
 
   `[standings] show_stint_laps` (`true`) prints each car's current stint
-  length, in laps, beside its stint bar in the strategy band. Stops still
-  owed show as dots up to four and as a number past that.
+  length, in laps, beside its stint bar in the strategy band. The **Stops**
+  column counts completed pit stops: one completed service reads `1`.
 
   `[standings] endurance_mode` is `"auto"` by default: the strategy band
-  (stint, stops owed, projected net position) and the strategy line appear
-  once the session is seen to need more than one stop, and stay for the rest
-  of it. `"on"` and `"off"` force it either way.
+  (stint, completed stops, projected net position) appears once a race is
+  seen to need more than one stop. `"on"` also shows stint and stop counts
+  in practice; `"off"` hides the band. The summary below appears in races
+  regardless of this setting and labels future estimates **STOPS TO GO**.
+  Practice and qualifying never project stops to the end of their timer.
 
   Every widget is laid out at the exact pixel size of its design mockup, so
   `scale = 1.0` reproduces the design. Set a panel's `scale` to resize it —

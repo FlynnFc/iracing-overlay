@@ -16,9 +16,9 @@ use iracing_telem::flags::TrackLocation;
 
 use crate::telemetry::pit::PitService;
 use crate::telemetry::snapshot::{
-    Approaching, CarAdjustments, CarSnapshot, ClassSection, EnduranceMeta, FasterClassSnapshot, Penalty,
-    PitStallSnapshot, RadarCar, RadarSide, RadarSnapshot, RelativeMeta, Seat, SessionKind, StandingsEntry,
-    TelemetrySnapshot, TrackWetness, TyreCompound, TyreInfo, TyreState, WeatherSnapshot,
+    Approaching, CarAdjustments, CarSnapshot, ClassSection, EnduranceMeta, FasterClassSnapshot, Penalty, RadarCar,
+    RadarSide, RadarSnapshot, RelativeMeta, Seat, SessionKind, StandingsEntry, TelemetrySnapshot, TrackWetness,
+    TyreCompound, TyreInfo, TyreState, WeatherSnapshot,
 };
 
 /// The header's session-wide figures: a 45-minute race twenty minutes in,
@@ -104,16 +104,6 @@ pub fn snapshot() -> TelemetrySnapshot {
         standings,
         radar: radar(),
         faster_class: faster_class(),
-        // Not from a mockup — there isn't one — but the reading worth showing:
-        // still coming, 2.5 m short, so the capsule is nine-tenths full and
-        // amber rather than sitting at one of its two ends.
-        pit_stall: PitStallSnapshot {
-            visible: true,
-            error_m: -2.5,
-            readout_m: Some(-2.5),
-            in_box: false,
-            green_half_width_m: crate::telemetry::pit_stall::DEFAULT_GREEN_HALF_WIDTH_M,
-        },
         weather: WeatherSnapshot {
             track_temp_c: 54.0,
             air_temp_c: 23.0,
@@ -707,6 +697,15 @@ pub fn apply_state(snapshot: &mut TelemetrySnapshot, state: &str) {
         }
 
         // --- Seats and session state ---
+        "practice" => {
+            snapshot.relative_meta.session_kind = SessionKind::Practice;
+            snapshot.endurance = EnduranceMeta::default();
+            for entry in &mut snapshot.standings {
+                entry.stops_remaining = None;
+                entry.projected_class_position = None;
+                entry.race_position_change = None;
+            }
+        }
         "spectating" => {
             snapshot.seat = Seat::Spectating(Arc::from("Alex Holder"));
             snapshot.relative_meta.spectating = Some(Arc::from("Alex Holder"));
@@ -719,20 +718,13 @@ pub fn apply_state(snapshot: &mut TelemetrySnapshot, state: &str) {
             snapshot.relative_meta.grid =
                 Some(GridStatus { cars_gridded: 27, car_count: 36, countdown_secs: Some(92.0) });
         }
-        "pitroad" => {
+        "pitroad" | "inbox" => {
             snapshot.pit_service.on_pit_road = true;
-            snapshot.pit_stall.error_m = -0.4;
-            snapshot.pit_stall.readout_m = Some(-0.4);
-        }
-        "inbox" => {
-            snapshot.pit_service.on_pit_road = true;
-            snapshot.pit_stall.in_box = true;
-            snapshot.pit_stall.error_m = 0.1;
-            snapshot.pit_stall.readout_m = Some(0.1);
         }
 
         // --- Pit service ---
         "autofuel" => snapshot.pit_service.refuel_target_litres = Some(72.0),
+        "nofuel" => snapshot.pit_service.fuel_armed = false,
         "fastrepair" => {
             snapshot.pit_service.fast_repairs_available = 2;
             snapshot.pit_service.fast_repair_armed = true;
