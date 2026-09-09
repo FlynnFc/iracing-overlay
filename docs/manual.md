@@ -99,9 +99,9 @@ Windows apps for iRacing, written in Rust:
 
 ## Installing
 
-Download `race-tools-windows-x64.zip` from the
+Download `iracing-overlay-<version>-windows-x64.zip` from the
 [latest release](https://github.com/FlynnFc/iracing-overlay/releases/latest),
-extract it anywhere (say `C:\race-tools`), and run `race-overlay.exe`. That's
+extract it anywhere (say `C:\iracing-overlay`), and run `race-overlay.exe`. That's
 the whole install — the zip carries everything the apps need, and all settings
 live in `%APPDATA%\race\`, so replacing the folder with a newer release loses
 nothing.
