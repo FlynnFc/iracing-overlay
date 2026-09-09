@@ -95,6 +95,32 @@ const LABEL_FRACTION: f32 = 0.47;
 /// The blue of a ticked checkbox.
 const CHECK: Color32 = Color32::from_rgb(0x2E, 0x7C, 0xE8);
 
+/// The same graphite surface as the timing panels, with lifted controls.
+const PAGE_SURFACE: Color32 = Color32::from_rgba_premultiplied(17, 19, 23, 218);
+const CONTROL_SURFACE: Color32 = Color32::from_rgb(35, 39, 47);
+/// A warm surface and amber edge retain the meaning of an armed service
+/// without turning every tyre and switch into a solid warning-coloured tile.
+const ARMED_SURFACE: Color32 = Color32::from_rgb(48, 39, 27);
+const ARMED_EDGE: Color32 = Color32::from_rgb(139, 104, 51);
+
+fn control_surface() -> Color32 {
+    if theme::is_instrument() { super::CONTROL_PLATE } else { CONTROL_SURFACE }
+}
+
+fn cursor_fill() -> Color32 {
+    if theme::is_instrument() { PLAYER_ROW } else { super::PLAYER_ROW_FILL }
+}
+
+fn cursor_ink() -> Color32 {
+    if theme::is_instrument() { PLAYER_ROW } else { super::PLAYER_PLATE }
+}
+
+fn paint_armed_edge(ui: &Ui, metrics: Metrics, rect: Rect, rounding: f32, armed: bool) {
+    if armed && !theme::is_instrument() {
+        ui.painter().rect_stroke(rect, rounding, Stroke::new(metrics.px(1.0), ARMED_EDGE));
+    }
+}
+
 /// The arrows at each end of a control plate.
 const CHEVRON_SIZE: f32 = 15.0;
 /// How far each arrow sits inside the plate's own ends.
@@ -136,8 +162,7 @@ const CHASSIS_ALPHA: u8 = 5;
 /// The spine's corner radius. Small, so it reads as a structural member;
 /// rounded to its own half-width it came out a pill with a button on it.
 const SPINE_ROUNDING: f32 = 6.0;
-/// The cursor on the whole-set plate: an olive bar along its foot when the
-/// plate is amber, since a ring round it read as a border.
+/// A focus bar beneath the whole-set plate preserves its armed surface.
 const ALL_FOUR_CURSOR_BAR: f32 = 4.0;
 /// Grooves down the tread, out by the sidewalls where the pressure isn't.
 ///
@@ -275,7 +300,8 @@ const PLATE_INSET_Y: f32 = 3.0;
 /// follow it, in the order a stop is actually set up — fuel, then tyres — and
 /// Strategy sits after them: it is the page you go to once, to decide what the
 /// stop should be, rather than one you page through mid-lap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Page {
     Relative,
     Fuel,
@@ -296,7 +322,7 @@ impl Page {
     }
 
     /// The page's name on the tab rail.
-    fn tab_label(self) -> &'static str {
+    pub fn tab_label(self) -> &'static str {
         match self {
             Self::Relative => "RELATIVE",
             Self::Strategy => "PIT WINDOW",
@@ -388,18 +414,21 @@ impl Page {
 /// when it does. That is why the black box holds a page *identity* rather than
 /// an index into a list whose length changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PageSet(u16);
+pub struct PageSet {
+    mask: u16,
+    order: [Page; 6],
+}
 
 impl PageSet {
     /// Whether `page` is on offer.
     #[must_use]
     pub fn contains(self, page: Page) -> bool {
-        self.0 & (1 << page.ordinal()) != 0
+        self.mask & (1 << page.ordinal()) != 0
     }
 
-    /// Every page on offer, in [`Page::ALL`] order.
+    /// Every page on offer, in the configured wheel and rail order.
     pub fn iter(self) -> impl Iterator<Item = Page> {
-        Page::ALL.into_iter().filter(move |page| self.contains(*page))
+        self.order.into_iter().filter(move |page| self.contains(*page))
     }
 
     /// The page `step` places along from `from`, wrapping at both ends.
@@ -450,7 +479,30 @@ pub fn pages_for(snapshot: Option<&TelemetrySnapshot>, synced: Option<&crate::sy
             offered |= 1 << page.ordinal();
         }
     }
-    PageSet(offered)
+    PageSet { mask: offered, order: Page::ALL }
+}
+
+/// Applies the driver's ordering and visibility to the pages the session can
+/// support. Always leaves an honest destination for wheel navigation.
+pub fn configured_pages(
+    snapshot: Option<&TelemetrySnapshot>,
+    synced: Option<&crate::sync::store::SyncedCar>,
+    config: &crate::config::BlackBoxConfig,
+) -> PageSet {
+    let mut pages = pages_for(snapshot, synced);
+    let mut seen = 0_u16;
+    let mut index = 0;
+    for page in config.page_order.iter().copied().chain(Page::ALL) {
+        let bit = 1 << page.ordinal();
+        if seen & bit == 0 {
+            pages.order[index] = page;
+            index += 1;
+            seen |= bit;
+        }
+    }
+    for page in &config.hidden_pages { pages.mask &= !(1 << page.ordinal()); }
+    if pages.mask == 0 { pages.mask = 1 << Page::Relative.ordinal(); }
+    pages
 }
 
 /// What a row does when the cursor is on it and a value is stepped or toggled.
@@ -608,6 +660,8 @@ pub enum Shape {
         readouts: Box<[Option<TyreReadout>; 4]>,
         /// Which of those readings the three bars on each wheel show.
         bars: crate::config::TyreBars,
+        /// Standing change-all-below policy, when one is active.
+        wear_threshold_pct: Option<u8>,
     },
     /// The tank as a tank, with everything this stop will do to it lit beneath.
     ///
@@ -1352,18 +1406,10 @@ pub fn resolve_status(snapshot: Option<&TelemetrySnapshot>, box_called: bool) ->
 /// Metres from pit entry within which a live BOX BOX starts pulsing.
 const BOX_PULSE_METRES: f32 = 400.0;
 
-/// Paints the status border and its top-edge label plate around `content`.
+/// Paints the alert outline and its dedicated header above the page tabs.
 ///
-/// A steady frame for a flag or a box call; the box call alone pulses, and
-/// only inside [`BOX_PULSE_METRES`] of the stall, so the flash means "turn in
-/// now". No-op for [`BlackBoxStatus::None`], which is the ordinary state.
-///
-/// The frame sits flush on the widget's own edge — no clear gap. On the
-/// Relative, whose status gutter is inside the frame, `gutter_band` is a
-/// paint slot reserved *before* the rows were drawn: the border's left limb
-/// widens into a filled band across the gutter there, set into that slot so
-/// the off-track and penalty markers draw on top of it — the border passes
-/// under them rather than detouring around them.
+/// The Relative's gutter stays graphite so status markers remain distinct.
+/// BOX BOX alone pulses inside the approach distance; flags stay steady.
 fn paint_status_frame(
     ui: &Ui,
     metrics: Metrics,
@@ -1395,32 +1441,39 @@ fn paint_status_frame(
     let painter = ui.painter();
     let rounding = card_rounding(metrics);
     let stroke = Stroke::new(metrics.px(STATUS_BORDER_WIDTH), colour);
-    // On the widget's own edge, so the frame reads as part of the box rather
-    // than a halo floating a gap outside it.
+    // A dedicated graphite header gives the alert label room above the tabs.
+    let header = Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.top() + metrics.px(STATUS_HEADER_HEIGHT)));
+    painter.rect_filled(
+        header,
+        egui::Rounding { nw: rounding.nw, ne: rounding.ne, ..egui::Rounding::ZERO },
+        STATUS_SURFACE,
+    );
     painter.rect_stroke(rect, rounding, stroke);
 
     if let Some(idx) = gutter_band {
-        // The gutter's full run, from the frame's left edge to the card
-        // beside it, filled and set into the reserved under-content slot.
+        // A dark gutter keeps the alert outline separate from row markers.
+        // The reserved slot puts this surface underneath those markers.
         let band = Rect::from_min_max(
             rect.left_top(),
             egui::pos2(rect.left() + metrics.px(super::relative::gutter_span()), rect.bottom()),
         );
-        painter.set(idx, egui::Shape::rect_filled(band, super::card_rounding_side(metrics, true), colour));
+        painter.set(idx, egui::Shape::rect_filled(band, super::card_rounding_side(metrics, true), STATUS_SURFACE));
     }
 
-    // The label plate straddling the top edge, centred, straight-edged, the
-    // state's colour filled with a dark ink so the word reads on it.
+    // The compact coloured label sits inside the header, clear of both the
+    // outline and navigation. Its colour retains the established alert meaning.
     let font = egui::FontId::proportional(metrics.px(STATUS_PLATE_TEXT));
     let galley = painter.layout_no_wrap(label.to_owned(), font, Color32::from_black_alpha(230));
     let pad = metrics.vec2(STATUS_PLATE_PAD_X, STATUS_PLATE_PAD_Y);
-    let plate = Rect::from_center_size(egui::pos2(rect.center().x, rect.top()), galley.size() + pad * 2.0);
+    let plate = Rect::from_center_size(header.center(), galley.size() + pad * 2.0);
     painter.rect_filled(plate, rounding, colour);
     painter.galley(plate.center() - galley.size() / 2.0, galley, Color32::from_black_alpha(230));
 }
 
 /// The status border's stroke width, and the label plate's text size and
 /// padding — all in design pixels, scaled.
+const STATUS_HEADER_HEIGHT: f32 = 36.0;
+const STATUS_SURFACE: Color32 = Color32::from_rgb(17, 19, 23);
 const STATUS_BORDER_WIDTH: f32 = 3.0;
 const STATUS_PLATE_TEXT: f32 = 15.0;
 const STATUS_PLATE_PAD_X: f32 = 10.0;
@@ -1429,6 +1482,7 @@ const STATUS_PLATE_PAD_Y: f32 = 3.0;
 /// Draws the black box, returning any clicks made on it.
 ///
 /// `options` carries the switches the Relative's rows read — see [`super::RowOptions`].
+#[expect(clippy::too_many_arguments, reason = "render context includes both configured page availability and optional synced car")]
 pub fn draw(
     ui: &mut Ui,
     state: &mut BlackBox,
@@ -1437,14 +1491,20 @@ pub fn draw(
     layout: &PageLayout,
     options: super::RowOptions,
     synced: Option<&crate::sync::store::SyncedCar>,
+    pages: PageSet,
 ) -> Vec<Click> {
     let page = state.page();
-    let rail = Rail { pages: pages_for(snapshot, synced), current: page };
+    let rail = Rail { pages, current: page };
     let metrics = Metrics::new(config.scale);
     // The status border wraps whatever page is showing — the session's flag
     // and the player's box call are the widget's state, not a page's. See
     // `plans/blackbox-status-border.md`.
     let status = resolve_status(snapshot, state.box_called());
+    if status != BlackBoxStatus::None {
+        // Reserve real layout space so no alert can cover a page tab, even
+        // when the overlay is positioned against the top of the screen.
+        ui.add_space(metrics.px(STATUS_HEADER_HEIGHT));
+    }
     let mut clicks = Vec::new();
     if page == Page::Relative {
         let scroll = state.scroll();
@@ -1459,7 +1519,8 @@ pub fn draw(
     let controls = &layout.controls;
     state.settle_cursor(controls);
     let cursor = state.cursor;
-    card_frame(metrics, PANEL_BG, margin(metrics, 0.0, 0.0), card_rounding(metrics)).show(ui, |ui| {
+    let fill = if theme::is_instrument() { PANEL_BG } else { PAGE_SURFACE };
+    card_frame(metrics, fill, margin(metrics, 0.0, 0.0), card_rounding(metrics)).show(ui, |ui| {
         ui.vertical(|ui| {
             ui.set_width(metrics.px(super::relative::outer_width(config)));
             draw_rail(ui, metrics, rail, &mut clicks);
@@ -1469,19 +1530,27 @@ pub fn draw(
                 return;
             }
             match &layout.shape {
-                Shape::Rows => draw_rows(ui, metrics, controls, cursor),
-                Shape::Corners { readouts, bars, .. } => {
-                    draw_corners(ui, metrics, controls, cursor, readouts, *bars, &mut clicks);
+                Shape::Rows => draw_rows(ui, metrics, controls, cursor, &mut clicks),
+                Shape::Corners { readouts, bars, wear_threshold_pct, .. } => {
+                    draw_corners(ui, metrics, controls, cursor, readouts, *bars, *wear_threshold_pct, &mut clicks);
                 }
                 Shape::Tiles(tiles) => draw_tiles(ui, metrics, tiles),
                 Shape::PitWindow { window, this_lap_litres, labels, skip_hint } => {
                     draw_pit_window(ui, metrics, window, *this_lap_litres, labels, skip_hint.as_deref());
-                    // The manual BOX BOX toggle sits under the window as an
-                    // ordinary control row, so the wheel walks onto it.
-                    draw_rows(ui, metrics, controls, cursor);
+                    // Control order remains the wheel's order beneath the
+                    // recommendation, including the crew's standing calls.
+                    draw_rows(ui, metrics, controls, cursor, &mut clicks);
                 }
                 Shape::Fuel { gauge, fast_repairs, margin_laps } => {
-                    draw_fuel(ui, metrics, controls, cursor, *gauge, fast_repairs, *margin_laps, &mut clicks);
+                    if synced.is_some() {
+                        // Crew controls may start with a read-only driver
+                        // identity. They do not have the driver's fixed
+                        // [load, fuel, tearoff, repair, auto] tile positions.
+                        draw_fuel(ui, metrics, &[], cursor, *gauge, fast_repairs, None, &mut clicks);
+                        draw_rows(ui, metrics, controls, cursor, &mut clicks);
+                    } else {
+                        draw_fuel(ui, metrics, controls, cursor, *gauge, fast_repairs, *margin_laps, &mut clicks);
+                    }
                 }
             }
             // The compound rides on the Tires footer: it is a fact about the
@@ -1546,9 +1615,9 @@ pub struct Rail {
 ///
 /// A wheel button pressed at speed needs its answer on screen before the
 /// press, not after, and the rail is that answer: a driver can count how
-/// many presses to Fuel. Its tabs are blocks in the class-tag geometry — the
-/// lit one paper with ink text, like the gutter's `PIT` chip; the rest ink
-/// with quiet text.
+/// many presses to Fuel. Panel uses a softly raised selection with a short
+/// white locator beneath it; inactive labels remain readable without a fill.
+/// Instrument retains its inverted paper tab.
 pub fn draw_rail(ui: &mut Ui, metrics: Metrics, rail: Rail, clicks: &mut Vec<Click>) {
     let (band, _response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), metrics.px(RAIL_HEIGHT)), egui::Sense::hover());
@@ -1577,14 +1646,26 @@ pub fn draw_rail(ui: &mut Ui, metrics: Metrics, rail: Rail, clicks: &mut Vec<Cli
         );
         let lit = page == rail.current;
         let hovered = !lit && hit(ui, tab, ("tab", page.tab_label()), clicks, Click::Page(page));
-        let (tab_fill, ink) = if lit {
+        let instrument = theme::is_instrument();
+        let (tab_fill, ink) = if lit && instrument {
             (text_primary(), Color32::from_black_alpha(230))
+        } else if lit {
+            (Color32::from_white_alpha(12), text_primary())
         } else if hovered {
             (Color32::from_white_alpha(14 + HOVER_ALPHA), text_secondary())
-        } else {
+        } else if instrument {
             (Color32::from_white_alpha(14), text_tertiary())
+        } else {
+            (Color32::TRANSPARENT, text_secondary())
         };
         painter.rect_filled(tab, metrics.px(super::BLOCK_ROUNDING), tab_fill);
+        if lit && !instrument {
+            let locator = Rect::from_center_size(
+                egui::pos2(tab.center().x, band.bottom() - metrics.px(1.0)),
+                metrics.vec2(14.0, 2.0),
+            );
+            painter.rect_filled(locator, metrics.px(1.0), super::PLAYER_PLATE);
+        }
         let label = RichText::new(page.tab_label()).size(metrics.px(RAIL_LABEL_SIZE)).strong().color(ink);
         let galley = egui::WidgetText::from(label).into_galley(
             ui,
@@ -1650,7 +1731,11 @@ fn compound_name(compound: i32) -> String {
 }
 
 /// A column of rows with the cursor running down it.
-fn draw_rows(ui: &mut Ui, metrics: Metrics, rows: &[Row], cursor: usize) {
+fn draw_rows(ui: &mut Ui, metrics: Metrics, rows: &[Row], cursor: usize, clicks: &mut Vec<Click>) {
+    if !theme::is_instrument() {
+        draw_control_group(ui, metrics, rows, cursor, clicks);
+        return;
+    }
     // No trailing space: the last row's fill runs to the card's own bottom
     // edge and takes its corners, so the run reads as one instrument face
     // rather than as a list floating in a box.
@@ -1658,6 +1743,114 @@ fn draw_rows(ui: &mut Ui, metrics: Metrics, rows: &[Row], cursor: usize) {
         let style = RowStyle { selected: index == cursor, odd: index % 2 == 1, seat: RowPlace::of(index, rows.len()) };
         draw_row(ui, metrics, row, style);
     }
+}
+
+/// Keep source indices when static provenance rows precede the controls.
+fn grouped_control_indices(rows: &[Row]) -> Vec<usize> {
+    rows.iter().enumerate().filter_map(|(index, row)| row.kind.is_selectable().then_some(index)).collect()
+}
+
+/// All cells share an inset surface; proportional geometry scales with the widget.
+fn grouped_control_cell(rect: Rect, slot: usize, count: usize, gap: f32) -> Rect {
+    let width = (rect.width() - gap * count.saturating_sub(1) as f32) / count.max(1) as f32;
+    Rect::from_min_size(egui::pos2(rect.left() + slot as f32 * (width + gap), rect.top()), egui::vec2(width, rect.height()))
+}
+
+fn draw_control_group(ui: &mut Ui, metrics: Metrics, rows: &[Row], cursor: usize, clicks: &mut Vec<Click>) {
+    if rows.is_empty() { return; }
+    let indices = grouped_control_indices(rows);
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.add_space(metrics.px(6.0));
+        for row in rows.iter().filter(|row| !row.kind.is_selectable()) {
+            if let RowKind::Static { value } = &row.kind {
+                let (band, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), metrics.px(26.0)), egui::Sense::hover());
+                let text = super::elide_to_width(ui, &format!("{}  {}", row.label, value), band.width() - metrics.px(FUEL_SIDE_MARGIN * 2.0), |text| {
+                    RichText::new(text).size(metrics.px(12.0)).color(text_tertiary())
+                });
+                paint_text(ui, egui::pos2(band.left() + metrics.px(FUEL_SIDE_MARGIN), band.center().y), egui::Align2::LEFT_CENTER, text);
+            }
+        }
+        if !indices.is_empty() {
+            let (band, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), metrics.px(104.0)), egui::Sense::hover());
+            let group = band.shrink2(metrics.vec2(FUEL_SIDE_MARGIN, 0.0));
+            ui.painter().rect_filled(group, metrics.px(10.0), CONTROL_SURFACE);
+            let inner = group.shrink(metrics.px(6.0));
+            for (slot, &index) in indices.iter().enumerate() {
+                let cell = grouped_control_cell(inner, slot, indices.len(), metrics.px(6.0));
+                draw_group_control(ui, metrics, cell, &rows[index], index, index == cursor, clicks);
+            }
+        }
+        ui.add_space(metrics.px(8.0));
+    });
+}
+
+#[expect(clippy::too_many_arguments, reason = "one allocated control and its original index, used by both paint and hit targets")]
+fn draw_group_control(ui: &Ui, metrics: Metrics, rect: Rect, row: &Row, index: usize, selected: bool, clicks: &mut Vec<Click>) {
+    if selected {
+        ui.painter().rect_filled(rect, metrics.px(6.0), cursor_fill());
+        let locator = Rect::from_center_size(egui::pos2(rect.center().x, rect.top() + metrics.px(2.0)), metrics.vec2(18.0, 2.0));
+        ui.painter().rect_filled(locator, metrics.px(1.0), cursor_ink());
+    }
+    let label = super::elide_to_width(ui, &row.label, rect.width() - metrics.px(12.0), |text| {
+        RichText::new(text).size(metrics.px(12.0)).color(text_secondary())
+    });
+    paint_text(ui, egui::pos2(rect.center().x, rect.top() + metrics.px(17.0)), egui::Align2::CENTER_CENTER, label);
+    match &row.kind {
+        RowKind::Toggle { checked, control } => draw_group_toggle(ui, metrics, rect, *checked, *control, index, clicks),
+        RowKind::Stepper { value, control } => {
+            let value = super::elide_to_width(ui, value, rect.width() - metrics.px(8.0), |text| {
+                RichText::new(text).size(metrics.px(14.0)).strong().color(text_primary())
+            });
+            paint_text(ui, egui::pos2(rect.center().x, rect.top() + metrics.px(40.0)), egui::Align2::CENTER_CENTER, value);
+            let stepper = Rect::from_min_max(egui::pos2(rect.left() + metrics.px(4.0), rect.bottom() - metrics.px(36.0)),
+                egui::pos2(rect.right() - metrics.px(4.0), rect.bottom() - metrics.px(4.0)));
+            draw_group_stepper(ui, metrics, stepper, *control, index, clicks);
+        }
+        _ => {}
+    }
+}
+
+#[expect(clippy::too_many_arguments, reason = "toggle state, control semantics and original click index stay together")]
+fn draw_group_toggle(ui: &Ui, metrics: Metrics, row: Rect, checked: bool, control: Control, index: usize, clicks: &mut Vec<Click>) {
+    let rect = Rect::from_center_size(egui::pos2(row.center().x, row.bottom() - metrics.px(33.0)), metrics.vec2(76.0, 32.0));
+    let colour = if control == Control::BoxBox { theme::alert() } else { theme::caution() };
+    let hovered = hit(ui, row, ("group-toggle", index), clicks, Click::Control { index, action: Action::Toggle });
+    ui.painter().rect_filled(rect, metrics.px(16.0), if checked { ARMED_SURFACE } else { PAGE_SURFACE });
+    if checked { ui.painter().rect_stroke(rect, metrics.px(16.0), Stroke::new(metrics.px(1.0), colour)); }
+    if hovered { paint_hover(ui, rect, metrics.px(16.0)); }
+    let knob_x = if checked { rect.right() - metrics.px(16.0) } else { rect.left() + metrics.px(16.0) };
+    ui.painter().circle_filled(egui::pos2(knob_x, rect.center().y), metrics.px(8.0), if checked { colour } else { text_secondary() });
+    let label_x = if checked { rect.left() + metrics.px(24.0) } else { rect.right() - metrics.px(23.0) };
+    paint_text(ui, egui::pos2(label_x, rect.center().y), egui::Align2::CENTER_CENTER,
+        RichText::new(if checked { "ON" } else { "OFF" }).size(metrics.px(11.0)).strong().color(if checked { colour } else { text_secondary() }));
+}
+
+fn grouped_step_regions(rect: Rect, metrics: Metrics) -> [Rect; 3] {
+    let width = metrics.px(32.0).min(rect.width() / 2.0);
+    [Rect::from_min_max(rect.min, egui::pos2(rect.left() + width, rect.bottom())),
+     rect.shrink2(egui::vec2(width, 0.0)),
+     Rect::from_min_max(egui::pos2(rect.right() - width, rect.top()), rect.max)]
+}
+
+fn draw_group_stepper(ui: &Ui, metrics: Metrics, rect: Rect, control: Control, index: usize, clicks: &mut Vec<Click>) {
+    ui.painter().rect_filled(rect, metrics.px(6.0), PAGE_SURFACE);
+    let [minus, middle, plus] = grouped_step_regions(rect, metrics);
+    for (button, glyph, action) in [(minus, "\u{2212}", Action::Decrement), (plus, "+", Action::Increment)] {
+        if hit(ui, button, ("group-step", index, glyph), clicks, Click::Control { index, action }) {
+            paint_hover(ui, button, metrics.px(6.0));
+        }
+        paint_text(ui, button.center(), egui::Align2::CENTER_CENTER, RichText::new(glyph).size(metrics.px(19.0)).color(text_secondary()));
+    }
+    let hint = match control { Control::FuelTarget => "Clear", Control::TyrePolicy => "Cycle", _ => "L" };
+    if matches!(control, Control::FuelTarget | Control::TyrePolicy)
+        && hit(ui, middle, ("group-value", index), clicks, Click::Control { index, action: Action::Toggle }) {
+        paint_hover(ui, middle, metrics.px(3.0));
+    }
+    let hint = super::elide_to_width(ui, hint, (middle.width() - metrics.px(4.0)).max(0.0), |text| {
+        RichText::new(text).size(metrics.px(10.0)).color(text_tertiary())
+    });
+    paint_text(ui, middle.center(), egui::Align2::CENTER_CENTER, hint);
 }
 
 /// A window of laps to box on: the recommendation, then the laps it was picked
@@ -1943,8 +2136,9 @@ fn draw_fuel(
     margin_laps: Option<f32>,
     clicks: &mut Vec<Click>,
 ) {
+    let arm_height = if controls.is_empty() { 0.0 } else { ARM_STRIP_HEIGHT };
     let height =
-        FUEL_TOP_PAD + FUEL_HEAD_HEIGHT + TANK_HEIGHT + FUEL_LEGEND_HEIGHT + FUEL_FIGURES_HEIGHT + ARM_STRIP_HEIGHT;
+        FUEL_TOP_PAD + FUEL_HEAD_HEIGHT + TANK_HEIGHT + FUEL_LEGEND_HEIGHT + FUEL_FIGURES_HEIGHT + arm_height;
     let (rect, _response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), metrics.px(height)), egui::Sense::hover());
     let inner = rect.shrink2(metrics.vec2(FUEL_SIDE_MARGIN, 0.0));
@@ -2077,15 +2271,14 @@ fn draw_tank_chevrons(ui: &Ui, metrics: Metrics, lane: Rect, selected: bool, cli
     }
 }
 
-/// The olive ring the cursor puts round the control it is on.
-///
-/// One colour for the cursor across the overlay, and it is the one that
-/// already means "you" — see [`PLAYER_ROW`].
+/// A white focus ring locates the control the next wheel action will change.
+/// Its neutral colour keeps focus distinct from an amber armed service.
+/// Instrument retains its olive cursor.
 fn paint_cursor_ring(ui: &Ui, metrics: Metrics, rect: Rect, rounding: f32) {
     ui.painter().rect_stroke(
         rect.expand(metrics.px(3.0)),
         rounding + metrics.px(3.0),
-        Stroke::new(metrics.px(2.0), PLAYER_ROW),
+        Stroke::new(metrics.px(if theme::is_instrument() { 2.0 } else { 1.5 }), cursor_ink()),
     );
 }
 
@@ -2295,12 +2488,15 @@ fn draw_fuel_figures(ui: &Ui, metrics: Metrics, rect: Rect, gauge: FuelGauge) {
 /// One thing a stop either does or doesn't, as a plate that is lit or isn't.
 fn draw_arm_tile(ui: &Ui, metrics: Metrics, rect: Rect, label: &str, note: Option<&str>, lit: bool, selected: bool) {
     let rounding = metrics.px(ARM_TILE_ROUNDING);
-    let (fill, text, quiet) = if lit {
+    let (fill, text, quiet) = if lit && theme::is_instrument() {
         (theme::caution(), Color32::from_black_alpha(230), Color32::from_black_alpha(150))
+    } else if lit {
+        (ARMED_SURFACE, theme::caution(), text_secondary())
     } else {
-        (super::CONTROL_PLATE, text_secondary(), text_tertiary())
+        (control_surface(), text_secondary(), text_tertiary())
     };
     ui.painter().rect_filled(rect, rounding, fill);
+    paint_armed_edge(ui, metrics, rect, rounding, lit);
     // The label sits centred with no note, and lifts to make room for one.
     let raise = if note.is_some() { metrics.px(ARM_TILE_NOTE_LIFT) } else { 0.0 };
     paint_text(
@@ -2343,9 +2539,8 @@ pub fn draw_heading_arrow(ui: &Ui, centre: egui::Pos2, reach: f32, heading_rad: 
 
 /// A run of readings, each with its name under it.
 ///
-/// No plates and no gutter: a plate on this panel means "you can change this",
-/// and nothing on a page of readings can be. It ends up the quietest page in
-/// the set, which is right — nothing on it can be acted on from here.
+/// Readings sit on quiet tiles without cursor or stepper affordances.
+/// Their shared baseline and muted labels keep the values easy to scan.
 ///
 /// Two tiles are twice the width of the rest: one that is a split, drawn as a
 /// bar with a notch at the middle (brake bias), and one that points somewhere,
@@ -2368,7 +2563,8 @@ fn draw_tiles(ui: &mut Ui, metrics: Metrics, tiles: &[Tile]) {
         let cell =
             Rect::from_min_max(egui::pos2(left, inner.top()), egui::pos2(left + unit * weight(tile), inner.bottom()));
         left = cell.right() + metrics.px(TILE_GAP);
-        ui.painter().rect_filled(cell, metrics.px(TILE_ROUNDING), super::TILE_BG);
+        let fill = if theme::is_instrument() { super::TILE_BG } else { CONTROL_SURFACE };
+        ui.painter().rect_filled(cell, metrics.px(TILE_ROUNDING), fill);
         let label = RichText::new(&tile.label).size(metrics.px(TILE_LABEL_SIZE)).strong().color(text_tertiary());
 
         if let Some(fraction) = tile.split {
@@ -2449,7 +2645,115 @@ fn draw_tiles(ui: &mut Ui, metrics: Metrics, tiles: &[Tile]) {
 /// at the next, because the one is how the other gets decided: a hot outer
 /// edge on the right front and the pressure that corner is set to are one
 /// fact about one corner, and they used to be two pages apart.
+#[expect(clippy::too_many_arguments, reason = "tyre presentation includes the active shared wear policy")]
 fn draw_corners(
+    ui: &mut Ui, metrics: Metrics, controls: &[Row], cursor: usize,
+    readouts: &[Option<TyreReadout>; 4], bars: crate::config::TyreBars,
+    wear_threshold_pct: Option<u8>, clicks: &mut Vec<Click>,
+) {
+    if theme::is_instrument() {
+        draw_instrument_corners(ui, metrics, controls, cursor, readouts, bars, clicks);
+        return;
+    }
+    ui.add_space(metrics.px(6.0));
+    let (band, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), metrics.px(36.0)), egui::Sense::hover());
+    let button = band.shrink2(metrics.vec2(FUEL_SIDE_MARGIN, 0.0));
+    if let Some(all) = controls.first() {
+        let checked = matches!(all.kind, RowKind::Toggle { checked: true, .. });
+        ui.painter().rect_filled(button, metrics.px(7.0), if checked { ARMED_SURFACE } else { CONTROL_SURFACE });
+        paint_armed_edge(ui, metrics, button, metrics.px(7.0), checked);
+        if cursor == 0 { paint_cursor_ring(ui, metrics, button, metrics.px(7.0)); }
+        if hit(ui, button, "all-four", clicks, Click::Control { index: 0, action: Action::Toggle }) {
+            paint_hover(ui, button, metrics.px(7.0));
+        }
+        paint_text(ui, button.center(), egui::Align2::CENTER_CENTER,
+            RichText::new(if checked { "All four tyres \u{00b7} CHANGE" } else { "All four tyres \u{00b7} KEEP" }).size(metrics.px(13.0)).strong()
+                .color(if checked { theme::caution() } else { text_primary() }));
+    }
+    ui.add_space(metrics.px(6.0));
+    let columns = 2;
+    let card_height = 180.0;
+    let row_gap = 6.0;
+    let height = card_height * 2.0 + row_gap;
+    let (band, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), metrics.px(height)), egui::Sense::hover());
+    let grid = band.shrink2(metrics.vec2(FUEL_SIDE_MARGIN, 0.0));
+    for wheel in 0..4 {
+        let index = wheel + 1;
+        let Some(row) = controls.get(index) else { continue };
+        if let RowKind::Corner { armed, pressure_kpa, .. } = row.kind {
+            let strip = Rect::from_min_size(egui::pos2(grid.left(), grid.top() + metrics.px(card_height + row_gap) * (wheel / columns) as f32),
+                egui::vec2(grid.width(), metrics.px(card_height)));
+            let card = grouped_control_cell(strip, wheel % columns, columns, metrics.px(8.0));
+            draw_tyre_card(ui, metrics, card, &row.label, Wheel { armed, pressure_kpa, readout: readouts[wheel], bars, selected: cursor == index },
+                wear_threshold_pct, index, clicks);
+        }
+    }
+    ui.add_space(metrics.px(6.0));
+}
+
+/// Unknown and non-finite readings stay empty, while zero means fully worn.
+fn tyre_wear_fraction(readout: Option<TyreReadout>, slot: usize) -> Option<f32> {
+    readout.and_then(|r| r.wear.get(slot).copied()).filter(|value| value.is_finite()).map(|value| value.clamp(0.0, 1.0))
+}
+
+fn tyre_threshold_y(rect: Rect, threshold_pct: Option<u8>) -> Option<f32> {
+    threshold_pct.map(|value| rect.bottom() - rect.height() * f32::from(value.min(100)) / 100.0)
+}
+
+#[expect(clippy::too_many_arguments, reason = "one corner with policy, original control index and click collector")]
+fn draw_tyre_card(ui: &Ui, metrics: Metrics, card: Rect, label: &str, wheel: Wheel,
+    threshold_pct: Option<u8>, index: usize, clicks: &mut Vec<Click>) {
+    let Wheel { armed, pressure_kpa, readout, bars, selected } = wheel;
+    ui.painter().rect_filled(card, metrics.px(9.0), CONTROL_SURFACE);
+    if selected { paint_cursor_ring(ui, metrics, card, metrics.px(9.0)); }
+    let ink = if armed { theme::caution() } else { text_primary() };
+    paint_text(ui, egui::pos2(card.left() + metrics.px(12.0), card.top() + metrics.px(14.0)), egui::Align2::LEFT_CENTER,
+        RichText::new(label).size(metrics.px(13.0)).strong().color(text_secondary()));
+    let temp = readout.map_or_else(|| "\u{2014}".to_owned(), |r| format!("{:.0}\u{00b0}", r.mean_temp_c()));
+    paint_text(ui, egui::pos2(card.right() - metrics.px(12.0), card.top() + metrics.px(14.0)), egui::Align2::RIGHT_CENTER,
+        RichText::new(temp).size(metrics.px(13.0)).color(text_secondary()));
+    let tyre = Rect::from_center_size(egui::pos2(card.center().x, card.top() + metrics.px(60.0)), metrics.vec2(66.0, 68.0));
+    ui.painter().rect_filled(tyre, metrics.px(10.0), PAGE_SURFACE);
+    paint_armed_edge(ui, metrics, tyre, metrics.px(10.0), armed);
+    let tread = tyre.shrink(metrics.px(7.0));
+    for slot in 0..3 {
+        let column = grouped_control_cell(tread, slot, 3, metrics.px(3.0));
+        ui.painter().rect_filled(column, metrics.px(2.0), Color32::from_white_alpha(9));
+        if let Some(left) = tyre_wear_fraction(readout, slot) {
+            let fill = Rect::from_min_max(egui::pos2(column.left(), column.bottom() - column.height() * left), column.max);
+            let below = threshold_pct.is_some_and(|pct| left < f32::from(pct.min(100)) / 100.0);
+            ui.painter().rect_filled(fill, metrics.px(2.0), if below || left < TYRE_WEAR_WORN { theme::alert() } else { ink });
+        }
+    }
+    if let Some(y) = tyre_threshold_y(tread, threshold_pct) {
+        ui.painter().line_segment([egui::pos2(tread.left() - metrics.px(3.0), y), egui::pos2(tread.right() + metrics.px(3.0), y)],
+            Stroke::new(metrics.px(2.0), theme::caution()));
+    }
+    let toggle = Rect::from_min_max(egui::pos2(card.left(), card.top() + metrics.px(26.0)), egui::pos2(card.right(), card.top() + metrics.px(113.0)));
+    if hit(ui, toggle, ("tyre-card", index), clicks, Click::Control { index, action: Action::Toggle }) { paint_hover(ui, tyre, metrics.px(10.0)); }
+    paint_text(ui, egui::pos2(card.center().x, card.top() + metrics.px(106.0)), egui::Align2::CENTER_CENTER,
+        RichText::new(if armed { "CHANGE" } else { "KEEP" }).size(metrics.px(11.0)).strong().color(ink));
+    let stepper = Rect::from_min_max(egui::pos2(card.left() + metrics.px(8.0), card.top() + metrics.px(116.0)),
+        egui::pos2(card.right() - metrics.px(8.0), card.top() + metrics.px(144.0)));
+    ui.painter().rect_filled(stepper, metrics.px(5.0), PAGE_SURFACE);
+    let [minus, middle, plus] = grouped_step_regions(stepper, metrics);
+    for (button, glyph, action) in [(minus, "\u{2212}", Action::Decrement), (plus, "+", Action::Increment)] {
+        if hit(ui, button, ("tyre-pressure", index, glyph), clicks, Click::Control { index, action }) { paint_hover(ui, button, metrics.px(5.0)); }
+        paint_text(ui, button.center(), egui::Align2::CENTER_CENTER, RichText::new(glyph).size(metrics.px(17.0)).color(text_secondary()));
+    }
+    paint_text(ui, middle.center(), egui::Align2::CENTER_CENTER, RichText::new(format!("{pressure_kpa}")).size(metrics.px(13.0)).strong().color(text_primary()));
+    let detail = match (readout, bars) {
+        (Some(r), crate::config::TyreBars::Temps) => format!("{:.0}\u{00b0} / {:.0}\u{00b0} / {:.0}\u{00b0}", r.temps_c[0], r.temps_c[1], r.temps_c[2]),
+        _ => (0..3).map(|slot| tyre_wear_fraction(readout, slot).map_or_else(|| "\u{2014}".to_owned(), |v| format!("{:.0}%", v * 100.0))).collect::<Vec<_>>().join(" / "),
+    };
+    let detail = super::elide_to_width(ui, &detail, card.width() - metrics.px(10.0), |text| RichText::new(text).size(metrics.px(10.0)).color(text_secondary()));
+    paint_text(ui, egui::pos2(card.center().x, card.top() + metrics.px(155.0)), egui::Align2::CENTER_CENTER, detail);
+    let hot = readout.map_or_else(|| "kPa \u{00b7} no tyre reading".to_owned(), |r| format!("kPa \u{00b7} {:.0} hot", r.pressure_kpa));
+    let hot = super::elide_to_width(ui, &hot, card.width() - metrics.px(10.0), |text| RichText::new(text).size(metrics.px(10.0)).color(text_tertiary()));
+    paint_text(ui, egui::pos2(card.center().x, card.top() + metrics.px(170.0)), egui::Align2::CENTER_CENTER, hot);
+}
+
+fn draw_instrument_corners(
     ui: &mut Ui,
     metrics: Metrics,
     controls: &[Row],
@@ -2503,7 +2807,7 @@ fn draw_corners(
                     paint_hover(ui, side, metrics.px(TYRE_ROUNDING));
                 }
                 let glyph = Rect::from_center_size(side.center(), metrics.vec2(CHEVRON_SIZE, CHEVRON_SIZE));
-                let ink = if armed {
+                let ink = if armed && theme::is_instrument() {
                     Color32::from_black_alpha(if hovered { 230 } else { 110 })
                 } else if hovered {
                     text_primary()
@@ -2588,19 +2892,21 @@ fn draw_body(ui: &Ui, metrics: Metrics, columns: [f32; 2], axles: [f32; 2]) {
 fn draw_tyre(ui: &Ui, metrics: Metrics, rect: Rect, wheel: Wheel) {
     let Wheel { armed, pressure_kpa, readout, bars, selected } = wheel;
     let rounding = metrics.px(TYRE_ROUNDING);
-    // Amber is this panel's one loud color and it means armed — so a full set
-    // of tyres for the next stop is four lit wheels, and anything less is a
-    // shape with a hole in it.
-    let (fill, quiet, loud) = if armed {
+    // Amber edges and pressure labels identify the set armed for the stop.
+    // Dark tread surfaces leave temperature and wear alerts easy to find.
+    let (fill, quiet, loud) = if armed && theme::is_instrument() {
         (theme::caution(), Color32::from_black_alpha(160), Color32::from_black_alpha(230))
+    } else if armed {
+        (ARMED_SURFACE, text_secondary(), theme::caution())
     } else {
-        (super::CONTROL_PLATE, text_tertiary(), text_primary())
+        (control_surface(), text_tertiary(), text_primary())
     };
     ui.painter().rect_filled(rect, rounding, fill);
+    paint_armed_edge(ui, metrics, rect, rounding, armed);
 
     // Grooves down the tread, which is what makes this read as a tyre rather
     // than as a rounded rectangle with a number in it.
-    let groove = Color32::from_black_alpha(if armed { 45 } else { 95 });
+    let groove = Color32::from_black_alpha(if armed && theme::is_instrument() { 45 } else { 95 });
     for fraction in TREAD_GROOVES {
         let x = rect.left() + rect.width() * fraction;
         ui.painter().rect_filled(
@@ -2631,7 +2937,7 @@ fn draw_tyre(ui: &Ui, metrics: Metrics, rect: Rect, wheel: Wheel) {
     let inner = rect.shrink2(metrics.vec2(TYRE_PAD_X, 0.0));
     let bars_top = rect.top() + metrics.px(TYRE_BARS_TOP);
     let bars_bottom = bars_top + metrics.px(TYRE_BARS_HEIGHT);
-    let trough = Color32::from_black_alpha(if armed { 40 } else { 90 });
+    let trough = Color32::from_black_alpha(if armed && theme::is_instrument() { 40 } else { 90 });
     let step = inner.width() / 3.0;
     let mean = readout.map(TyreReadout::mean_temp_c);
     let span = readout
@@ -2710,8 +3016,7 @@ fn draw_tyre(ui: &Ui, metrics: Metrics, rect: Rect, wheel: Wheel) {
         );
     }
 
-    // A ring rather than the olive the rows use: there is no row here to wash,
-    // and a ring around the object is how an instrument says "this one".
+    // Focus surrounds the whole wheel, separate from its service state.
     if selected {
         paint_cursor_ring(ui, metrics, rect, rounding);
     }
@@ -2722,13 +3027,13 @@ fn draw_tyre(ui: &Ui, metrics: Metrics, rect: Rect, wheel: Wheel) {
 /// Red for the hot edge, blue for the cold one, quiet in between — the one
 /// place in the overlay a number earns a ramp, because the whole question is
 /// which end of a set of three is out of line. On an armed (amber) wheel the
-/// quiet bar is ink rather than paper, so it still reads as a bar.
+/// quiet bar is ink in Instrument; Panel keeps light bars on its dark tread.
 fn temp_colour(off_mean_c: f32, armed: bool) -> Color32 {
     if off_mean_c >= TYRE_TEMP_FAR_C {
         theme::alert()
     } else if off_mean_c <= -TYRE_TEMP_FAR_C {
         super::LAPPED
-    } else if armed {
+    } else if armed && theme::is_instrument() {
         Color32::from_black_alpha(120)
     } else {
         text_secondary()
@@ -2737,28 +3042,26 @@ fn temp_colour(off_mean_c: f32, armed: bool) -> Color32 {
 
 /// The whole-set control, on a plate because it is one.
 ///
-/// Armed, the plate itself fills amber with its label dark on top — the same
-/// way an armed tyre does, and for the same reason: the four wheels and the
-/// control that arms all four should light up alike, so "everything is on"
-/// reads as one lit shape rather than as four lit wheels beside a word that
-/// changed color.
+/// Uses the same amber service treatment as each tyre. Focus is neutral,
+/// so selecting the control cannot be confused with arming the whole set.
 fn draw_all_four(ui: &Ui, metrics: Metrics, centre: egui::Pos2, label: &str, checked: bool, selected: bool) {
     let plate = Rect::from_center_size(centre, metrics.vec2(ALL_FOUR_SIZE.0, ALL_FOUR_SIZE.1));
-    // The cursor is the olive the rows use, as a fill rather than a ring: a
-    // ring round this plate read as a border. Armed, the plate stays amber
-    // and the olive is a bar along its foot.
+    // When armed, the surface keeps its service colour and focus moves to
+    // the short bar beneath it.
     let (fill, label_color) = match (checked, selected) {
-        (true, _) => (theme::caution(), Color32::from_black_alpha(230)),
-        (false, true) => (PLAYER_ROW, text_primary()),
-        (false, false) => (super::CONTROL_PLATE, text_secondary()),
+        (true, _) if theme::is_instrument() => (theme::caution(), Color32::from_black_alpha(230)),
+        (true, _) => (ARMED_SURFACE, theme::caution()),
+        (false, true) => (cursor_fill(), text_primary()),
+        (false, false) => (control_surface(), text_secondary()),
     };
     super::paint_control_plate_filled(ui, plate, metrics.px(PLATE_ROUNDING), fill);
+    paint_armed_edge(ui, metrics, plate, metrics.px(PLATE_ROUNDING), checked);
     if checked && selected {
         let bar = Rect::from_min_max(
             egui::pos2(plate.left() + metrics.px(PLATE_ROUNDING), plate.bottom() - metrics.px(ALL_FOUR_CURSOR_BAR)),
             egui::pos2(plate.right() - metrics.px(PLATE_ROUNDING), plate.bottom()),
         );
-        ui.painter().rect_filled(bar, metrics.px(2.0), PLAYER_ROW);
+        ui.painter().rect_filled(bar, metrics.px(2.0), cursor_ink());
     }
 
     paint_text(
@@ -2842,25 +3145,22 @@ fn draw_row(ui: &mut Ui, metrics: Metrics, row: &Row, style: RowStyle) {
         egui::Rounding::ZERO
     };
 
-    // The cursor takes the olive the Relative gives the player's own row.
-    // "The row that is you" and "the row you are about to change" are one
-    // idea, and the overlay should have one way of drawing it. It replaces an
-    // outlined pill, which read as a dialog control dropped onto an
-    // instrument face.
-    // A slash was tried at the row's leading edge as well, borrowed from the
-    // Relative. On a row whose left half is empty it had nothing to sit
-    // between and read as a stray glyph rather than as a mark; the olive says
-    // "this row" on its own, and the slant is already spent on the control
-    // plate, which is where it earns its keep.
+    // Slate and a small white locator repeat the timing panels' focus
+    // hierarchy, keeping the selected row distinct from semantic colours.
     if style.selected {
-        ui.painter().rect_filled(rect, rounding, PLAYER_ROW);
+        ui.painter().rect_filled(rect, rounding, cursor_fill());
+        if !theme::is_instrument() {
+            let locator =
+                Rect::from_center_size(egui::pos2(rect.left() + metrics.px(6.0), middle), metrics.vec2(2.0, 13.0));
+            ui.painter().rect_filled(locator, metrics.px(1.0), cursor_ink());
+        }
     } else if let Some(stripe) = row_stripe(style.odd) {
         ui.painter().rect_filled(rect, rounding, stripe);
     }
 
     // On the row's own top edge rather than its bottom, so the run ends
     // cleanly against the card instead of on a divider with nothing under it.
-    if !style.seat.is_first() {
+    if !style.seat.is_first() && theme::is_instrument() {
         super::paint_row_groove(ui, rect.top(), rect.left(), rect.right());
     }
 
@@ -2930,7 +3230,11 @@ fn draw_stepper(ui: &Ui, metrics: Metrics, rect: Rect, split: f32, value: &str, 
         egui::pos2(split, rect.top() + metrics.px(PLATE_INSET_Y)),
         egui::pos2(rect.right() - metrics.px(PLATE_RIGHT_INSET), rect.bottom() - metrics.px(PLATE_INSET_Y)),
     );
-    super::paint_control_plate(ui, plate, metrics.px(PLATE_ROUNDING));
+    if theme::is_instrument() {
+        super::paint_control_plate(ui, plate, metrics.px(PLATE_ROUNDING));
+    } else {
+        super::paint_control_plate_filled(ui, plate, metrics.px(PLATE_ROUNDING), control_surface());
+    }
 
     let left = plate.left() + metrics.px(CHEVRON_INSET);
     let right = plate.right() - metrics.px(CHEVRON_INSET);
@@ -3439,5 +3743,76 @@ mod tests {
         box_.throttle_auto_fuel(PitRequest::SetFuel(55), Instant::now());
         assert_eq!(box_.auto_fuel_request(None, &settings, Instant::now()), None);
         assert!(box_.last_auto_fuel_at.is_none(), "so switching back on arms straight away");
+    }
+}
+
+#[cfg(test)]
+mod grouped_controls_tests {
+    use super::*;
+
+    #[test]
+    fn provenance_does_not_shift_crew_action_indices() {
+        let rows = vec![
+            Row { label: "Via".into(), kind: RowKind::Static { value: "Teammate".into() } },
+            Row { label: "Add".into(), kind: RowKind::Stepper { value: "45 L".into(), control: Control::Fuel } },
+            Row { label: "Fuel".into(), kind: RowKind::Toggle { checked: true, control: Control::Fuel } },
+        ];
+        assert_eq!(grouped_control_indices(&rows), vec![1, 2]);
+    }
+
+    #[test]
+    fn compact_cards_and_buttons_remain_disjoint_at_each_scale() {
+        for scale in [0.65, 1.0, 1.5, 2.0] {
+            let metrics = Metrics::new(scale);
+            let group = Rect::from_min_size(egui::pos2(10.0, 20.0), metrics.vec2(480.0, 92.0));
+            for count in [2, 3] {
+                let mut previous: Option<Rect> = None;
+                for slot in 0..count {
+                    let cell = grouped_control_cell(group, slot, count, metrics.px(6.0));
+                    assert!(group.contains_rect(cell));
+                    if let Some(previous) = previous { assert!(previous.right() < cell.left()); }
+                    let step = Rect::from_min_size(cell.min, egui::vec2(cell.width(), metrics.px(32.0)));
+                    let [minus, value, plus] = grouped_step_regions(step, metrics);
+                    assert!((minus.width() - metrics.px(32.0)).abs() < 0.001);
+                    assert!((plus.width() - metrics.px(32.0)).abs() < 0.001);
+                    assert_eq!(minus.right(), value.left());
+                    assert_eq!(value.right(), plus.left());
+                    assert!(!minus.contains(plus.center()));
+                    assert!(!plus.contains(minus.center()));
+                    previous = Some(cell);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tyre_card_tests {
+    use super::*;
+
+    #[test]
+    fn wear_columns_preserve_three_readings_and_unknowns() {
+        let readout = Some(TyreReadout { temps_c: [80.0; 3], wear: [0.0, 0.72, 1.0], pressure_kpa: 180.0 });
+        assert_eq!(tyre_wear_fraction(readout, 0), Some(0.0));
+        assert_eq!(tyre_wear_fraction(readout, 1), Some(0.72));
+        assert_eq!(tyre_wear_fraction(readout, 2), Some(1.0));
+        assert_eq!(tyre_wear_fraction(None, 0), None);
+        assert_eq!(tyre_wear_fraction(readout, 3), None);
+        let invalid = Some(TyreReadout { temps_c: [0.0; 3], wear: [f32::NAN, -0.1, 1.2], pressure_kpa: 0.0 });
+        assert_eq!(tyre_wear_fraction(invalid, 0), None);
+        assert_eq!(tyre_wear_fraction(invalid, 1), Some(0.0));
+        assert_eq!(tyre_wear_fraction(invalid, 2), Some(1.0));
+    }
+
+    #[test]
+    fn wear_policy_line_uses_same_fraction_as_tread_fill() {
+        for scale in [0.65, 1.0, 2.0] {
+            let rect = Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(50.0 * scale, 100.0 * scale));
+            assert_eq!(tyre_threshold_y(rect, None), None);
+            assert_eq!(tyre_threshold_y(rect, Some(0)), Some(rect.bottom()));
+            assert_eq!(tyre_threshold_y(rect, Some(100)), Some(rect.top()));
+            assert_eq!(tyre_threshold_y(rect, Some(75)), Some(rect.bottom() - rect.height() * 0.75));
+            assert_eq!(tyre_threshold_y(rect, Some(255)), Some(rect.top()));
+        }
     }
 }

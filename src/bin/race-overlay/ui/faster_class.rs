@@ -41,7 +41,7 @@ const CARD_WIDTH: f32 = 320.0;
 const CARD_PAD: (f32, f32) = (16.0, 12.0);
 const CONTENT_HEIGHT: f32 = 104.0;
 /// The stripe down the card's inner left edge, and the gap to the content.
-const STRIPE_WIDTH: f32 = 6.0;
+const STRIPE_WIDTH: f32 = 4.0;
 const STRIPE_GAP: f32 = 12.0;
 
 /// The header row: class tag, car number, driver, and the "+N" chip.
@@ -82,7 +82,7 @@ const PLATE_MAX_WIDTH: f32 = 64.0;
 const PLATE_LABEL_SIZE: f32 = 10.0;
 /// The wash over the part of the track inside the alert threshold.
 const ALERT_ZONE_ALPHA: u8 = 55;
-const TRACK_ALPHA: u8 = 22;
+const TRACK_ALPHA: u8 = 6;
 
 /// How fast the alert level flashes, and how far the dim half drops.
 ///
@@ -127,7 +127,8 @@ pub fn draw(
     let metrics = Metrics::new(config.scale);
     let now = ui.input(|input| input.time);
     let colour = level_colour(level, config.flash && !flash_on(now));
-    card_frame(metrics, PANEL_BG, margin(metrics, CARD_PAD.0, CARD_PAD.1), card_rounding(metrics)).show(ui, |ui| {
+    let surface = if theme::is_instrument() { PANEL_BG } else { Color32::from_rgba_premultiplied(17, 19, 23, 218) };
+    card_frame(metrics, surface, margin(metrics, CARD_PAD.0, CARD_PAD.1), card_rounding(metrics)).show(ui, |ui| {
         let (rect, _response) =
             ui.allocate_exact_size(metrics.vec2(CARD_WIDTH - CARD_PAD.0 * 2.0, CONTENT_HEIGHT), egui::Sense::hover());
         stripe(ui, metrics, rect, colour);
@@ -155,19 +156,22 @@ fn header(ui: &Ui, metrics: Metrics, content: Rect, car: &Approaching, others: u
     // Standings puts on a class header, so it reads as the same thing.
     let tag = Rect::from_min_size(row.min, egui::vec2(metrics.px(TAG_WIDTH), row.height()));
     let name = if car.car_class_short_name.is_empty() { "?" } else { &*car.car_class_short_name };
-    ui.painter().rect_filled(tag, rounding, class_color(&car.car_class_color));
+    let class = class_color(&car.car_class_color);
+    let (tag_fill, tag_ink) =
+        if theme::is_instrument() { (class, Color32::from_black_alpha(230)) } else { (tint(class, 24), class) };
+    ui.painter().rect_filled(tag, rounding, tag_fill);
     paint_text(
         ui,
         tag.center(),
         egui::Align2::CENTER_CENTER,
-        RichText::new(name).size(metrics.px(TAG_SIZE)).strong().color(Color32::from_black_alpha(230)),
+        RichText::new(name).size(metrics.px(TAG_SIZE)).strong().color(tag_ink),
     );
 
     // The chip is laid out first so the driver's name knows where to stop.
     let mut right = row.right();
     if others > 0 {
         let chip = Rect::from_min_max(egui::pos2(row.right() - metrics.px(OTHERS_WIDTH), row.top()), row.max);
-        ui.painter().rect_filled(chip, rounding, tint(colour, 60));
+        ui.painter().rect_filled(chip, rounding, tint(colour, if theme::is_instrument() { 60 } else { 16 }));
         paint_text(
             ui,
             chip.center(),
@@ -180,12 +184,11 @@ fn header(ui: &Ui, metrics: Metrics, content: Rect, car: &Approaching, others: u
     let mut x = tag.right() + metrics.px(TAG_GAP);
     let middle = row.center().y;
     if !car.car_number.is_empty() {
-        let number =
-            RichText::new(format!("#{}", car.car_number)).size(metrics.px(NAME_SIZE)).strong().color(text_primary());
+        let number = RichText::new(format!("#{}", car.car_number)).size(metrics.px(NAME_SIZE)).color(text_secondary());
         paint_text(ui, egui::pos2(x, middle), egui::Align2::LEFT_CENTER, number.clone());
         x += text_width(ui, number) + metrics.px(NAME_GAP);
     }
-    let driver = |text: &str| RichText::new(text).size(metrics.px(NAME_SIZE)).color(text_secondary());
+    let driver = |text: &str| RichText::new(text).size(metrics.px(NAME_SIZE)).color(text_primary());
     let fitted = fit(&car.driver_name, right - x, |text| text_width(ui, driver(text)));
     paint_text(ui, egui::pos2(x, middle), egui::Align2::LEFT_CENTER, driver(&fitted));
 }
@@ -199,7 +202,8 @@ fn gap_readout(ui: &Ui, metrics: Metrics, content: Rect, car: &Approaching, leve
     let middle = row.center().y;
 
     // A car alongside or just past has no gap worth a decimal; zero says so.
-    let figure = readout(format!("{:.1}", car.behind_secs.max(0.0)), metrics.px(READOUT_SIZE)).color(colour);
+    let ink = if level == Level::Warn && !theme::is_instrument() { text_primary() } else { colour };
+    let figure = readout(format!("{:.1}", car.behind_secs.max(0.0)), metrics.px(READOUT_SIZE)).color(ink);
     let figure_width = text_width(ui, figure.clone());
     paint_text(ui, egui::pos2(row.left(), middle), egui::Align2::LEFT_CENTER, figure);
     paint_text(

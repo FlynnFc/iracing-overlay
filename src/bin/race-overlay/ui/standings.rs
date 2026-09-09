@@ -1,6 +1,6 @@
 // Rust guideline compliant 2026-02-16
 
-//! Renders the Standings widget, matching `design mocks/Screenshot_11.jpg`.
+//! Renders the Standings as one continuous, softly layered timing table.
 //!
 //! One card, three bands: the drivers, their timing (gap, fastest, last), and
 //! — in endurance mode — their strategy (stint, stops owed, projected net
@@ -10,8 +10,8 @@
 //! The bands are laid out from one shared row plan rather than by three
 //! independent layouts. Row heights are fixed per row kind, so the plan can
 //! be walked once per column and every column lands on the same y — which is
-//! the whole reason the design can split a single logical row across two
-//! cards and a gutter without them drifting apart.
+//! the whole reason the design can split a single logical row across several
+//! bands and a gutter without them drifting apart.
 //!
 //! Positions are class-relative throughout: each class gets its own section
 //! showing its leaders, and the player's own class additionally opens out
@@ -135,12 +135,12 @@ const GUTTER_WIDTH: f32 = 32.0;
 /// so the track shows through the standings more than the other widgets.
 /// Standings is the tallest panel on screen, and at the shared opacity it
 /// reads as a wall rather than an overlay.
-const STANDINGS_BG: Color32 = Color32::from_rgba_premultiplied(12, 12, 12, 170);
+const STANDINGS_BG: Color32 = Color32::from_rgba_premultiplied(17, 19, 23, 218);
 /// The timing band's lifted fill, faded by the same step as [`STANDINGS_BG`]
 /// so the bands keep their contrast with each other; and the strategy band's,
 /// lifted the same step again.
-const STANDINGS_TILE_BG: Color32 = Color32::from_rgba_premultiplied(20, 20, 22, 185);
-const STANDINGS_STRATEGY_BG: Color32 = Color32::from_rgba_premultiplied(28, 28, 31, 200);
+const STANDINGS_TILE_BG: Color32 = Color32::from_rgba_premultiplied(22, 24, 29, 222);
+const STANDINGS_STRATEGY_BG: Color32 = Color32::from_rgba_premultiplied(27, 29, 35, 226);
 
 /// Fixed row heights. These are what keep the three columns in lockstep, so
 /// they must not depend on a row's content.
@@ -166,13 +166,8 @@ const TOP_BAR_HEIGHT: f32 = 38.0;
 
 /// Type scale.
 const NAME_SIZE: f32 = 18.0;
-/// The position, in the readout face — see `ui::readout`.
-/// The position, in the readout face.
-///
-/// Sized to fill its plate rather than to sit inside it — the same call as
-/// the Relative's. It is the one thing on a row read at a glance rather than
-/// studied, and the plate is otherwise empty slate.
-const POSITION_SIZE: f32 = 26.0;
+/// The position leads the row, with breathing room inside its compact tile.
+const POSITION_SIZE: f32 = 22.0;
 const TIME_SIZE: f32 = 16.0;
 const CLOCK_SIZE: f32 = 18.0;
 const COLUMN_LABEL_SIZE: f32 = 14.0;
@@ -333,7 +328,7 @@ struct RowStyle {
 
 /// One entry in the shared row plan the three columns are painted from.
 enum Row<'a> {
-    /// A class banner: skewed tag, car count, and that class's field strength.
+    /// A class banner: a tinted label, car count, and field strength.
     ClassHeader(&'a ClassSection),
     Driver(&'a StandingsEntry),
     /// The break between a class's leaders and the window around the player.
@@ -455,6 +450,7 @@ pub fn draw(ui: &mut Ui, snapshot: Option<&TelemetrySnapshot>, config: &Standing
                             show_stint_laps: config.show_stint_laps,
                             show_flags: options.show_flags,
                             name_width: name_width(config),
+                            timing_order: timing_order(&config.column_order),
                         },
                     );
                     if show_summary {
@@ -518,6 +514,7 @@ struct ColumnsSpec {
     show_flags: bool,
     /// The driver band's width, already clamped — see [`name_width`].
     name_width: f32,
+    timing_order: [crate::config::StandingsColumn; 3],
 }
 
 /// Lays the table's columns side by side from one shared row plan.
@@ -543,6 +540,7 @@ fn draw_columns(
         show_stint_laps,
         show_flags,
         name_width,
+        timing_order,
     } = spec;
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
@@ -572,8 +570,8 @@ fn draw_columns(
             },
             rows,
             tumble,
-            |ui, metrics, rect| draw_right_top_bar(ui, metrics, rect, show_tyres),
-            |ui, metrics, rect, row, style| draw_right_row(ui, metrics, rect, row, style, show_tyres),
+            |ui, metrics, rect| draw_right_top_bar(ui, metrics, rect, show_tyres, timing_order),
+            |ui, metrics, rect, row, style| draw_right_row(ui, metrics, rect, row, style, show_tyres, timing_order),
         );
         if show_endurance {
             column(
@@ -778,7 +776,17 @@ fn draw_left_top_bar(ui: &Ui, metrics: Metrics, rect: Rect, meta: &TopBarMeta) {
 
     let letter = meta.session_letter();
     let badge = Rect::from_center_size(egui::pos2(inner.left() + metrics.px(11.0), middle), metrics.vec2(22.0, 22.0));
-    icons::circled_text(ui, badge, &letter, text_secondary(), metrics.px(11.0));
+    if theme::is_instrument() {
+        icons::circled_text(ui, badge, &letter, text_secondary(), metrics.px(11.0));
+    } else {
+        ui.painter().rect_filled(badge, metrics.px(6.0), Color32::from_white_alpha(10));
+        paint_text(
+            ui,
+            badge.center(),
+            egui::Align2::CENTER_CENTER,
+            RichText::new(letter).size(metrics.px(11.0)).strong().color(text_secondary()),
+        );
+    }
 
     // A held clock reads quieter than a running one, so a driver can tell at
     // a glance whether the race has started without reading the number twice.
@@ -867,9 +875,15 @@ fn draw_left_top_bar(ui: &Ui, metrics: Metrics, rect: Rect, meta: &TopBarMeta) {
 }
 
 /// The right card's top bar: the timing column headings.
-fn draw_right_top_bar(ui: &Ui, metrics: Metrics, rect: Rect, show_tyres: bool) {
+fn draw_right_top_bar(
+    ui: &Ui,
+    metrics: Metrics,
+    rect: Rect,
+    show_tyres: bool,
+    order: [crate::config::StandingsColumn; 3],
+) {
     let middle = rect.center().y;
-    for (label, x) in timing_columns(metrics, rect) {
+    for (label, x) in timing_columns(metrics, rect, order) {
         paint_text(
             ui,
             egui::pos2(x, middle),
@@ -888,9 +902,33 @@ fn draw_right_top_bar(ui: &Ui, metrics: Metrics, rect: Rect, show_tyres: bool) {
 }
 
 /// The timing card's three column headings and their left edges.
-fn timing_columns(metrics: Metrics, rect: Rect) -> [(&'static str, f32); 3] {
-    let left = rect.left() + metrics.px(12.0);
-    [("Gap", left), ("Fastest", left + metrics.px(56.0)), ("Last", left + metrics.px(158.0))]
+fn timing_order(configured: &[crate::config::StandingsColumn]) -> [crate::config::StandingsColumn; 3] {
+    let mut result = Vec::new();
+    for column in configured.iter().copied().chain(crate::config::StandingsColumn::ALL) {
+        if !result.contains(&column) {
+            result.push(column);
+        }
+    }
+    [result[0], result[1], result[2]]
+}
+fn timing_columns(
+    metrics: Metrics,
+    rect: Rect,
+    order: [crate::config::StandingsColumn; 3],
+) -> [(&'static str, f32); 3] {
+    use crate::config::StandingsColumn as C;
+    let mut result = [("Gap", 0.0), ("Fastest", 0.0), ("Last", 0.0)];
+    let mut x = rect.left() + metrics.px(12.0);
+    for column in order {
+        let (index, width) = match column {
+            C::Gap => (0, 56.0),
+            C::Fastest => (1, 102.0),
+            C::Last => (2, 102.0),
+        };
+        result[index].1 = x;
+        x += metrics.px(width);
+    }
+    result
 }
 
 /// One row of the left card: class banner, driver, or a skip break.
@@ -914,7 +952,7 @@ fn draw_left_row(
     }
 }
 
-/// A class banner: a two-block tag, then that class's SOF.
+/// A class banner: a tinted class label, quiet car count, and field strength.
 fn draw_class_header(ui: &Ui, metrics: Metrics, rect: Rect, section: &ClassSection, class_count: usize) {
     // One class running means the tag has nothing to tell apart, so it is
     // paper rather than a colour that would only be decoration.
@@ -924,36 +962,32 @@ fn draw_class_header(ui: &Ui, metrics: Metrics, rect: Rect, section: &ClassSecti
     let middle = inner.center().y;
     let rounding = metrics.px(BLOCK_ROUNDING);
 
-    // First block: the class itself, on a solid block of its color. It leads
-    // because it is what the section *is*; the count is a detail about it, and
-    // the header used to open on a number with no unit attached to it.
+    // Class color stays local to its label, leaving timing data to carry the
+    // contrast in the table below.
     let name = if section.short_name.is_empty() { "?" } else { &*section.short_name };
     let name_rect = Rect::from_min_max(
         egui::pos2(inner.left() + metrics.px(CLASS_TAG_INSET), inner.top()),
         egui::pos2(inner.left() + metrics.px(CLASS_TAG_INSET + CLASS_TAG_WIDTH), inner.bottom()),
     );
-    ui.painter().rect_filled(name_rect, rounding, color);
+    ui.painter().rect_filled(name_rect, rounding, tint(color, 24));
     paint_text(
         ui,
         name_rect.center(),
         egui::Align2::CENTER_CENTER,
-        RichText::new(name).size(metrics.px(TAG_SIZE)).strong().color(Color32::from_black_alpha(230)),
+        RichText::new(name).size(metrics.px(TAG_SIZE)).strong().color(color),
     );
 
-    // Second block: how many cars are in it, on a darkened tint of the same
-    // color. The car icon that used to sit beside this is gone — the number is
-    // in a block labelled with the class it counts, so nothing was asking what
-    // it counted.
+    // The count shares the class label's baseline without another badge.
     let count_rect = Rect::from_min_max(
         egui::pos2(name_rect.right() + metrics.px(CLASS_TAG_GAP), inner.top()),
         egui::pos2(name_rect.right() + metrics.px(CLASS_TAG_GAP + COUNT_TAG_WIDTH), inner.bottom()),
     );
-    ui.painter().rect_filled(count_rect, rounding, tint(color, 60));
+    // The count is supporting text, with no second badge.
     paint_text(
         ui,
         count_rect.center(),
         egui::Align2::CENTER_CENTER,
-        RichText::new(section.car_count.to_string()).size(metrics.px(TAG_SIZE)).strong().color(color),
+        RichText::new(section.car_count.to_string()).size(metrics.px(TAG_SIZE)).color(text_secondary()),
     );
 
     if let Some(sof) = section.sof {
@@ -961,7 +995,7 @@ fn draw_class_header(ui: &Ui, metrics: Metrics, rect: Rect, section: &ClassSecti
             ui,
             egui::pos2(rect.right() - metrics.px(14.0), middle),
             egui::Align2::RIGHT_CENTER,
-            RichText::new(format!("SOF {sof}")).size(metrics.px(TAG_SIZE)).strong().color(color),
+            RichText::new(format!("SOF {sof}")).size(metrics.px(TAG_SIZE)).color(text_secondary()),
         );
     }
 }
@@ -1068,23 +1102,23 @@ fn draw_driver_row(
     let name_x = rect.left() + metrics.px(NAME_X + change_slot + flag_slot);
     let name_room = (pill.left() - metrics.px(10.0) - name_x).max(0.0);
     let name = super::elide_to_width(ui, &entry.driver_name, name_room, |text| {
-        RichText::new(text).size(metrics.px(NAME_SIZE)).strong().color(text_color)
+        let label = RichText::new(text).size(metrics.px(NAME_SIZE)).color(text_color);
+        if entry.is_focus { label.strong() } else { label }
     });
     paint_text(ui, egui::pos2(name_x, middle), egui::Align2::LEFT_CENTER, name);
-    ui.painter().rect_filled(pill, metrics.px(5.0), Color32::from_black_alpha(if dimmed { 90 } else { 150 }));
+    ui.painter().rect_filled(pill, metrics.px(6.0), Color32::from_white_alpha(if dimmed { 3 } else { 7 }));
     paint_text(
         ui,
         pill.center(),
         egui::Align2::CENTER_CENTER,
-        RichText::new(format_irating(entry.irating))
-            .monospace()
-            .size(metrics.px(RATING_SIZE))
-            .strong()
-            .color(if dimmed { text_tertiary() } else { text_primary() }),
+        RichText::new(format_irating(entry.irating)).monospace().size(metrics.px(RATING_SIZE)).color(if dimmed {
+            text_tertiary()
+        } else {
+            text_secondary()
+        }),
     );
 
-    // The stint tooltip has no visual weight in the mockup, but the data is
-    // genuinely useful and the row is already a hover target.
+    // Keep strategy detail available without adding another visible column.
     stint_tooltip(ui, rect, entry);
 }
 
@@ -1173,7 +1207,15 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 }
 
 /// One row of the timing card.
-fn draw_right_row(ui: &mut Ui, metrics: Metrics, rect: Rect, row: &Row<'_>, style: RowStyle, show_tyres: bool) {
+fn draw_right_row(
+    ui: &mut Ui,
+    metrics: Metrics,
+    rect: Rect,
+    row: &Row<'_>,
+    style: RowStyle,
+    show_tyres: bool,
+    order: [crate::config::StandingsColumn; 3],
+) {
     let Row::Driver(entry) = row else { return };
     let dimmed = is_dimmed(entry);
     let middle = rect.center().y;
@@ -1184,7 +1226,7 @@ fn draw_right_row(ui: &mut Ui, metrics: Metrics, rect: Rect, row: &Row<'_>, styl
         ui.painter().rect_filled(rect, style.rounding, stripe);
     }
 
-    let columns = timing_columns(metrics, rect);
+    let columns = timing_columns(metrics, rect, order);
     let text_color = if entry.is_focus {
         Color32::WHITE
     } else if dimmed {
@@ -1216,15 +1258,16 @@ fn draw_right_row(ui: &mut Ui, metrics: Metrics, rect: Rect, row: &Row<'_>, styl
         );
     }
 
-    // The class's fastest lap gets a filled cell rather than just colored
-    // text, matching the stopwatch chip this same row gets in the gutter.
+    // The fastest lap receives a soft inset tint. Its semantic accent is
+    // repeated by the stopwatch in the gutter.
+    let lap_color = if entry.is_focus || dimmed { text_color } else { text_secondary() };
     let fastest_text = format_lap_time(entry.best_lap_secs);
     if entry.is_class_fastest {
         let cell = Rect::from_min_max(
             egui::pos2(columns[1].1 - metrics.px(8.0), rect.top() + metrics.px(3.0)),
             egui::pos2(columns[1].1 + metrics.px(98.0), rect.bottom() - metrics.px(3.0)),
         );
-        ui.painter().rect_filled(cell, metrics.px(4.0), theme::fastest_cell());
+        ui.painter().rect_filled(cell, metrics.px(6.0), theme::fastest_cell());
     }
     paint_text(
         ui,
@@ -1233,7 +1276,7 @@ fn draw_right_row(ui: &mut Ui, metrics: Metrics, rect: Rect, row: &Row<'_>, styl
         RichText::new(fastest_text).monospace().size(metrics.px(TIME_SIZE)).color(if entry.is_class_fastest {
             theme::fastest_text()
         } else {
-            text_color
+            lap_color
         }),
     );
 
@@ -1241,7 +1284,7 @@ fn draw_right_row(ui: &mut Ui, metrics: Metrics, rect: Rect, row: &Row<'_>, styl
         ui,
         egui::pos2(columns[2].1, middle),
         egui::Align2::LEFT_CENTER,
-        RichText::new(format_lap_time(entry.last_lap_secs)).monospace().size(metrics.px(TIME_SIZE)).color(text_color),
+        RichText::new(format_lap_time(entry.last_lap_secs)).monospace().size(metrics.px(TIME_SIZE)).color(lap_color),
     );
 
     // The compound circle: the letter ringed in the panel's water blue for a
@@ -1510,10 +1553,7 @@ fn draw_gutter_row(ui: &mut Ui, metrics: Metrics, rect: Rect, row: &Row<'_>, _st
     }
 }
 
-/// Paints each class banner's underline across both cards.
-///
-/// Drawn after the cards rather than inside either one, because the rule
-/// spans them both — it's what ties a class's name to its timing column.
+/// A subdued class hairline connects the label to timing and strategy data.
 fn paint_class_rules(
     ui: &Ui,
     metrics: Metrics,
@@ -1530,10 +1570,10 @@ fn paint_class_rules(
         let height = metrics.px(row.height());
         if let Row::ClassHeader(section) = row {
             let rule = Rect::from_min_size(
-                egui::pos2(left_rect.left(), y + height - metrics.px(2.0)),
-                egui::vec2(full_width, metrics.px(2.0)),
+                egui::pos2(left_rect.left() + metrics.px(10.0), y + height - metrics.px(1.0)),
+                egui::vec2(full_width - metrics.px(20.0), metrics.px(1.0)),
             );
-            ui.painter().rect_filled(rule, 0.0, tint(class_color(&section.color), 200));
+            ui.painter().rect_filled(rule, 0.0, tint(class_color(&section.color), 65));
         }
         y += height;
     }
@@ -1626,7 +1666,7 @@ struct TopBarMeta {
 }
 
 impl TopBarMeta {
-    /// The session's initial, as the mockup's circled badge shows it.
+    /// The session's initial, shown in the compact session badge.
     fn session_letter(&self) -> String {
         self.session_kind.letter().to_owned()
     }

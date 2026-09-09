@@ -1,0 +1,1 @@
+{"name":"pitwall-site","private":true,"version":"1.0.0","scripts":{"dev":"node serve.mjs","build":"node build.mjs","test":"node --test test/site.test.cjs"}}

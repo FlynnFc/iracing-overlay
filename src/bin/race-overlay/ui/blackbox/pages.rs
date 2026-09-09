@@ -304,7 +304,7 @@ pub fn tires(snapshot: &TelemetrySnapshot, bars: crate::config::TyreBars) -> Pag
     });
     PageLayout {
         controls,
-        shape: Shape::Corners { compound: service.pending_tyre_compound, readouts: Box::new(readouts), bars },
+        shape: Shape::Corners { compound: service.pending_tyre_compound, readouts: Box::new(readouts), bars, wear_threshold_pct: None },
     }
 }
 

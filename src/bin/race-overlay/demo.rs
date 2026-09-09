@@ -81,14 +81,14 @@ pub fn snapshot() -> TelemetrySnapshot {
         class_sections: vec![
             ClassSection {
                 car_class_id: DP.0,
-                short_name: Arc::from(DP.1),
+                short_name: Arc::from("GTP"),
                 color: Arc::from(DP.2),
                 car_count: 1,
                 sof: Some(1852),
             },
             ClassSection {
                 car_class_id: GTE.0,
-                short_name: Arc::from(GTE.1),
+                short_name: Arc::from("LMP2"),
                 color: Arc::from(GTE.2),
                 car_count: 20,
                 sof: Some(4690),
@@ -277,24 +277,24 @@ const fn lap(minutes: f32, seconds: f32) -> f32 {
     reason = "a verbatim transcription of the mockup's classification table; splitting it per class would scatter the data this fixture exists to hold in one readable place"
 )]
 fn standings() -> Vec<StandingsEntry> {
-    let dp = [Row {
+    let gtp = [Row {
         class_position: 1,
         position: 1,
         name: "Driver 1",
-        car: "Chevrolet Corvette C8.R GTE",
+        car: "Ferrari 499P",
         irating: 1800,
         gap: 0.0,
-        best: lap(1.0, 38.021),
-        last: lap(1.0, 38.785),
+        best: lap(1.0, 33.635),
+        last: lap(1.0, 35.063),
         laps_down: 0,
         location: TrackLocation::OnTrack,
     }];
-    let gte = [
+    let lmp2 = [
         Row {
             class_position: 1,
             position: 2,
             name: "Driver 2",
-            car: "Porsche 911 RSR",
+            car: "Dallara P217",
             irating: 8000,
             gap: 0.0,
             best: lap(1.0, 38.635),
@@ -306,7 +306,7 @@ fn standings() -> Vec<StandingsEntry> {
             class_position: 2,
             position: 3,
             name: "Driver 3",
-            car: "Ferrari 488 GTE",
+            car: "Dallara P217",
             irating: 6800,
             gap: 4.5,
             best: lap(1.0, 39.281),
@@ -318,7 +318,7 @@ fn standings() -> Vec<StandingsEntry> {
             class_position: 3,
             position: 4,
             name: "Driver 4",
-            car: "BMW M8 GTE",
+            car: "Dallara P217",
             irating: 6400,
             gap: 4.6,
             best: lap(1.0, 39.209),
@@ -452,7 +452,7 @@ fn standings() -> Vec<StandingsEntry> {
 
     let mut entries = Vec::new();
     let mut car_idx = 0;
-    for (class, rows) in [(DP, &dp[..]), (GTE, &gte[..]), (GT3, &gt3[..])] {
+    for (class, rows) in [((DP.0, "GTP", DP.2), &gtp[..]), ((GTE.0, "LMP2", GTE.2), &lmp2[..]), (GT3, &gt3[..])] {
         // The mockup's class-fastest cells: whoever holds the lowest best
         // lap in each class gets the highlighted timing cell and the
         // stopwatch chip in the gutter.
@@ -668,6 +668,7 @@ fn relative() -> Vec<CarSnapshot> {
             off_tracks: if row.name == "Driver 12" { 2 } else { 0 },
             lap_diff: row.lap_diff,
             best_recent_lap_secs: Some(row.recent_lap),
+            recent_laps: [Some(row.recent_lap + 0.4), Some(row.recent_lap), Some(row.recent_lap + 0.2)],
             penalty: row.penalty,
         })
         .collect()

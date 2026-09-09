@@ -23,6 +23,16 @@ use crate::config::SyncConfig;
 use crate::telemetry::pit::{Corner, PitRequest};
 use crate::telemetry::snapshot::{Seat, TelemetrySnapshot};
 
+/// Inputs of a connection attempt, retained after refusal to avoid retrying it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConnectionIdentity {
+    relay_url: String,
+    invite: String,
+    subsession: u64,
+    cust_id: u32,
+    name: String,
+}
+
 /// Owns the connection, the producer and the consumer store.
 #[derive(Debug, Default)]
 pub struct TeamSync {
@@ -35,6 +45,8 @@ pub struct TeamSync {
     /// The subsession the current client is joined to, so a new session
     /// (`SubSessionID` changes) tears the old connection down and starts fresh.
     joined_subsession: Option<u64>,
+    connection_identity: Option<ConnectionIdentity>,
+    refused_identity: Option<ConnectionIdentity>,
     /// This member's display name, for stamping the writes it sends.
     member_name: Option<String>,
     /// The latest `SessionTime` seen, stamped onto events this member sends
@@ -49,7 +61,7 @@ pub struct TeamSync {
     /// sender, so without this a spec would set a fuel target or tyre policy
     /// and never see it on their own screen. Interior-mutable because
     /// publishing happens under the frame's shared borrows.
-    self_published: std::sync::Mutex<Vec<Event>>,
+    self_published: std::sync::Mutex<Vec<Outgoing>>,
     /// Whether the driver was on pit road last frame — the entry edge the
     /// standing tyre policy fires its arm/disarm write on.
     was_on_pit_road: bool,
@@ -64,6 +76,7 @@ impl TeamSync {
     pub fn update(&mut self, config: &SyncConfig, snapshot: Option<&TelemetrySnapshot>, now: Instant) {
         if !config.enabled {
             self.disconnect();
+            self.refused_identity = None;
             return;
         }
         self.ensure_connected(config, snapshot);
@@ -148,7 +161,7 @@ impl TeamSync {
         if let Some(client) = &self.client {
             let _ = client.publish.send(Outgoing { session_time: self.last_session_time, event: event.clone() });
             if let Ok(mut queue) = self.self_published.lock() {
-                queue.push(event);
+                queue.push(Outgoing { session_time: self.last_session_time, event });
             }
         }
     }
@@ -159,10 +172,15 @@ impl TeamSync {
             Ok(queue) => std::mem::take(&mut *queue),
             Err(_) => Vec::new(),
         };
-        for event in events {
-            // Producer and seq are wire concerns the store never reads; the
-            // clock is this member's latest, which is when the write happened.
-            self.state.apply(&Envelope { producer: 0, seq: 0, session_time: self.last_session_time, event });
+        for outgoing in events {
+            // Synthetic identity for a local write; preserve the same clock
+            // sent to the relay, even if the frame clock has since advanced.
+            self.state.apply(&Envelope {
+                producer: 0,
+                seq: 0,
+                session_time: outgoing.session_time,
+                event: outgoing.event,
+            });
         }
     }
 
@@ -194,6 +212,7 @@ impl TeamSync {
             // should not forget the ledger already gathered.
             self.listeners = false;
             self.joined_subsession = None;
+            self.connection_identity = None;
             // Un-applied writes are dropped rather than carried across a
             // reconnect — a stale pit adjustment is not one to spring later.
             self.pending_writes.clear();
@@ -206,6 +225,15 @@ impl TeamSync {
     /// Opens a connection once the identity is known, or replaces one whose
     /// session has changed underneath it.
     fn ensure_connected(&mut self, config: &SyncConfig, snapshot: Option<&TelemetrySnapshot>) {
+        self.ensure_connected_with(config, snapshot, SyncClient::start);
+    }
+
+    fn ensure_connected_with(
+        &mut self,
+        config: &SyncConfig,
+        snapshot: Option<&TelemetrySnapshot>,
+        start: impl FnOnce(String, u64, String, Member) -> SyncClient,
+    ) {
         let Some(identity) = snapshot.map(|snap| &snap.identity) else { return };
         let (Some(subsession), Some(cust_id)) = (identity.subsession, identity.player_cust_id) else {
             return;
@@ -217,6 +245,17 @@ impl TeamSync {
             return;
         }
         let name = identity.player_name.as_deref().unwrap_or("driver").to_owned();
+        let attempt = ConnectionIdentity {
+            relay_url: config.relay_url.clone(),
+            invite: config.invite.clone(),
+            subsession,
+            cust_id,
+            name: name.clone(),
+        };
+        if self.refused_identity.as_ref() == Some(&attempt) {
+            return;
+        }
+        self.refused_identity = None;
         let member = Member { cust_id, name: name.clone() };
         // A new subsession is a new race: the store, the producer's lap and
         // scalars memory, and any un-applied writes all belong to the old one
@@ -232,7 +271,8 @@ impl TeamSync {
         self.was_on_pit_road = false;
         self.listeners = false;
         self.member_name = Some(name);
-        self.client = Some(SyncClient::start(config.relay_url.clone(), subsession, config.invite.clone(), member));
+        self.client = Some(start(config.relay_url.clone(), subsession, config.invite.clone(), member));
+        self.connection_identity = Some(attempt);
         self.joined_subsession = Some(subsession);
     }
 
@@ -261,7 +301,11 @@ impl TeamSync {
                 FromRelay::Welcome { members, .. } | FromRelay::Roster(members) => {
                     self.listeners = members.len() > 1;
                 }
-                FromRelay::Refused { .. } => self.disconnect(),
+                FromRelay::Refused { .. } => {
+                    self.refused_identity = self.connection_identity.clone();
+                    self.disconnect();
+                    break;
+                }
             }
         }
     }
@@ -315,5 +359,93 @@ fn clamp_litres(litres: f32) -> i16 {
         #[expect(clippy::cast_possible_truncation, reason = "guarded above into i16's positive range")]
         let litres = rounded as i16;
         litres
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn fake_client() -> SyncClient {
+        let (_, incoming) = mpsc::channel();
+        let (publish, _) = mpsc::channel();
+        SyncClient::from_test_channels(incoming, publish)
+    }
+
+    fn refused_runtime() -> (TeamSync, SyncConfig, TelemetrySnapshot) {
+        let config = SyncConfig {
+            enabled: true,
+            relay_url: "ws://relay".to_owned(),
+            invite: "wrong".to_owned(),
+            ..SyncConfig::default()
+        };
+        let mut snapshot = crate::demo::snapshot();
+        snapshot.identity.subsession = Some(123);
+        snapshot.identity.player_cust_id = Some(456);
+        let mut sync = TeamSync::default();
+        sync.ensure_connected_with(&config, Some(&snapshot), |_, _, _, _| fake_client());
+        let (tx, incoming) = mpsc::channel();
+        sync.client.as_mut().expect("connected").incoming = incoming;
+        tx.send(FromRelay::Refused { reason: "bad invite".to_owned() }).expect("queue refusal");
+        sync.drain_incoming();
+        assert!(sync.client.is_none());
+        (sync, config, snapshot)
+    }
+
+    #[test]
+    fn refused_credentials_do_not_restart_each_frame() {
+        let (mut sync, config, snapshot) = refused_runtime();
+        for _ in 0..10 {
+            sync.ensure_connected_with(&config, Some(&snapshot), |_, _, _, _| {
+                panic!("refused credentials must not restart")
+            });
+        }
+    }
+
+    #[test]
+    fn changed_connection_inputs_allow_retry_after_refusal() {
+        for change in 0..4 {
+            let (mut sync, mut config, mut snapshot) = refused_runtime();
+            match change {
+                0 => config.invite = "corrected".to_owned(),
+                1 => config.relay_url = "ws://other-relay".to_owned(),
+                2 => snapshot.identity.subsession = Some(124),
+                _ => snapshot.identity.player_cust_id = Some(457),
+            }
+            sync.ensure_connected_with(&config, Some(&snapshot), |_, _, _, _| fake_client());
+            assert!(sync.client.is_some(), "changed input {change} must allow retry");
+        }
+    }
+
+    #[test]
+    fn explicit_toggle_allows_retry_after_refusal() {
+        let (mut sync, config, snapshot) = refused_runtime();
+        let disabled = SyncConfig { enabled: false, ..config.clone() };
+        sync.update(&disabled, Some(&snapshot), Instant::now());
+        sync.ensure_connected_with(&config, Some(&snapshot), |_, _, _, _| fake_client());
+        assert!(sync.client.is_some());
+    }
+
+    #[test]
+    fn own_writes_keep_their_publish_clock() {
+        let (publish, outgoing) = mpsc::channel();
+        let (_, incoming) = mpsc::channel();
+        let mut sync = TeamSync {
+            client: Some(SyncClient::from_test_channels(incoming, publish)),
+            last_session_time: 10.0,
+            ..TeamSync::default()
+        };
+        sync.set_fuel_target(Some(2.0));
+        assert_eq!(outgoing.recv().expect("published").session_time, 10.0);
+        sync.last_session_time = 30.0;
+        sync.fold_own_writes();
+        sync.state.apply(&Envelope {
+            producer: 1,
+            seq: 1,
+            session_time: 20.0,
+            event: Event::FuelTarget { requester: "other".to_owned(), litres_per_lap: Some(3.0) },
+        });
+        assert_eq!(sync.fuel_target(), Some(3.0));
     }
 }

@@ -4,10 +4,9 @@
 //! tokens, scaling, card/badge/gradient helpers) that makes every panel read
 //! as one instrument cluster instead of four unrelated boxes.
 //!
-//! Every dimension in this module and its children is the pixel value
-//! measured off the corresponding image in `design mocks/`, multiplied
-//! through [`Metrics`]. Run `race-overlay.exe --demo` to render the widgets
-//! against those mockups' own data without iRacing.
+//! Dimensions are authored at a reference size and multiplied through
+//! [`Metrics`]. Run `race-overlay.exe --demo` to preview the widgets with
+//! representative race data without iRacing.
 //!
 //! Palette: a near-black "ink" card base with white text at three opacity
 //! tiers for hierarchy, plus a tight semantic accent set — `signal` (good /
@@ -30,6 +29,8 @@ pub mod faster_class;
 pub mod flags;
 pub mod icons;
 pub mod launcher_page;
+#[cfg(feature = "licence")]
+pub mod licence;
 
 /// Remembers what a short name resolved to, so it is worked out once per run.
 ///
@@ -194,7 +195,7 @@ pub const FASTEST_TEXT: Color32 = Color32::from_rgb(0xC4, 0xA5, 0xFF);
 /// or a narrow bar and the gold reads as an accent. The Relative's row uses
 /// [`PLAYER_ROW_FILL`] instead — a whole row of this was too much of it.
 pub const PLAYER_ROW: Color32 = Color32::from_rgb(0x8A, 0x7B, 0x3A);
-/// The fill behind the player's own row in the Relative.
+/// The cool slate fill behind the player's row in the timing tables.
 ///
 /// A lifted neutral, not a hue. Every colour in this overlay already means
 /// something — red is danger, amber caution, violet fastest, teal good — and
@@ -203,7 +204,7 @@ pub const PLAYER_ROW: Color32 = Color32::from_rgb(0x8A, 0x7B, 0x3A);
 /// selected because it is plainly lighter than both the panel and the
 /// alternating stripe, and because the position plate on it goes white; see
 /// [`PLAYER_PLATE`].
-pub const PLAYER_ROW_FILL: Color32 = Color32::from_rgb(0x3A, 0x3B, 0x40);
+pub const PLAYER_ROW_FILL: Color32 = Color32::from_rgb(0x30, 0x34, 0x3C);
 /// The position plate on the player's own row: near-white, with the number
 /// in near-black on top of it.
 ///
@@ -215,16 +216,16 @@ pub const PLAYER_PLATE: Color32 = Color32::from_rgb(0xF2, 0xF3, 0xF6);
 /// Stands in for a class's own color when the session runs only one class.
 ///
 /// A single-make grid reports the same class color for every car, and
-/// iRacing's is very often white — so the slash and the wash that exist to
-/// tell classes apart say nothing, and a row of white marks competes with the
+/// iRacing's is very often white — so repeated class marks say nothing,
+/// and a row of white marks competes with the
 /// player's own highlight for attention. With nothing to distinguish there is
 /// no reason to spend white on it.
 pub const SINGLE_CLASS: Color32 = Color32::from_rgb(0x38, 0xBD, 0xF8);
 /// The plate under a row's position number — see [`paint_position_plate`].
 ///
 /// Opaque, not a translucent black: it has to read as one flat slate at every
-/// point along a row, and a wash, an alternating stripe and the player's own
-/// olive highlight all pass underneath it. Letting any of those tint it made
+/// point along a row, and an alternating stripe and the player's own
+/// slate highlight pass underneath it. Letting either of those tint it made
 /// the plate a different color on every other row.
 pub const POSITION_PLATE: Color32 = Color32::from_rgb(0x1E, 0x1D, 0x21);
 /// The plate a value you can change sits on — see [`paint_control_plate`].
@@ -303,7 +304,7 @@ pub fn instrument_divider() -> Color32 {
 /// Hairline dividers and card borders.
 #[must_use]
 pub fn hairline() -> Color32 {
-    Color32::from_white_alpha(18)
+    Color32::from_white_alpha(if theme::is_instrument() { 18 } else { 8 })
 }
 
 // ---- Shape tokens ------------------------------------------------------
@@ -456,7 +457,7 @@ pub fn row_stripe(odd: bool) -> Option<Color32> {
     if theme::is_instrument() {
         return None;
     }
-    odd.then_some(Color32::from_white_alpha(10))
+    odd.then_some(Color32::from_white_alpha(3))
 }
 
 /// A symmetric margin in scaled pixels.
@@ -465,32 +466,9 @@ pub fn margin(metrics: Metrics, x: f32, y: f32) -> egui::Margin {
     egui::Margin::symmetric(metrics.px(x), metrics.px(y))
 }
 
-/// The plate a row's position number sits on: a darker panel at the row's
-/// leading edge, with a shadow falling across the row behind it.
-///
-/// The position is the one thing on a row read at a glance rather than
-/// studied, and it was competing with the class-color wash that runs under it.
-/// Sinking it into its own darker panel separates the two, and the shadow is
-/// what makes the panel read as sitting *under* the row rather than as another
-/// flat band of color beside it.
-///
-/// Straight-edged. It used to be cut to the class slash's lean; nothing in the
-/// overlay leans now, so the plate ends where it ends and the class bar
-/// stands beside it.
-///
-/// `width` is the scaled distance from `rect`'s left edge to the plate's
-/// trailing edge, and `edge` an optional coloured border struck down that
-/// edge — the car's class, in both panels that use this. The class was a
-/// wash across the row, then a bar floating in the column beside the plate;
-/// as the plate's own edge it is tucked against the one element every row
-/// starts with, and it stops competing for the column next to it.
-/// `row_rounding` is the row's own, so the plate curves with the outer corner
-/// and stays square where it meets the rest of the row — one strip, rather
-/// than a pill floating on top of one.
-///
-/// `fill` is [`POSITION_PLATE`] on every row but the player's own, which
-/// takes [`PLAYER_ROW`] so that "you" reads from the plate alone, before the
-/// row's wash is noticed.
+/// An inset position tile with a separate, short class-colour marker.
+/// The white focus tile anchors the player's row without colouring its data.
+/// Instrument retains its continuous position rail.
 pub fn paint_position_plate(
     ui: &Ui,
     rect: Rect,
@@ -500,6 +478,22 @@ pub fn paint_position_plate(
     edge: Option<(f32, Color32)>,
 ) {
     if width <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    if !theme::is_instrument() {
+        let inset = (rect.height() * 0.12).min(width * 0.2);
+        let body = Rect::from_min_max(
+            rect.min + egui::vec2(inset, inset),
+            egui::pos2(rect.left() + width - inset, rect.bottom() - inset),
+        );
+        ui.painter().rect_filled(body, inset, fill);
+        if let Some((thickness, colour)) = edge.filter(|(thickness, _)| *thickness > 0.0) {
+            let marker = Rect::from_center_size(
+                egui::pos2(rect.left() + width + thickness / 2.0, rect.center().y),
+                egui::vec2(thickness, rect.height() * 0.42),
+            );
+            ui.painter().rect_filled(marker, thickness / 2.0, colour);
+        }
         return;
     }
     let trailing = rect.left() + width;
@@ -581,30 +575,25 @@ const HATCH_ANGLE_TAN: f32 = 1.732_050_8;
 /// bars, whose fill is translucent, those corners showed against the track as
 /// square shoulders either side of each rounded tip.
 ///
-/// The ends are therefore painted as their own rounded caps and the gradient
-/// runs between them. The caps take the gradient's end colours flat, which
-/// over a cap of half the bar's width is a small enough span of the ramp to
-/// read as continuous.
+/// The ends are clipped from full-size rounded capsules and the gradient
+/// runs between them. A short cap rectangle cannot carry the full radius:
+/// egui clamps rounding to half its height, leaving square shoulders outside
+/// the capsule. Clipping the full shape preserves its radius. The caps take
+/// the gradient's end colours flat, continuous with the central mesh.
 pub fn gradient_capsule_v(ui: &Ui, rect: Rect, from: Color32, to: Color32) {
     if rect.width() <= 0.0 || rect.height() <= 0.0 {
         return;
     }
     let radius = (rect.width() / 2.0).min(rect.height() / 2.0);
     let cap = |top: bool| {
-        let (rect, rounding, color) = if top {
-            (
-                Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + radius)),
-                Rounding { nw: radius, ne: radius, sw: 0.0, se: 0.0 },
-                from,
-            )
+        let (clip, color) = if top {
+            (Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + radius)), from)
         } else {
-            (
-                Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - radius), rect.max),
-                Rounding { nw: 0.0, ne: 0.0, sw: radius, se: radius },
-                to,
-            )
+            (Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - radius), rect.max), to)
         };
-        ui.painter().rect_filled(rect, rounding, color);
+        // Disjoint cap clips meet the central mesh at the straight sides.
+        // Painting only each cap avoids compositing translucent fills twice.
+        ui.painter().with_clip_rect(ui.clip_rect().intersect(clip)).rect_filled(rect, radius, color);
     };
     cap(true);
     cap(false);

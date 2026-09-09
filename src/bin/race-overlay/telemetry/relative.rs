@@ -1077,6 +1077,7 @@ mod tests {
             off_tracks: 0,
             lap_diff: 0,
             best_recent_lap_secs: None,
+            recent_laps: [None; 3],
             penalty: None,
         }
     }

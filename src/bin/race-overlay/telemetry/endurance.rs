@@ -33,7 +33,10 @@
 )]
 pub fn laps_remaining(session_remain_secs: Option<f64>, avg_lap_secs: f32, lap_dist_pct: Option<f32>) -> Option<i32> {
     let remain = session_remain_secs?;
-    if avg_lap_secs <= 0.0 || remain <= 0.0 {
+    if !avg_lap_secs.is_finite() || !remain.is_finite() || avg_lap_secs <= 0.0 || remain <= 0.0 {
+        return None;
+    }
+    if lap_dist_pct.is_some_and(|pct| !pct.is_finite()) {
         return None;
     }
     let driven = f64::from(lap_dist_pct.unwrap_or(0.0).clamp(0.0, 1.0));
@@ -72,7 +75,10 @@ pub fn projected_total_laps(
     avg_lap_secs: f32,
 ) -> Option<i32> {
     let remain = session_remain_secs?;
-    if avg_lap_secs <= 0.0 || remain < 0.0 {
+    if !avg_lap_secs.is_finite() || !remain.is_finite() || avg_lap_secs <= 0.0 || remain < 0.0 {
+        return None;
+    }
+    if lap_dist_pct.is_some_and(|pct| !pct.is_finite()) {
         return None;
     }
     // Clamped because `CarIdxLapDistPct` reads a little outside 0..1 either
@@ -94,7 +100,7 @@ pub fn projected_total_laps(
 /// `avg_stint_laps` of zero or less yields `None` rather than a guess.
 #[must_use]
 pub fn stops_remaining(laps_left: i32, stint_laps_so_far: i32, avg_stint_laps: i32) -> Option<i32> {
-    if avg_stint_laps <= 0 {
+    if avg_stint_laps <= 0 || stint_laps_so_far < 0 || laps_left < 0 {
         return None;
     }
     // Laps this car can still cover before its current stint runs out.
@@ -104,7 +110,7 @@ pub fn stops_remaining(laps_left: i32, stint_laps_so_far: i32, avg_stint_laps: i
         return Some(0);
     }
     // Ceiling division: any remainder needs one more stop.
-    Some((laps_needing_a_stop + avg_stint_laps - 1) / avg_stint_laps)
+    Some(1 + (laps_needing_a_stop - 1) / avg_stint_laps)
 }
 
 /// Laps of fuel kept in hand when deciding the last lap to pit on.
@@ -176,13 +182,14 @@ pub fn projected_dry_lap(current_lap: u16, fuel_litres: f32, burn_per_lap: f32) 
 pub struct Contender {
     /// Where this car sits in its class right now.
     pub class_position: i32,
-    /// Current gap to the class leader, in seconds.
+    /// Current total time deficit to the class leader, in seconds, including
+    /// any whole laps behind. A within-lap gap is not sufficient.
     pub gap_to_leader_secs: f32,
     /// Stops this car still has to make, from [`stops_remaining`].
     pub stops_remaining: i32,
-    /// What one stop costs this car, in seconds — its own measured average
-    /// where it has one, so a car that consistently takes tyres is projected
-    /// with its real loss rather than a shared guess.
+    /// Total time lost relative to staying on track for one stop, in seconds.
+    /// This includes pit-lane transit loss as well as stationary service;
+    /// stationary service time alone cannot substitute for total pit loss.
     pub pit_loss_secs: f32,
 }
 
@@ -197,10 +204,23 @@ pub struct Contender {
 ///
 /// Ties keep their current running order, so a car ahead on the road stays
 /// ahead when two projections land level.
+///
+/// An invalid input makes the entire class projection unavailable: excluding
+/// one car would silently promote the others into incorrect net positions.
 #[must_use]
-pub fn projected_positions(contenders: &[Contender]) -> Vec<i32> {
-    #[expect(clippy::cast_precision_loss, reason = "stop counts are single digits in any real session")]
-    let projected_gap = |c: &Contender| c.gap_to_leader_secs + c.stops_remaining as f32 * c.pit_loss_secs;
+pub fn projected_positions(contenders: &[Contender]) -> Vec<Option<i32>> {
+    if contenders.iter().any(|c| {
+        c.class_position <= 0
+            || !c.gap_to_leader_secs.is_finite()
+            || c.gap_to_leader_secs < 0.0
+            || c.stops_remaining < 0
+            || !c.pit_loss_secs.is_finite()
+            || c.pit_loss_secs < 0.0
+    }) {
+        return vec![None; contenders.len()];
+    }
+    let projected_gap =
+        |c: &Contender| f64::from(c.gap_to_leader_secs) + f64::from(c.stops_remaining) * f64::from(c.pit_loss_secs);
 
     let mut order: Vec<usize> = (0..contenders.len()).collect();
     order.sort_by(|&a, &b| {
@@ -209,9 +229,9 @@ pub fn projected_positions(contenders: &[Contender]) -> Vec<i32> {
             .then(contenders[a].class_position.cmp(&contenders[b].class_position))
     });
 
-    let mut positions = vec![0; contenders.len()];
+    let mut positions = vec![None; contenders.len()];
     for (rank, &index) in order.iter().enumerate() {
-        positions[index] = i32::try_from(rank).unwrap_or(i32::MAX).saturating_add(1);
+        positions[index] = Some(i32::try_from(rank).unwrap_or(i32::MAX).saturating_add(1));
     }
     positions
 }
@@ -390,7 +410,7 @@ mod tests {
             Contender { class_position: 2, gap_to_leader_secs: 20.0, stops_remaining: 1, pit_loss_secs: 30.0 },
         ];
         // 0 + 60 = 60 versus 20 + 30 = 50, so the rival comes out ahead.
-        assert_eq!(projected_positions(&field), vec![2, 1]);
+        assert_eq!(projected_positions(&field), vec![Some(2), Some(1)]);
     }
 
     #[test]
@@ -400,7 +420,7 @@ mod tests {
             Contender { class_position: 2, gap_to_leader_secs: 15.0, stops_remaining: 2, pit_loss_secs: 30.0 },
             Contender { class_position: 3, gap_to_leader_secs: 40.0, stops_remaining: 2, pit_loss_secs: 30.0 },
         ];
-        assert_eq!(projected_positions(&field), vec![1, 2, 3]);
+        assert_eq!(projected_positions(&field), vec![Some(1), Some(2), Some(3)]);
     }
 
     /// A car whose stops are measurably quicker — short fuel-only stops
@@ -413,11 +433,93 @@ mod tests {
             Contender { class_position: 2, gap_to_leader_secs: 5.0, stops_remaining: 2, pit_loss_secs: 12.0 },
         ];
         // 64.0 versus 29.0.
-        assert_eq!(projected_positions(&field), vec![2, 1]);
+        assert_eq!(projected_positions(&field), vec![Some(2), Some(1)]);
     }
 
     #[test]
     fn an_empty_field_projects_nothing() {
-        assert_eq!(projected_positions(&[]), Vec::<i32>::new());
+        assert_eq!(projected_positions(&[]), Vec::<Option<i32>>::new());
+    }
+
+    #[test]
+    fn paying_the_projected_pit_loss_preserves_net_position_after_exit() {
+        let mut field = [
+            Contender { class_position: 1, gap_to_leader_secs: 0.0, stops_remaining: 2, pit_loss_secs: 60.0 },
+            Contender { class_position: 2, gap_to_leader_secs: 20.0, stops_remaining: 2, pit_loss_secs: 60.0 },
+            Contender { class_position: 3, gap_to_leader_secs: 45.0, stops_remaining: 1, pit_loss_secs: 60.0 },
+        ];
+        let before = projected_positions(&field);
+        // The first car pays its stop, drops behind both rivals and owes one
+        // fewer stop. Rebase all live gaps onto the new on-road leader.
+        field[0].gap_to_leader_secs = 40.0;
+        field[0].class_position = 3;
+        field[0].stops_remaining = 1;
+        field[1].gap_to_leader_secs = 0.0;
+        field[1].class_position = 1;
+        field[2].gap_to_leader_secs = 25.0;
+        field[2].class_position = 2;
+        assert_eq!(before, vec![Some(2), Some(3), Some(1)]);
+        assert_eq!(projected_positions(&field), before);
+    }
+
+    #[test]
+    fn equal_projected_times_keep_running_order_even_with_shuffled_input() {
+        let field = [
+            Contender { class_position: 3, gap_to_leader_secs: 60.0, stops_remaining: 0, pit_loss_secs: 30.0 },
+            Contender { class_position: 1, gap_to_leader_secs: 0.0, stops_remaining: 2, pit_loss_secs: 30.0 },
+            Contender { class_position: 2, gap_to_leader_secs: 30.0, stops_remaining: 1, pit_loss_secs: 30.0 },
+        ];
+        assert_eq!(projected_positions(&field), vec![Some(3), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn a_lap_down_car_only_gains_position_if_saved_stops_cover_the_total_deficit() {
+        let mut field = [
+            Contender { class_position: 1, gap_to_leader_secs: 0.0, stops_remaining: 1, pit_loss_secs: 60.0 },
+            // A 90-second lap plus a 10-second gap, not a 10-second deficit.
+            Contender { class_position: 2, gap_to_leader_secs: 100.0, stops_remaining: 0, pit_loss_secs: 60.0 },
+        ];
+        assert_eq!(projected_positions(&field), vec![Some(1), Some(2)]);
+        field[0].stops_remaining = 2;
+        assert_eq!(projected_positions(&field), vec![Some(2), Some(1)]);
+    }
+
+    #[test]
+    fn invalid_contender_inputs_withhold_the_entire_class_projection() {
+        let valid = Contender { class_position: 1, gap_to_leader_secs: 0.0, stops_remaining: 2, pit_loss_secs: 60.0 };
+        for invalid in [
+            Contender { gap_to_leader_secs: f32::NAN, ..valid },
+            Contender { gap_to_leader_secs: f32::INFINITY, ..valid },
+            Contender { gap_to_leader_secs: -1.0, ..valid },
+            Contender { pit_loss_secs: f32::NAN, ..valid },
+            Contender { pit_loss_secs: f32::INFINITY, ..valid },
+            Contender { pit_loss_secs: -1.0, ..valid },
+            Contender { stops_remaining: -1, ..valid },
+            Contender { class_position: 0, ..valid },
+        ] {
+            assert_eq!(projected_positions(&[valid, invalid]), vec![None, None]);
+        }
+    }
+
+    #[test]
+    fn nonfinite_timing_inputs_do_not_produce_lap_or_stop_estimates() {
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(laps_remaining(Some(600.0), invalid, Some(0.5)), None);
+            assert_eq!(laps_remaining(Some(f64::from(invalid)), 90.0, Some(0.5)), None);
+            assert_eq!(laps_remaining(Some(600.0), 90.0, Some(invalid)), None);
+            assert_eq!(projected_total_laps(10, Some(0.5), Some(600.0), invalid), None);
+            assert_eq!(projected_total_laps(10, Some(0.5), Some(f64::from(invalid)), 90.0), None);
+            assert_eq!(projected_total_laps(10, Some(invalid), Some(600.0), 90.0), None);
+        }
+    }
+
+    #[test]
+    fn stop_counts_reject_invalid_laps_and_do_not_overflow_ceiling_division() {
+        assert_eq!(stops_remaining(10, -1, 20), None);
+        assert_eq!(stops_remaining(-1, 10, 20), None);
+        assert_eq!(stops_remaining(i32::MAX, 20, 20), Some(107_374_183));
+        assert_eq!(stops_remaining(0, 20, 20), Some(0));
+        assert_eq!(stops_remaining(20, 0, 20), Some(0));
+        assert_eq!(stops_remaining(21, 0, 20), Some(1));
     }
 }

@@ -83,6 +83,9 @@ pub struct EventSource {
     last_lap: Option<u16>,
     /// The tank at the start of the current lap, to measure what it burned.
     lap_start_fuel: Option<f32>,
+    /// A stop anywhere on this lap invalidates its tank delta, even if the
+    /// car has left pit road before crossing the timing line.
+    lap_had_stop: bool,
     /// The last scalars actually sent, and when — the throttle's memory.
     last_scalars: Option<SentScalars>,
     last_scalars_at: Option<Instant>,
@@ -117,7 +120,7 @@ impl EventSource {
             // laps' fuel as one lap's burn and poison the shared average.
             let laps_elapsed = f32::from(obs.lap - previous);
             let burned = started_with - obs.fuel_litres;
-            let used = if obs.on_pit_road || burned < 0.0 {
+            let used = if self.lap_had_stop || obs.on_pit_road || burned < 0.0 {
                 obs.fuel_per_lap_litres.unwrap_or(burned.max(0.0))
             } else {
                 burned / laps_elapsed
@@ -130,6 +133,9 @@ impl EventSource {
         }
         if self.last_lap != Some(obs.lap) {
             self.lap_start_fuel = Some(obs.fuel_litres);
+            self.lap_had_stop = obs.on_pit_road;
+        } else {
+            self.lap_had_stop |= obs.on_pit_road;
         }
         self.last_lap = Some(obs.lap);
 
@@ -297,6 +303,35 @@ mod tests {
             }
             other => panic!("expected one lap close, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_small_top_up_before_pit_exit_does_not_understate_lap_burn() {
+        let mut source = EventSource::default();
+        let now = Instant::now();
+        source.observe(obs(10.0, 5, 20.0), now, false);
+        let mut in_pits = obs(40.0, 5, 18.0);
+        in_pits.on_pit_road = true;
+        source.observe(in_pits, now, false);
+        // A one-litre top-up is less than this lap's consumption. At the
+        // crossing the tank is lower than at lap start and pit road is false.
+        in_pits.fuel_litres = 19.0;
+        source.observe(in_pits, now, false);
+        source.observe(obs(70.0, 5, 18.8), now, false);
+        let events = source.observe(obs(100.0, 6, 18.5), now, false);
+        let [Event::LapClosed { used_litres, .. }] = events.as_slice() else {
+            panic!("expected a lap close, got {events:?}");
+        };
+        // Use the rolling average, not the 1.5 L tank delta.
+        assert!((used_litres - 2.5).abs() < 0.01);
+
+        // The stop latch clears at the crossing: a normal following lap
+        // must use its actual delta, even if the rolling average differs.
+        let events = source.observe(obs(190.0, 7, 15.5), now, false);
+        let [Event::LapClosed { used_litres, .. }] = events.as_slice() else {
+            panic!("expected a lap close, got {events:?}");
+        };
+        assert!((used_litres - 3.0).abs() < 0.01);
     }
 
     #[test]

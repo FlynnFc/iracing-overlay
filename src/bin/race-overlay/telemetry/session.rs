@@ -2376,6 +2376,7 @@ unsafe fn build_snapshot(
                 laps[i],
                 last_laps.get(i).copied().unwrap_or(0.0),
             ),
+            recent_laps: trackers.recent_laps.samples(car_idx),
             penalty: session_flags_per_car.get(i).copied().and_then(relative::penalty_from_flags),
         });
     }
@@ -2407,6 +2408,7 @@ unsafe fn build_snapshot(
                 me_lap,
                 last_laps.get(i).copied().unwrap_or(0.0),
             ),
+            recent_laps: trackers.recent_laps.samples(focus_car_idx),
             penalty: session_flags_per_car.get(i).copied().and_then(relative::penalty_from_flags),
         });
     }
@@ -2577,12 +2579,26 @@ unsafe fn build_snapshot(
         wind_dir_relative_to_car_rad: weather::wind_direction_relative_to_car(f32_of_opt(&vars.wind_dir), car_yaw_rad),
     };
     let class_sections = build_class_sections(&standings, &mut trackers.sof);
+    // Settle the lane measurement before NET consumes it on the exit tick.
+    let phase = match me_track_location {
+        TrackLocation::InPitStall => pit_model::LanePhase::Stall,
+        TrackLocation::ApproachingPits => pit_model::LanePhase::Lane,
+        TrackLocation::OnTrack | TrackLocation::OffTrack => pit_model::LanePhase::OnTrack,
+        TrackLocation::NotInWorld => pit_model::LanePhase::Away,
+    };
+    if let Some(transit) = trackers.pit_loss.update(phase, session_time_secs, me_lap_fraction, pace_secs) {
+        println!("note: pit lane transit measured at {transit:.1}s");
+    }
+    let pit_model = trackers.pit_loss.model();
+    let net_gaps = live_net_gaps(&standings, laps, lap_dist_pcts, &trackers.lap_curve, my_car_class_id);
     let mut endurance_meta = annotate_endurance(
         &mut standings,
         laps_remaining,
         tuning.pit_loss_secs,
         my_car_class_id,
         &mut trackers.multi_stop_race,
+        pit_model,
+        &net_gaps,
     );
     // `laps_remaining` counts the lap under way whole; this is the part of it
     // already behind the car, which the fuel target subtracts — see
@@ -2745,25 +2761,7 @@ unsafe fn build_snapshot(
             ),
             lap_fraction: me_lap_fraction,
         },
-        pit_model: {
-            // Every visit to the lane measures what it costs, with no drill and
-            // no track database: the lap curve already knows how long the stretch
-            // between the pit entry and the pit exit takes at racing pace, so
-            // the loss is how much longer the car actually took.
-            let phase = match me_track_location {
-                TrackLocation::InPitStall => pit_model::LanePhase::Stall,
-                TrackLocation::ApproachingPits => pit_model::LanePhase::Lane,
-                TrackLocation::OnTrack | TrackLocation::OffTrack => pit_model::LanePhase::OnTrack,
-                TrackLocation::NotInWorld => pit_model::LanePhase::Away,
-            };
-            if let Some(transit) = trackers.pit_loss.update(phase, session_time_secs, me_lap_fraction, pace_secs) {
-                // Said out loud once a stop, because it is the figure every pit
-                // projection is built on and there is otherwise no way to know
-                // whether it came from this track or from a constant.
-                println!("note: pit lane transit measured at {transit:.1}s");
-            }
-            trackers.pit_loss.model()
-        },
+        pit_model,
     }
 }
 
@@ -2843,22 +2841,81 @@ fn build_grid_status(
     Some(GridStatus { cars_gridded, car_count, countdown_secs })
 }
 
+/// NET needs current race distance, not the last scoring-line gap. A missing
+/// reading stays missing; zero would invent a car alongside its class leader.
+fn live_net_gaps(
+    standings: &[StandingsEntry],
+    laps: &[i32],
+    pcts: &[f32],
+    curve: &relative::LapCurve,
+    curve_class_id: Option<i32>,
+) -> HashMap<i32, f32> {
+    use super::net_position::{RaceProgress, live_gap_secs};
+    let progress = |entry: &StandingsEntry| {
+        let i = usize::try_from(entry.car_idx).ok()?;
+        Some(RaceProgress { lap: *laps.get(i)?, pct: *pcts.get(i)? })
+    };
+    let fallback_curve = relative::LapCurve::default();
+    let mut gaps = HashMap::new();
+    for representative in standings.iter().filter(|entry| entry.class_position == 1) {
+        // Use the furthest active car as the common origin. The displayed
+        // order intentionally holds close passes with hysteresis and can
+        // therefore name a leader a little behind another car on this tick.
+        let leader = standings
+            .iter()
+            .filter(|entry| {
+                entry.car_class_id == representative.car_class_id && entry.track_location != TrackLocation::NotInWorld
+            })
+            .filter_map(|entry| {
+                progress(entry)
+                    .filter(|p| p.lap >= 0 && p.pct.is_finite() && (0.0..=1.0).contains(&p.pct))
+                    .map(|p| (entry, p))
+            })
+            .max_by(|(_, a), (_, b)| a.lap.cmp(&b.lap).then(a.pct.total_cmp(&b.pct)))
+            .map(|(entry, _)| entry);
+        let Some(leader) = leader else { continue };
+        let Some(leader_progress) = progress(leader) else { continue };
+        let class_pace = standings
+            .iter()
+            .filter(|entry| entry.car_class_id == leader.car_class_id)
+            .map(|entry| entry.best_lap_secs)
+            .filter(|secs| secs.is_finite() && *secs > 0.0)
+            .min_by(f32::total_cmp);
+        let Some(pace) = class_pace else { continue };
+        // A different class may spend very different fractions of its lap in
+        // each corner; do not apply the focus car's measured curve to it.
+        let class_curve = if curve_class_id == Some(leader.car_class_id) { curve } else { &fallback_curve };
+        for entry in standings.iter().filter(|entry| entry.car_class_id == leader.car_class_id) {
+            if let Some(gap) = progress(entry).and_then(|car| live_gap_secs(class_curve, leader_progress, car, pace)) {
+                gaps.insert(entry.car_idx, gap);
+            }
+        }
+    }
+    gaps
+}
+
 /// Fills in every entry's endurance projection and returns the session-level
 /// summary for the player.
 ///
 /// Each car's remaining stops come from its own stint history — or, where it
 /// has none yet, from its class's typical stint — and its projected position
 /// from re-sorting its class on current gap plus the cost of the stops it
-/// still owes. A car's own measured stop time is preferred over the
-/// configured `pit_loss_secs`, so a rival who consistently skips tyres is
-/// projected on what their stops actually cost.
+/// still owes. Measured service time is added to lane transit, never used
+/// as a replacement for the total loss. Gaps include whole laps and update
+/// with track position, independently of the scorer's F2 timing updates.
 fn annotate_endurance(
     standings: &mut [StandingsEntry],
     laps_remaining: Option<i32>,
     default_pit_loss_secs: f32,
     my_car_class_id: Option<i32>,
     multi_stop_race: &mut bool,
+    pit_model: pit_model::PitModel,
+    net_gaps: &HashMap<i32, f32>,
 ) -> EnduranceMeta {
+    for entry in standings.iter_mut() {
+        entry.stops_remaining = None;
+        entry.projected_class_position = None;
+    }
     let Some(laps_left) = laps_remaining else {
         return EnduranceMeta { multi_stop_race: *multi_stop_race, ..EnduranceMeta::default() };
     };
@@ -2876,8 +2933,15 @@ fn annotate_endurance(
         ids
     };
     for class_id in class_ids {
-        let indices: Vec<usize> =
-            standings.iter().enumerate().filter(|(_, e)| e.car_class_id == class_id).map(|(i, _)| i).collect();
+        // NET ranks the active field. An absent car has no forward strategy
+        // to project; leave its NET unknown without blanking every rival.
+        // If it rejoins, it participates again on the next valid reading.
+        let indices: Vec<usize> = standings
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.car_class_id == class_id && e.track_location != TrackLocation::NotInWorld)
+            .map(|(i, _)| i)
+            .collect();
         // A class where nobody has a stint history yet has nothing to
         // project; leaving the field `None` keeps the column blank rather
         // than showing everyone their current position as a "projection".
@@ -2890,13 +2954,33 @@ fn annotate_endurance(
         // car as if it would never pit, which is the one answer known to be
         // wrong: everyone in a class runs broadly the same tank.
         let class_typical_stint = lower_median_i32(indices.iter().filter_map(|&i| standings[i].avg_stint_laps));
+        for &i in &indices {
+            let entry = &mut standings[i];
+            entry.stops_remaining = entry
+                .avg_stint_laps
+                .or(class_typical_stint)
+                .and_then(|avg| endurance::stops_remaining(laps_left, entry.current_stint_laps, avg));
+        }
+        // An ongoing visit has already lost part of its time, but its stint
+        // has not settled yet. Publishing a rank would charge it twice.
+        // Resume as soon as every car in this class has a usable exit reading.
+        if indices.iter().any(|&i| {
+            let entry = &standings[i];
+            !matches!(entry.track_location, TrackLocation::OnTrack | TrackLocation::OffTrack)
+                || !net_gaps.contains_key(&entry.car_idx)
+        }) {
+            continue;
+        }
+        let class_service = lower_median_f64(
+            indices.iter().filter_map(|&i| standings[i].avg_pit_secs).filter(|secs| secs.is_finite() && *secs > 0.0),
+        );
         let contenders: Vec<endurance::Contender> = indices
             .iter()
             .map(|&i| {
                 let entry = &standings[i];
                 endurance::Contender {
                     class_position: entry.class_position,
-                    gap_to_leader_secs: entry.gap_to_leader_secs,
+                    gap_to_leader_secs: net_gaps[&entry.car_idx],
                     stops_remaining: entry
                         .stops_remaining
                         .or_else(|| {
@@ -2908,12 +2992,25 @@ fn annotate_endurance(
                         clippy::cast_possible_truncation,
                         reason = "a pit stop's duration is a handful of seconds, far inside f32"
                     )]
-                    pit_loss_secs: entry.avg_pit_secs.map_or(default_pit_loss_secs, |secs| secs as f32),
+                    pit_loss_secs: entry
+                        .avg_pit_secs
+                        .filter(|secs| secs.is_finite() && *secs > 0.0)
+                        .or(class_service)
+                        .map_or(default_pit_loss_secs, |secs| {
+                            if pit_model.transit_runs > 0 {
+                                pit_model.transit_loss_secs + secs as f32
+                            } else {
+                                // This setting is a TOTAL stop-loss estimate
+                                // (also used by the pit-position preview).
+                                // Adding service again would double-charge it.
+                                default_pit_loss_secs
+                            }
+                        }),
                 }
             })
             .collect();
         for (&index, position) in indices.iter().zip(endurance::projected_positions(&contenders)) {
-            standings[index].projected_class_position = Some(position);
+            standings[index].projected_class_position = position;
         }
     }
 
@@ -4045,12 +4142,15 @@ impl StintState {
         if watched && stopped_secs < MIN_STOP_SECS {
             return;
         }
-        let (Some((start_secs, start_lap)), Some((lane_secs, lane_lap))) =
+        let (Some((start_secs, start_lap)), Some((lane_secs, _))) =
             (self.current_start_secs.zip(self.current_start_lap), entered)
         else {
             return;
         };
-        let stint_laps = (lane_lap - start_lap).max(0);
+        // Use exit-to-exit lap counts, matching the current stint's reset
+        // below. Where the lane crosses the timing line, measuring to entry
+        // but restarting at exit silently removes one lap from every tank.
+        let stint_laps = (lap - start_lap).max(0);
         // A stop a few laps in was for damage or a penalty, not fuel — see
         // `MIN_FUEL_STINT_LAPS`. It stays a stop; it just says nothing about
         // the car's range.
@@ -4060,11 +4160,16 @@ impl StintState {
             }
             self.completed.push_back((stint_laps, (lane_secs - start_secs).max(0.0)));
         }
-        if self.pit_secs.len() >= STINT_SAMPLES {
-            self.pit_secs.pop_front();
+        // An unwatched visit can reset the stint without supplying a service
+        // measurement. Recording zero here makes NET price later stops as
+        // drive-throughs immediately after the first such visit.
+        self.last_pit_secs = (stopped_secs >= MIN_STOP_SECS).then_some(stopped_secs);
+        if let Some(measured_secs) = self.last_pit_secs {
+            if self.pit_secs.len() >= STINT_SAMPLES {
+                self.pit_secs.pop_front();
+            }
+            self.pit_secs.push_back(measured_secs);
         }
-        self.pit_secs.push_back(stopped_secs);
-        self.last_pit_secs = Some(stopped_secs);
         self.pit_count = self.pit_count.saturating_add(1);
         self.current_start_secs = Some(session_time_secs);
         self.current_start_lap = Some(lap);
@@ -4452,6 +4557,15 @@ struct RecentLapsTracker {
 }
 
 impl RecentLapsTracker {
+    fn samples(&self, car_idx: i32) -> [Option<f32>; 3] {
+        let mut samples = [None; 3];
+        if let Some(car) = self.cars.get(&car_idx) {
+            for (slot, lap) in samples.iter_mut().zip(car.laps.iter().rev()) {
+                *slot = Some(*lap);
+            }
+        }
+        samples
+    }
     fn update(&mut self, car_idx: i32, lap: i32, last_lap_secs: f32) -> Option<f32> {
         self.cars.entry(car_idx).or_default().update(lap, last_lap_secs)
     }
@@ -5985,6 +6099,42 @@ mod tests {
         assert_eq!(reading.completed_stops, 1, "unwatched, so trusted as a stop rather than ruled a drive-through");
         assert_eq!(reading.current_laps, 1, "and the stint restarted, which is the whole point");
         assert_eq!(reading.avg_laps, Some(8));
+        assert_eq!(reading.last_pit_secs, None, "an inferred stop has no measured service duration");
+        assert_eq!(reading.avg_pit_secs, None, "missing service must not become a zero-second stop");
+    }
+
+    #[test]
+    fn a_blind_stop_preserves_the_previous_service_estimate() {
+        let mut stint = StintState::default();
+        run_stint(&mut stint, &[(30.0, 0, false), (700.0, 8, true), (725.0, 8, false)]);
+        stint.update(1400.0, 16, true, false, None);
+        stint.update(1430.0, 16, true, false, None);
+        let reading = stint.update(1440.0, 16, false, false, None);
+
+        assert_eq!(reading.completed_stops, 2);
+        assert_eq!(reading.last_pit_secs, None);
+        assert_eq!(reading.avg_pit_secs, Some(25.0), "an unmeasured stop cannot undercut a measured one");
+    }
+
+    #[test]
+    fn pit_lane_line_crossings_do_not_shorten_every_completed_stint() {
+        let mut stint = StintState::default();
+        let reading = run_stint(
+            &mut stint,
+            &[
+                (30.0, 0, false),
+                (1500.0, 16, true),
+                (1530.0, 17, false),
+                (3000.0, 33, true),
+                (3030.0, 34, false),
+                (4500.0, 50, true),
+                (4530.0, 51, false),
+            ],
+        );
+
+        assert_eq!(reading.completed_stops, 3);
+        assert_eq!(reading.avg_laps, Some(17), "17 laps between exits must remain a 17-lap range");
+        assert_eq!(reading.current_laps, 0, "the current stint uses the same exit boundary");
     }
 
     /// A car held for a moment behind another on its way through has still
@@ -6175,13 +6325,145 @@ mod tests {
 
         let mut standings = [unpitted, pitted];
         let mut multi_stop = false;
-        annotate_endurance(&mut standings, Some(20), 30.0, Some(10), &mut multi_stop);
+        annotate_endurance(
+            &mut standings,
+            Some(20),
+            30.0,
+            Some(10),
+            &mut multi_stop,
+            pit_model::PitModel::default(),
+            &HashMap::from([(0, 0.0), (1, 10.0)]),
+        );
 
         // The unpitted leader owes two stops (nothing left of a typical
         // stint, then 20 laps over 17-lap tanks); the rival owes one. 60 s of
         // stops against 10 + 30 puts the rival ahead.
         assert_eq!(standings[1].projected_class_position, Some(1));
         assert_eq!(standings[0].projected_class_position, Some(2));
+    }
+
+    #[test]
+    fn net_uses_total_stop_loss_and_live_gap_after_pit_exit() {
+        let mut leader = test_entry(10, 0, 100.0);
+        leader.avg_stint_laps = Some(17);
+        leader.current_stint_laps = 17;
+        leader.avg_pit_secs = Some(20.0);
+        let mut pitted = leader.clone();
+        pitted.car_idx = 1;
+        pitted.class_position = 2;
+        pitted.current_stint_laps = 0;
+        // F2 still has the old gap. Live track position says forty seconds.
+        pitted.gap_to_leader_secs = 0.0;
+        let mut standings = [leader, pitted];
+        let curve = relative::LapCurve::default();
+        let gaps = live_net_gaps(&standings, &[20, 20], &[0.7, 0.3], &curve, Some(10));
+        let model = pit_model::PitModel { transit_loss_secs: 30.0, transit_runs: 1, ..Default::default() };
+        annotate_endurance(&mut standings, Some(10), 30.0, Some(10), &mut false, model, &gaps);
+        assert_eq!(standings[0].stops_remaining, Some(1));
+        assert_eq!(standings[1].stops_remaining, Some(0));
+        assert_eq!(standings[1].projected_class_position, Some(1), "40 seconds paid beats 50 seconds owed");
+        // At sixty seconds behind, the same car really has lost NET P1.
+        let gaps = live_net_gaps(&standings, &[20, 20], &[0.9, 0.3], &curve, Some(10));
+        annotate_endurance(&mut standings, Some(10), 30.0, Some(10), &mut false, model, &gaps);
+        assert_eq!(standings[1].projected_class_position, Some(2), "stale F2 must not keep it ahead");
+    }
+
+    #[test]
+    fn net_waits_for_a_complete_pit_exit_reading_then_recovers() {
+        let mut leader = test_entry(10, 0, 100.0);
+        leader.avg_stint_laps = Some(17);
+        let mut pitted = leader.clone();
+        pitted.car_idx = 1;
+        pitted.class_position = 2;
+        pitted.track_location = TrackLocation::ApproachingPits;
+        let mut standings = [leader, pitted];
+        let model = pit_model::PitModel::default();
+        let gaps = HashMap::from([(0, 0.0), (1, 20.0)]);
+        annotate_endurance(&mut standings, Some(10), 30.0, Some(10), &mut false, model, &gaps);
+        assert!(standings.iter().all(|entry| entry.projected_class_position.is_none()));
+        standings[1].track_location = TrackLocation::OnTrack;
+        annotate_endurance(&mut standings, Some(10), 30.0, Some(10), &mut false, model, &HashMap::from([(0, 0.0)]));
+        assert!(standings.iter().all(|entry| entry.projected_class_position.is_none()));
+        annotate_endurance(&mut standings, Some(10), 30.0, Some(10), &mut false, model, &gaps);
+        assert_eq!(standings[1].projected_class_position, Some(2));
+        annotate_endurance(&mut standings, None, 30.0, Some(10), &mut false, model, &gaps);
+        assert!(
+            standings.iter().all(|entry| entry.projected_class_position.is_none()),
+            "no stale rank without a horizon"
+        );
+    }
+
+    #[test]
+    fn net_does_not_add_service_to_an_unmeasured_total_loss() {
+        let mut leader = test_entry(10, 0, 100.0);
+        leader.avg_stint_laps = Some(17);
+        leader.current_stint_laps = 17;
+        leader.avg_pit_secs = Some(20.0);
+        let mut rival = leader.clone();
+        rival.car_idx = 1;
+        rival.class_position = 2;
+        rival.current_stint_laps = 0;
+        let mut standings = [leader, rival];
+        annotate_endurance(
+            &mut standings,
+            Some(10),
+            30.0,
+            Some(10),
+            &mut false,
+            pit_model::PitModel::default(),
+            &HashMap::from([(0, 0.0), (1, 40.0)]),
+        );
+        assert_eq!(standings[0].projected_class_position, Some(1), "configured 30 is total, not 30 plus service");
+    }
+
+    #[test]
+    fn net_ranks_active_cars_when_a_competitor_leaves_the_world() {
+        let mut absent = test_entry(10, 0, 100.0);
+        absent.avg_stint_laps = Some(17);
+        absent.track_location = TrackLocation::NotInWorld;
+        let mut active = absent.clone();
+        active.car_idx = 1;
+        active.class_position = 2;
+        active.track_location = TrackLocation::OnTrack;
+        let mut standings = [absent, active];
+        let gaps = live_net_gaps(&standings, &[-1, 20], &[-1.0, 0.3], &relative::LapCurve::default(), Some(10));
+        annotate_endurance(&mut standings, Some(10), 30.0, Some(10), &mut false, pit_model::PitModel::default(), &gaps);
+        assert_eq!(standings[0].projected_class_position, None);
+        assert_eq!(standings[1].projected_class_position, Some(1));
+    }
+
+    #[test]
+    fn net_gap_origin_does_not_depend_on_held_standings_order() {
+        let leader = test_entry(10, 0, 100.0);
+        let mut passing = leader.clone();
+        passing.car_idx = 1;
+        passing.class_position = 2;
+        let gaps =
+            live_net_gaps(&[leader, passing], &[20, 20], &[0.5, 0.501], &relative::LapCurve::default(), Some(10));
+        assert_eq!(gaps.len(), 2);
+        assert!((gaps[&0] - 0.1).abs() < 0.001);
+        assert!(gaps[&1].abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn net_live_gaps_keep_lap_deficits_and_class_leaders_separate() {
+        let mut fast = test_entry(1, 0, 80.0);
+        fast.car_idx = 0;
+        let mut slow = test_entry(2, 0, 100.0);
+        slow.car_idx = 1;
+        let mut lapped = slow.clone();
+        lapped.car_idx = 2;
+        lapped.class_position = 2;
+        let gaps = live_net_gaps(
+            &[fast, slow, lapped],
+            &[30, 25, 23],
+            &[0.8, 0.2, 0.9],
+            &relative::LapCurve::default(),
+            Some(2),
+        );
+        assert!(gaps[&0].abs() < f32::EPSILON);
+        assert!(gaps[&1].abs() < f32::EPSILON);
+        assert!((gaps[&2] - 130.0).abs() < 0.001);
     }
 
     /// The trackers live for one iRacing connection, which covers practice,

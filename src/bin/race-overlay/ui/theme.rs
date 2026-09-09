@@ -3,12 +3,9 @@
 //! The visual language the panels are drawn in, and the tokens that differ
 //! between them — see `plans/instrument-theme.md`.
 //!
-//! Two styles ship. **Panel** is the overlay's original look: filled
-//! near-black cards with a drop shadow, no border, and a muted semantic
-//! accent set. **Instrument** is a hardware-display look — the same card
-//! but bordered in near-white rather than shadowed, its inner tiles reduced to
-//! outlines, and the accents replaced by the saturated set a hardware display
-//! uses.
+//! The product uses Panel: graphite cards, quiet supporting detail and
+//! semantic accents. Legacy Instrument geometry stays isolated here while
+//! callers share its helpers, but it is no longer a configuration option.
 //!
 //! Only the tokens that actually differ live here. Everything a theme does not
 //! change — type, spacing, geometry — stays where it was in [`super`], because
@@ -38,29 +35,6 @@ pub enum Theme {
     /// Bordered cards, outlined tiles, saturated display accents, applied to
     /// the panels that opt into it.
     Instrument,
-}
-
-impl Theme {
-    /// Every theme, in the order the settings page lists them.
-    pub const ALL: [Self; 2] = [Self::Panel, Self::Instrument];
-
-    /// What the settings page calls it.
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Panel => "Panel",
-            Self::Instrument => "Instrument",
-        }
-    }
-
-    /// The one-line description under the selector.
-    #[must_use]
-    pub fn hint(self) -> &'static str {
-        match self {
-            Self::Panel => "Filled cards with soft accents \u{2014} the original look.",
-            Self::Instrument => "Bordered cards with display accents, like a DDU.",
-        }
-    }
 }
 
 /// The active theme, as a [`Theme`] discriminant.
@@ -267,12 +241,4 @@ mod tests {
         apply(Theme::Panel);
     }
 
-    /// Every theme has to be namable and describable for the settings page.
-    #[test]
-    fn every_theme_is_labelled() {
-        for theme in Theme::ALL {
-            assert!(!theme.label().is_empty());
-            assert!(!theme.hint().is_empty());
-        }
-    }
 }

@@ -111,6 +111,9 @@ pub struct DemoOptions {
     /// Open the black box on this page, since every page but the first is
     /// reached by a wheel button that demo mode cannot press.
     pub page: Option<blackbox::Page>,
+    /// Open a settings page for reproducible previews, only when `enabled`.
+    /// Accepted names are defined by `SettingsWindow::open_demo_page`.
+    pub settings_page: Option<String>,
     /// Write one rendered frame here, then quit — see
     /// [`OverlayApp::take_screenshot`].
     pub screenshot: Option<std::path::PathBuf>,
@@ -245,6 +248,8 @@ pub struct OverlayApp {
     focus_tracker: FocusTracker,
     /// The black box's page, cursor and scroll.
     black_box: blackbox::BlackBox,
+    preview_black_box: blackbox::BlackBox,
+    preview_blackbox_page: Option<blackbox::Page>,
     /// Wheel and keyboard binds, polled every frame.
     actions: input::Actions,
     /// Queued pit intents. Sent from the telemetry thread, which owns the
@@ -348,7 +353,14 @@ impl OverlayApp {
         tray: Option<Tray>,
         launched_from: Option<HWND>,
     ) -> Self {
-        let DemoOptions { enabled: demo, page: demo_page, screenshot, states } = demo;
+        let DemoOptions { enabled: demo, page: demo_page, settings_page, screenshot, states } = demo;
+        let mut settings = settings::SettingsWindow::default();
+        if demo
+            && let Some(page) = settings_page
+            && !settings.open_demo_page(&page)
+        {
+            println!("note: --demo-settings={page} is not a settings page; keeping settings closed");
+        }
         // A demo run asked to show the team-sync surfaces starts with a
         // ledger already folded in — see `crate::sync::runtime::TeamSync::demo_seed`.
         let mut team_sync = crate::sync::runtime::TeamSync::default();
@@ -367,6 +379,8 @@ impl OverlayApp {
             tray,
             focus_tracker: FocusTracker::new(),
             black_box: demo_page.map_or_else(blackbox::BlackBox::new, blackbox::BlackBox::showing),
+            preview_black_box: blackbox::BlackBox::new(),
+            preview_blackbox_page: None,
             actions: input::Actions::new(),
             pit_requests,
             layout_mode: false,
@@ -374,7 +388,7 @@ impl OverlayApp {
             next_config_check: Instant::now() + CONFIG_POLL,
             settling_blackbox,
             blackbox_changed_at: None,
-            settings: settings::SettingsWindow::default(),
+            settings,
             settings_changed_at: None,
             pending_clicks: Vec::new(),
             window_state: None,
@@ -807,12 +821,21 @@ impl OverlayApp {
         }
     }
 
+    #[expect(clippy::too_many_lines, reason = "each overlay draws with its own config and saved position")]
     fn draw_panels(&mut self, egui_context: &egui::Context) -> bool {
         // Layout mode substitutes the mockup snapshot for whatever the sim
         // is saying, so every widget has something to draw while it is
         // being positioned. Built per frame rather than cached: this runs
         // only while the menu item is ticked, and never during a race.
-        let preview = self.layout_mode().then(crate::demo::snapshot);
+        let selected_preview = self.settings.preview_panel();
+        let preview_page = self.settings.preview_blackbox_page();
+        if preview_page != self.preview_blackbox_page {
+            if let Some(page) = preview_page {
+                self.preview_black_box = blackbox::BlackBox::showing(page);
+            }
+            self.preview_blackbox_page = preview_page;
+        }
+        let preview = (self.layout_mode() || selected_preview.is_some()).then(crate::demo::snapshot);
         // While spectating, the black box (and only it) reads the team car's
         // synced fuel over this sim's empty tank — the override touches only
         // the fuel fields no other panel reads, so it is safe to share. Owned,
@@ -852,8 +875,14 @@ impl OverlayApp {
         // Computed before the `self.black_box` borrow below, as it reads
         // `self.team_sync`.
         let fuel_target_readout = self.fuel_target_readout(latest);
-        let black_box = &mut self.black_box;
-        let layout = blackbox::layout_for(
+        let mut preview_config = self.config.blackbox.clone();
+        if let Some(page) = preview_page {
+            preview_config.hidden_pages.retain(|hidden| *hidden != page);
+        }
+        let pages = blackbox::configured_pages(latest, synced.as_ref(), &preview_config);
+        let black_box = if preview_page.is_some() { &mut self.preview_black_box } else { &mut self.black_box };
+        black_box.settle_page(pages);
+        let mut layout = blackbox::layout_for(
             black_box.page(),
             latest,
             &self.config.blackbox,
@@ -862,27 +891,40 @@ impl OverlayApp {
             synced.as_ref(),
             sync_controls,
         );
+        if let blackbox::Shape::Corners { wear_threshold_pct, .. } = &mut layout.shape {
+            *wear_threshold_pct = self.team_sync.tyre_policy().and_then(|(policy, _)| match policy {
+                crate::sync::protocol::TyrePolicy::BelowWear { threshold_pct } => Some(threshold_pct),
+                _ => None,
+            });
+        }
         let clicks = &mut self.pending_clicks;
         let row_options = crate::ui::RowOptions {
-            show_off_tracks: self.config.show_off_tracks,
-            show_flags: self.config.show_flags,
+            show_off_tracks: self.config.relative.show_off_tracks,
+            show_flags: self.config.relative.show_flags,
             danger: &danger,
             fuel_target: fuel_target_readout,
         };
         let mut held = false;
-        if layout_mode || self.config.relative.visible {
+        if panel_visible(selected_preview, crate::tray::Panel::Relative, layout_mode, self.config.relative.visible) {
             let pos = active_pos(seat_layout, &mut self.config.relative.pos, &mut self.config.relative.watch_pos);
             let synced_ref = synced.as_ref();
             let drag = draggable_panel(egui_context, "relative", pos, |ui| {
-                clicks.extend(blackbox::draw(
-                    ui,
-                    black_box,
-                    latest,
-                    &relative_config,
-                    &layout,
-                    row_options,
-                    synced_ref,
-                ));
+                let drawn_clicks =
+                    blackbox::draw(ui, black_box, latest, &relative_config, &layout, row_options, synced_ref, pages);
+                if preview_page.is_some() {
+                    for click in drawn_clicks {
+                        let _ = black_box.click(
+                            click,
+                            &layout.controls,
+                            latest,
+                            &mut preview_config,
+                            &relative_config,
+                            pages,
+                        );
+                    }
+                } else {
+                    clicks.extend(drawn_clicks);
+                }
             });
             held |= drag.held;
             if drag.stopped {
@@ -890,10 +932,19 @@ impl OverlayApp {
             }
         }
 
-        if layout_mode || self.config.standings.visible {
+        if panel_visible(selected_preview, crate::tray::Panel::Standings, layout_mode, self.config.standings.visible) {
             let pos = active_pos(seat_layout, &mut self.config.standings.pos, &mut self.config.standings.watch_pos);
             let drag = draggable_panel(egui_context, "standings", pos, |ui| {
-                standings::draw(ui, latest, &standings_config, row_options);
+                standings::draw(
+                    ui,
+                    latest,
+                    &standings_config,
+                    crate::ui::RowOptions {
+                        show_off_tracks: standings_config.show_off_tracks,
+                        show_flags: standings_config.show_flags,
+                        ..row_options
+                    },
+                );
             });
             held |= drag.held;
             if drag.stopped {
@@ -901,7 +952,7 @@ impl OverlayApp {
             }
         }
 
-        if layout_mode || self.config.radar.visible {
+        if panel_visible(selected_preview, crate::tray::Panel::RadarBars, layout_mode, self.config.radar.visible) {
             let pos = active_pos(seat_layout, &mut self.config.radar.pos, &mut self.config.radar.watch_pos);
             let drag = draggable_panel(egui_context, "radar_bars", pos, |ui| {
                 radar_bars::draw(ui, latest, &radar_config);
@@ -917,8 +968,13 @@ impl OverlayApp {
         // draws the nearest car at the warning level whatever the thresholds
         // say, so the panel can be positioned — and a demo run is the same
         // kind of showing, so its screenshots match what layout mode shows.
-        let faster_preview = layout_mode || self.demo;
-        if layout_mode || self.config.faster_class.visible {
+        let faster_preview = layout_mode || self.demo || selected_preview == Some(crate::tray::Panel::FasterClass);
+        if panel_visible(
+            selected_preview,
+            crate::tray::Panel::FasterClass,
+            layout_mode,
+            self.config.faster_class.visible,
+        ) {
             let alarm = &mut self.faster_class_alarm;
             let pos =
                 active_pos(seat_layout, &mut self.config.faster_class.pos, &mut self.config.faster_class.watch_pos);
@@ -931,7 +987,7 @@ impl OverlayApp {
             }
         }
 
-        if layout_mode || self.config.pit_stall.visible {
+        if panel_visible(selected_preview, crate::tray::Panel::PitStall, layout_mode, self.config.pit_stall.visible) {
             let pos = active_pos(seat_layout, &mut self.config.pit_stall.pos, &mut self.config.pit_stall.watch_pos);
             let drag = draggable_panel(egui_context, "pit_stall", pos, |ui| {
                 pit_stall::draw(ui, latest, &pit_stall_config);
@@ -989,6 +1045,12 @@ impl EguiOverlay for OverlayApp {
         // `wants_keyboard_input` is last frame's answer, which is the freshest
         // one there is before this frame begins.
         self.typed.poll(self.settings.open && egui_context.wants_keyboard_input(), &mut input.events);
+        if self.screenshot.is_some() {
+            // Hidden previews must not inherit the desktop pointer or a held
+            // key: hover tooltips would obscure settings and make captures vary.
+            input.events.clear();
+            input.events.push(egui::Event::PointerGone);
+        }
         if !self.sized {
             // Before the first pass rather than inside it: `set_fonts` only
             // takes effect at the next `begin_pass`, so a first frame that
@@ -1070,7 +1132,7 @@ impl EguiOverlay for OverlayApp {
         crate::ui::logos::apply(&self.config.logos);
         // Every widget reads the theme while drawing, so it is published once
         // here rather than threaded through every draw call — see `ui::theme`.
-        crate::ui::theme::apply(self.config.theme);
+        crate::ui::theme::apply(crate::ui::theme::Theme::Panel);
 
         if !self.sized {
             let size = primary_monitor_size(glfw_backend);
@@ -1150,7 +1212,7 @@ impl EguiOverlay for OverlayApp {
         // so its controls build correct requests from the driver's real fuel.
         let bb_snapshot = self.synced_blackbox_snapshot();
         let bb = bb_snapshot.as_ref().or(self.latest.as_ref());
-        let pages = blackbox::pages_for(bb, synced.as_ref());
+        let pages = blackbox::configured_pages(bb, synced.as_ref(), &self.config.blackbox);
         self.black_box.settle_page(pages);
 
         let binds = self.config.binds.pairs();
@@ -1194,10 +1256,14 @@ impl EguiOverlay for OverlayApp {
                 if let blackbox::Click::Control { index, action } = click {
                     match control_at(index) {
                         Some(blackbox::Control::FuelTarget) => {
+                            // App-owned actions still select their control so the
+                            // next wheel input targets the row that was clicked.
+                            let _ = self.black_box.click(click, &rows, bb, &mut self.config.blackbox, &relative, pages);
                             fuel_target_actions.push(action);
                             continue;
                         }
                         Some(blackbox::Control::TyrePolicy) => {
+                            let _ = self.black_box.click(click, &rows, bb, &mut self.config.blackbox, &relative, pages);
                             tyre_policy_actions.push(action);
                             continue;
                         }
@@ -1231,18 +1297,8 @@ impl EguiOverlay for OverlayApp {
         // Tray menu clicks arrive on this thread's message queue, which the
         // window's own event pump drains, so they're polled here.
         let tray_actions = self.tray.as_ref().map(Tray::poll).unwrap_or_default();
-        if tray_actions.toggle_layout {
-            self.layout_mode = !self.layout_mode;
-        }
         if tray_actions.open_settings {
             self.settings.open = true;
-        }
-        // A panel switched off from the tray stays off next time: that is a
-        // setting, not a mode.
-        for panel in &tray_actions.toggle_panels {
-            let visible = self.config.panel_visible_mut(*panel);
-            *visible = !*visible;
-            self.persist();
         }
         if tray_actions.quit {
             glfw_backend.window.set_should_close(true);
@@ -1271,14 +1327,13 @@ impl EguiOverlay for OverlayApp {
     }
 }
 
-/// Draws one panel at `pos`, using egui's own movable-`Area` machinery
-/// rather than hand-rolled drag-delta math: `default_pos` only seeds the
-/// position on the very first frame this `Id` is ever seen (i.e. on
-/// startup, from the saved config), after which egui's own memory owns the
-/// position for as long as the app runs, which is what `movable(true)` is
-/// built and tested for.
-///
-/// See [`PanelDrag`] for what it reports back.
+/// A selected settings preview is exclusive, even when layout mode is on.
+fn panel_visible(selected: Option<crate::tray::Panel>, panel: crate::tray::Panel, layout: bool, visible: bool) -> bool {
+    selected.map_or(layout || visible, |selected| selected == panel)
+}
+
+/// Draws live panels and settings previews from the same saved position and
+/// Area identity. Selecting a settings page changes content, never geometry.
 fn draggable_panel(
     ctx: &egui::Context,
     id: &str,
@@ -1286,7 +1341,7 @@ fn draggable_panel(
     add_contents: impl FnOnce(&mut egui::Ui),
 ) -> PanelDrag {
     let area = egui::Area::new(egui::Id::new(id))
-        .default_pos(egui::pos2(pos[0], pos[1]))
+        .current_pos(egui::pos2(pos[0], pos[1]))
         .movable(true)
         // egui keeps an `Area` inside the screen rect by default, and this
         // window is not the screen yet on the frame it is first drawn: GLFW
@@ -1331,7 +1386,7 @@ struct PanelDrag {
 /// the system font directory. egui's built-in font is deliberately
 /// minimal — fine for a debug UI, but it was the single biggest reason
 /// this app's actual rendering looked nothing like its design mockups.
-fn install_fonts(ctx: &egui::Context) {
+pub(super) fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let mut install = |family: egui::FontFamily, name: &str, bytes: &'static [u8]| {
         fonts.font_data.insert(name.to_owned(), egui::FontData::from_static(bytes));
@@ -1603,57 +1658,61 @@ impl OverlayApp {
     /// a screenshot that could not be written is not a reason to take the
     /// overlay down with it.
     fn take_screenshot(&self, backend: &ThreeDBackend) {
-        use egui_overlay::egui_render_three_d::glow::{HasContext as _, PixelPackData, RGBA, UNSIGNED_BYTE};
+        if let Some(path) = &self.screenshot {
+            capture_screenshot(path, backend);
+        }
+    }
+}
 
-        let Some(path) = self.screenshot.as_ref() else {
-            return;
-        };
-        let [width, height] = backend.glow_backend.framebuffer_size;
-        let (Ok(w), Ok(h)) = (usize::try_from(width), usize::try_from(height)) else {
-            println!("note: could not screenshot: framebuffer is {width}x{height}");
-            return;
-        };
-        let mut rgba = vec![0_u8; w * h * 4];
-        let gl = &backend.glow_backend.glow_context;
-        // SAFETY: `glow` marks every GL entry point unsafe. This one reads the
-        // bound framebuffer into `rgba`, which is exactly `w * h * 4` bytes —
-        // the size the format and dimensions passed here ask for — and runs on
-        // the thread that owns the context, mid-frame.
-        //
-        // The semicolon has to sit outside the block for the crate's
-        // `semicolon_outside_block` lint, which is what the other lint objects
-        // to; they cannot both be satisfied on a one-call block.
-        #[expect(clippy::semicolon_if_nothing_returned, reason = "conflicts with semicolon_outside_block")]
-        unsafe {
-            gl.read_pixels(
-                0,
-                0,
-                width.cast_signed(),
-                height.cast_signed(),
-                RGBA,
-                UNSIGNED_BYTE,
-                PixelPackData::Slice(&mut rgba),
-            )
-        };
-        // OpenGL's origin is bottom-left and a PNG's is top-left, so the rows
-        // come back in the opposite order; each is composited onto black on
-        // the way into the output.
-        let mut opaque = Vec::with_capacity(w * h * 3);
-        for row in (0..h).rev() {
-            for pixel in rgba[row * w * 4..(row + 1) * w * 4].as_chunks::<4>().0 {
-                let alpha = f32::from(pixel[3]) / 255.0;
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "a channel times a 0..=1 alpha stays inside u8"
-                )]
-                opaque.extend(pixel[..3].iter().map(|channel| (f32::from(*channel) * alpha) as u8));
-            }
+/// Captures the current GL framebuffer for overlay and first-run design previews.
+pub(super) fn capture_screenshot(path: &std::path::Path, backend: &ThreeDBackend) {
+    use egui_overlay::egui_render_three_d::glow::{HasContext as _, PixelPackData, RGBA, UNSIGNED_BYTE};
+
+    let [width, height] = backend.glow_backend.framebuffer_size;
+    let (Ok(w), Ok(h)) = (usize::try_from(width), usize::try_from(height)) else {
+        println!("note: could not screenshot: framebuffer is {width}x{height}");
+        return;
+    };
+    let mut rgba = vec![0_u8; w * h * 4];
+    let gl = &backend.glow_backend.glow_context;
+    // SAFETY: `glow` marks every GL entry point unsafe. This one reads the
+    // bound framebuffer into `rgba`, which is exactly `w * h * 4` bytes —
+    // the size the format and dimensions passed here ask for — and runs on
+    // the thread that owns the context, mid-frame.
+    //
+    // The semicolon has to sit outside the block for the crate's
+    // `semicolon_outside_block` lint, which is what the other lint objects
+    // to; they cannot both be satisfied on a one-call block.
+    #[expect(clippy::semicolon_if_nothing_returned, reason = "conflicts with semicolon_outside_block")]
+    unsafe {
+        gl.read_pixels(
+            0,
+            0,
+            width.cast_signed(),
+            height.cast_signed(),
+            RGBA,
+            UNSIGNED_BYTE,
+            PixelPackData::Slice(&mut rgba),
+        )
+    };
+    // OpenGL's origin is bottom-left and a PNG's is top-left, so the rows
+    // come back in the opposite order; each is composited onto black on
+    // the way into the output.
+    let mut opaque = Vec::with_capacity(w * h * 3);
+    for row in (0..h).rev() {
+        for pixel in rgba[row * w * 4..(row + 1) * w * 4].as_chunks::<4>().0 {
+            let alpha = f32::from(pixel[3]) / 255.0;
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a channel times a 0..=1 alpha stays inside u8"
+            )]
+            opaque.extend(pixel[..3].iter().map(|channel| (f32::from(*channel) * alpha) as u8));
         }
-        match write_png(path, &opaque, width, height) {
-            Ok(()) => println!("note: wrote {}", path.display()),
-            Err(err) => println!("note: could not write {}: {err}", path.display()),
-        }
+    }
+    match write_png(path, &opaque, width, height) {
+        Ok(()) => println!("note: wrote {}", path.display()),
+        Err(err) => println!("note: could not write {}: {err}", path.display()),
     }
 }
 
@@ -1861,5 +1920,79 @@ mod tests {
         drop(drawn);
 
         assert!(eq(pos, saved), "a pass with no drag in it must leave the saved position alone");
+    }
+    #[test]
+    fn settings_preview_is_exclusive_and_leaves_normal_visibility_intact() {
+        use crate::tray::Panel;
+        let panels = [Panel::Relative, Panel::Standings, Panel::RadarBars, Panel::FasterClass, Panel::PitStall];
+        for selected in panels {
+            for panel in panels {
+                for layout in [false, true] {
+                    for visible in [false, true] {
+                        assert_eq!(panel_visible(Some(selected), panel, layout, visible), selected == panel);
+                        assert_eq!(panel_visible(None, panel, layout, visible), layout || visible);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dragged_panel_stays_put_after_selecting_another_panel() {
+        let ctx = egui::Context::default();
+        let mut relative = [120.0, 140.0];
+        let mut standings = [500.0, 140.0];
+        let frame = |id: &str, pos: &mut [f32; 2], events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0))),
+                events,
+                ..Default::default()
+            };
+            let mut rect = egui::Rect::NOTHING;
+            drop(ctx.run(input, |ctx| {
+                draggable_panel(ctx, id, pos, |ui| {
+                    rect = ui.allocate_exact_size(egui::vec2(180.0, 80.0), egui::Sense::hover()).0;
+                });
+            }));
+            rect.min
+        };
+        frame("relative", &mut relative, vec![]);
+        frame("relative", &mut relative, vec![]);
+        let press = egui::pos2(160.0, 170.0);
+        let release = egui::pos2(300.0, 300.0);
+        frame(
+            "relative",
+            &mut relative,
+            vec![
+                egui::Event::PointerMoved(press),
+                egui::Event::PointerButton {
+                    pos: press,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame("relative", &mut relative, vec![egui::Event::PointerMoved(release)]);
+        frame(
+            "relative",
+            &mut relative,
+            vec![egui::Event::PointerButton {
+                pos: release,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let saved = relative;
+        assert!(saved[0] > 200.0 && saved[1] > 200.0, "the test must actually drag the panel");
+        frame("standings", &mut standings, vec![]);
+        frame("standings", &mut standings, vec![]);
+        let returned = frame("relative", &mut relative, vec![]);
+        assert!((returned - egui::pos2(saved[0], saved[1])).length() < 1.0);
+        // Numeric edits and a position reset also take effect after a preview.
+        relative = [410.0, 360.0];
+        let edited = frame("relative", &mut relative, vec![]);
+        assert!((edited - egui::pos2(410.0, 360.0)).length() < 1.0);
     }
 }

@@ -6,6 +6,14 @@ description = "iRacing overlay and session launcher"
 license = "MIT"
 publish = false
 
+[features]
+# The first-run license setup window. On by default; `--no-default-features`
+# compiles it out, giving a build that starts straight into the overlay with
+# no activation step and no key to enter. That is what release.yml ships;
+# the licensed build is produced and distributed separately.
+default = ["licence"]
+licence = []
+
 [dependencies]
 anyhow = "1.0.103"
 egui = { version = "0.29", default-features = false }

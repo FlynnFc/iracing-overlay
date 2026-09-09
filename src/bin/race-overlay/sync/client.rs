@@ -52,9 +52,18 @@ pub struct SyncClient {
     pub incoming: Receiver<FromRelay>,
     /// Events this member wants published.
     pub publish: Sender<Outgoing>,
+    /// Keeps retries alive only while the owning client still exists.
+    _shutdown: Sender<()>,
 }
 
 impl SyncClient {
+    /// A channel-only client for runtime tests, without a network thread.
+    #[cfg(test)]
+    pub(super) fn from_test_channels(incoming: Receiver<FromRelay>, publish: Sender<Outgoing>) -> Self {
+        let (shutdown, _) = std::sync::mpsc::channel();
+        Self { incoming, publish, _shutdown: shutdown }
+    }
+
     /// Starts the background thread and returns its channels.
     ///
     /// `url` is the relay as the member reaches it — `ws://127.0.0.1:port`
@@ -65,8 +74,9 @@ impl SyncClient {
     pub fn start(url: String, subsession: u64, invite: String, member: Member) -> Self {
         let (incoming_tx, incoming) = std::sync::mpsc::channel();
         let (publish, publish_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || run(&url, subsession, &invite, &member, &incoming_tx, &publish_rx));
-        Self { incoming, publish }
+        let (shutdown_tx, shutdown) = std::sync::mpsc::channel();
+        std::thread::spawn(move || run(&url, subsession, &invite, &member, &incoming_tx, &publish_rx, &shutdown));
+        Self { incoming, publish, _shutdown: shutdown_tx }
     }
 }
 
@@ -78,6 +88,7 @@ fn run(
     member: &Member,
     incoming: &Sender<FromRelay>,
     publish: &Receiver<Outgoing>,
+    shutdown: &Receiver<()>,
 ) {
     // Socket pump; keep it off the sim's cores — see `crate::perf`.
     crate::perf::mark_background_thread();
@@ -98,7 +109,12 @@ fn run(
                 println!("note: team sync could not connect ({reason}); retrying in {backoff:?}");
             }
         }
-        std::thread::sleep(backoff);
+        // Connection failures never reach the publish-channel pump. The
+        // owning handle must still be able to stop this thread, including
+        // while it waits through a long reconnect backoff.
+        if shutdown.recv_timeout(backoff) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+            return;
+        }
         backoff = (backoff * 2).min(BACKOFF_CAP);
     }
 }
@@ -148,9 +164,14 @@ fn connect_once(
     // The relay's `Welcome` can push it further — a previous run of this
     // process may have published events this one never saw.
     let mut next_seq = replica.next_seq(member.cust_id);
+    // A restarted process has no replica yet. Wait for both the relay's
+    // contiguous tips and backlog (which can include events past a gap)
+    // before assigning identities to queued events.
+    let mut welcomed = false;
+    let mut caught_up = false;
 
     loop {
-        loop {
+        while caught_up {
             match publish.try_recv() {
                 Ok(outgoing) => {
                     let envelope = Envelope {
@@ -185,6 +206,11 @@ fn connect_once(
                     return ConnectionEnd::Refused(reason.clone());
                 }
                 absorb(&frame, replica, &mut next_seq, member.cust_id);
+                match &frame {
+                    FromRelay::Welcome { .. } => welcomed = true,
+                    FromRelay::Backlog(_) if welcomed => caught_up = true,
+                    _ => {}
+                }
                 // Anything of this member's own that the relay lacks — laps
                 // published while the link was down — is re-offered here.
                 // The relay cannot back-fill what it never received, so the
@@ -236,5 +262,94 @@ fn absorb(frame: &FromRelay, replica: &mut Ledger, next_seq: &mut u32, cust_id: 
             replica.insert(envelope.clone());
         }
         FromRelay::Roster(_) | FromRelay::Refused { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_handles_stops_retries_when_the_url_cannot_connect() {
+        let (incoming_tx, incoming) = std::sync::mpsc::channel();
+        let (publish, publish_rx) = std::sync::mpsc::channel();
+        let (shutdown_tx, shutdown) = std::sync::mpsc::channel();
+        let client = SyncClient { incoming, publish, _shutdown: shutdown_tx };
+        drop(client);
+        let (finished_tx, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            run(
+                "not a websocket URL",
+                1,
+                "invite",
+                &Member { cust_id: 7, name: "Driver".to_owned() },
+                &incoming_tx,
+                &publish_rx,
+                &shutdown,
+            );
+            finished_tx.send(()).expect("signal worker exit");
+        });
+        finished.recv_timeout(Duration::from_secs(2)).expect("dropped client must end failed retries");
+        worker.join().expect("worker finished");
+    }
+
+    #[test]
+    fn queued_publish_after_restart_follows_all_existing_producer_history() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind relay");
+        let url = format!("ws://{}", listener.local_addr().expect("relay address"));
+        let history: Vec<_> = [1, 3]
+            .into_iter()
+            .map(|seq| Envelope {
+                producer: 7,
+                seq,
+                session_time: f64::from(seq),
+                event: Event::OffTrack { car_idx: 1, tally: 1 },
+            })
+            .collect();
+        let old_events = history.clone();
+        let relay = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept client");
+            stream.set_read_timeout(Some(Duration::from_secs(5))).expect("set timeout");
+            let mut ws = tungstenite::accept(stream).expect("handshake");
+            let Message::Binary(hello) = ws.read().expect("hello") else { panic!("expected hello") };
+            assert!(matches!(decode::<FromClient>(&hello).expect("decode hello"), FromClient::Hello { .. }));
+            let mut ledger = Ledger::default();
+            for event in history {
+                ledger.insert(event);
+            }
+            for frame in
+                [FromRelay::Welcome { members: vec![], have: ledger.tips() }, FromRelay::Backlog(ledger.after(&[]))]
+            {
+                ws.send(Message::Binary(encode(&frame).into())).expect("send catch-up");
+            }
+            let Message::Binary(data) = ws.read().expect("queued publish") else { panic!("expected publish") };
+            let FromClient::Publish(envelope) = decode(&data).expect("decode publish") else {
+                panic!("expected publish")
+            };
+            let inserted = ledger.insert(envelope.clone());
+            ws.close(None).expect("close relay");
+            (envelope, inserted)
+        });
+        let (incoming_tx, _incoming) = std::sync::mpsc::channel();
+        let (publish, publish_rx) = std::sync::mpsc::channel();
+        let event = Event::OffTrack { car_idx: 1, tally: 9 };
+        publish.send(Outgoing { session_time: 10.0, event: event.clone() }).expect("queue before connect");
+        let mut replica = Ledger::default();
+        let _ = connect_once(
+            &url,
+            1,
+            "invite",
+            &Member { cust_id: 7, name: "Driver".to_owned() },
+            &mut replica,
+            &incoming_tx,
+            &publish_rx,
+        );
+        let (published, inserted) = relay.join().expect("relay finished");
+        assert_eq!(published.seq, 4, "must follow backlog events beyond the contiguous tip");
+        assert_eq!(published.event, event);
+        assert!(inserted, "the relay must retain the queued event rather than deduplicating it");
+        let mut expected = old_events;
+        expected.push(published);
+        assert_eq!(replica.after(&[]), expected, "catch-up must preserve both old and new events");
     }
 }

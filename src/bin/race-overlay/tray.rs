@@ -13,8 +13,8 @@
 //! tickable entry per panel — and where the settings window is opened from.
 
 use anyhow::Context;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-use tray_icon::{TrayIcon, TrayIconBuilder};
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// One of the overlay's panels, as the tray menu names them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +34,7 @@ impl Panel {
     pub const ALL: [Self; 5] = [Self::Standings, Self::Relative, Self::RadarBars, Self::FasterClass, Self::PitStall];
 
     /// The menu entry's text.
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Relative => "Relative & Black Box",
             Self::Standings => "Standings",
@@ -53,10 +53,7 @@ pub struct Tray {
     #[expect(dead_code, reason = "held only so the icon stays in the notification area until exit")]
     icon: TrayIcon,
     quit_id: MenuId,
-    layout_id: MenuId,
     settings_id: MenuId,
-    /// Each panel's tickable entry, so a click can be traced back to its panel.
-    panel_ids: Vec<(MenuId, Panel)>,
 }
 
 /// What the user asked of the tray menu since the last frame.
@@ -64,14 +61,8 @@ pub struct Tray {
 pub struct TrayActions {
     /// The overlay should shut down.
     pub quit: bool,
-    /// Layout mode should be turned on or off — see `app::OverlayApp`.
-    pub toggle_layout: bool,
-    /// The settings window should come up — see `ui::settings`.
+    /// The settings window should come up.
     pub open_settings: bool,
-    /// Panels whose visibility should flip, one entry per click. A panel
-    /// clicked twice in a frame appears twice and ends where it started,
-    /// which is what its tick in the menu has already done.
-    pub toggle_panels: Vec<Panel>,
 }
 
 /// `TrayIcon` itself is not `Debug`, but the crate's lint set requires every
@@ -86,33 +77,13 @@ impl std::fmt::Debug for Tray {
 impl Tray {
     /// Builds the tray icon and its menu.
     ///
-    /// `shown` says whether each panel is on screen now, so its tick starts
-    /// out telling the truth.
-    ///
     /// # Errors
     /// Returns an error if the icon image can't be decoded or the shell
     /// refuses to register the notification-area entry.
-    pub fn new(shown: impl Fn(Panel) -> bool) -> anyhow::Result<Self> {
+    pub fn new() -> anyhow::Result<Self> {
         let menu = Menu::new();
 
-        // One tick per panel. Checkable so the menu is also the answer to
-        // "which of these have I got turned off?" — the same reason the
-        // layout entry below is.
-        let mut panel_ids = Vec::with_capacity(Panel::ALL.len());
-        for panel in Panel::ALL {
-            let item = CheckMenuItem::new(panel.label(), true, shown(panel), None);
-            panel_ids.push((item.id().clone(), panel));
-            menu.append(&item).with_context(|| format!("adding the tray menu's {} item", panel.label()))?;
-        }
-        menu.append(&PredefinedMenuItem::separator()).context("adding a tray menu separator")?;
-
-        // Checkable, so the menu itself says whether layout mode is on. A
-        // driver who left it on and wondered why the radar was full of cars
-        // that aren't there has only to open the menu to see why.
-        let layout = CheckMenuItem::new("Layout Mode (show every widget)", true, false, None);
-        let layout_id = layout.id().clone();
-        menu.append(&layout).context("adding the tray menu's layout item")?;
-        let settings = MenuItem::new("Settings\u{2026}", true, None);
+        let settings = MenuItem::new("Open Settings", true, None);
         let settings_id = settings.id().clone();
         menu.append(&settings).context("adding the tray menu's settings item")?;
         menu.append(&PredefinedMenuItem::separator()).context("adding a tray menu separator")?;
@@ -123,12 +94,14 @@ impl Tray {
 
         let icon = TrayIconBuilder::new()
             .with_tooltip("Race Overlay")
+            .with_menu_on_left_click(false)
+            .with_menu_on_right_click(true)
             .with_menu(Box::new(menu))
             .with_icon(load_icon()?)
             .build()
             .context("registering the tray icon")?;
 
-        Ok(Self { icon, quit_id, layout_id, settings_id, panel_ids })
+        Ok(Self { icon, quit_id, settings_id })
     }
 
     /// Drains pending tray-menu events into the actions they stand for.
@@ -138,17 +111,16 @@ impl Tray {
     /// receives on.
     pub fn poll(&self) -> TrayActions {
         let mut actions = TrayActions::default();
+        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                actions.open_settings = true;
+            }
+        }
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == self.quit_id {
                 actions.quit = true;
-            } else if event.id == self.layout_id {
-                // Toggled rather than assigned: `CheckMenuItem` has already
-                // flipped its own tick by the time this arrives.
-                actions.toggle_layout = !actions.toggle_layout;
             } else if event.id == self.settings_id {
                 actions.open_settings = true;
-            } else if let Some((_, panel)) = self.panel_ids.iter().find(|(id, _)| *id == event.id) {
-                actions.toggle_panels.push(*panel);
             }
         }
         actions

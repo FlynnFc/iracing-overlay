@@ -6,6 +6,7 @@
 pub mod endurance;
 pub mod faster_class;
 pub mod irating;
+pub mod net_position;
 pub mod pit;
 pub mod pit_model;
 pub mod pit_stall;

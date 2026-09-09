@@ -99,6 +99,8 @@ pub struct CarSnapshot {
     /// from long ago. `None` until this car has completed a lap since it was
     /// first seen this session.
     pub best_recent_lap_secs: Option<f32>,
+    /// Last three completed laps, newest first.
+    pub recent_laps: [Option<f32>; 3],
     /// A black flag held against this car, if any — see [`Penalty`].
     pub penalty: Option<Penalty>,
 }

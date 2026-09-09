@@ -9,9 +9,9 @@
 //! [`TeamState::apply`] path — so a rebuilt state is identical to one that
 //! never dropped.
 //!
-//! Deliberately a plain fold with no time logic: events carry their own
-//! `session_time`, and the ledger has already ordered and de-duplicated them
-//! by the time they arrive here. This just remembers the latest of each.
+//! Backlogs are grouped by producer, not global time. Each replaceable field
+//! therefore retains its own event version so live delivery and replay pick
+//! the same latest value.
 
 use super::protocol::{Envelope, Event, TyrePolicy};
 use crate::telemetry::snapshot::TyreInfo;
@@ -24,6 +24,34 @@ const LAP_HISTORY: usize = 32;
 /// Laps averaged for the burn a spectator's Fuel page shows — the same short
 /// window Auto Fuel uses, so the crew's figure matches the driver's.
 const BURN_WINDOW_LAPS: usize = 5;
+
+/// A field's latest event, ordered independently of network/replay arrival.
+#[derive(Debug, Clone, Copy)]
+struct Version {
+    session_time: f64,
+    producer: u32,
+    seq: u32,
+}
+
+impl Version {
+    fn advance(held: &mut Option<Self>, envelope: &Envelope) -> bool {
+        let next = Self { session_time: envelope.session_time, producer: envelope.producer, seq: envelope.seq };
+        let accept = held.is_none_or(|previous| {
+            // Own writes currently have no wire identity. Preserve their
+            // equal-time arrival order until the runtime has a real envelope.
+            let local = (next.producer, next.seq) == (0, 0) || (previous.producer, previous.seq) == (0, 0);
+            if local {
+                next.session_time >= previous.session_time
+            } else {
+                (next.session_time, next.producer, next.seq) >= (previous.session_time, previous.producer, previous.seq)
+            }
+        });
+        if accept {
+            *held = Some(next);
+        }
+        accept
+    }
+}
 
 /// One completed lap's fuel record, oldest-first in [`TeamState::laps`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -86,37 +114,52 @@ pub struct TeamState {
     laps: Vec<LapFuel>,
     /// Who is currently in the car, from the last stint boundary.
     driver: Option<String>,
-    /// The highest `session_time` any applied event carried, so a stale
-    /// scalars frame arriving after a newer one can't walk the tank
-    /// backwards. Lap history is keyed by lap number and immune to this.
-    fuel_as_of: f64,
+    /// Independent clocks prevent unrelated events from hiding newer values.
+    fuel_as_of: Option<Version>,
+    service_as_of: Option<Version>,
+    tyre_readings_as_of: Option<Version>,
+    fuel_target_as_of: Option<Version>,
+    tyre_policy_as_of: Option<Version>,
+    driver_as_of: Option<Version>,
 }
 
 impl TeamState {
     /// Folds one envelope in. Idempotent for lap history (keyed by lap) and
-    /// monotonic for the live tank (a later `session_time` wins).
+    /// monotonic for replaceable fields (a later event version wins).
     pub fn apply(&mut self, envelope: &Envelope) {
         match &envelope.event {
             Event::LapClosed { lap, fuel_litres, used_litres } => {
                 self.record_lap(LapFuel { lap: *lap, fuel_after_litres: *fuel_litres, used_litres: *used_litres });
-                self.set_fuel(*fuel_litres, envelope.session_time);
+                self.set_fuel(*fuel_litres, envelope);
             }
             Event::DriverScalars { fuel_litres, service_fuel_litres, tyres_armed, tyre_pressures_kpa } => {
-                self.set_fuel(*fuel_litres, envelope.session_time);
-                // Armed service is not timestamped against `fuel_as_of`: it
-                // is small, changes rarely, and the last one seen is the one
-                // the sim last echoed, whatever the ordering of two nearby
-                // scalars frames.
-                self.service_fuel_litres = *service_fuel_litres;
-                self.tyres_armed = *tyres_armed;
-                self.tyre_pressures_kpa = *tyre_pressures_kpa;
+                self.set_fuel(*fuel_litres, envelope);
+                if Version::advance(&mut self.service_as_of, envelope) {
+                    self.service_fuel_litres = *service_fuel_litres;
+                    self.tyres_armed = *tyres_armed;
+                    self.tyre_pressures_kpa = *tyre_pressures_kpa;
+                }
             }
-            Event::TyreReadings(info) => self.tyre_readings = Some(*info),
-            Event::FuelTarget { litres_per_lap, .. } => self.fuel_target = *litres_per_lap,
+            Event::TyreReadings(info) => {
+                if Version::advance(&mut self.tyre_readings_as_of, envelope) {
+                    self.tyre_readings = Some(*info);
+                }
+            }
+            Event::FuelTarget { litres_per_lap, .. } => {
+                if Version::advance(&mut self.fuel_target_as_of, envelope) {
+                    self.fuel_target = *litres_per_lap;
+                }
+            }
             Event::TyrePolicySet { requester, policy } => {
-                self.tyre_policy = policy.map(|policy| (policy, requester.clone()));
+                if Version::advance(&mut self.tyre_policy_as_of, envelope) {
+                    self.tyre_policy = policy.map(|policy| (policy, requester.clone()));
+                }
             }
-            Event::StintBoundary { driver } => self.driver = Some(driver.clone()),
+            Event::StintBoundary { driver } => {
+                if Version::advance(&mut self.driver_as_of, envelope) {
+                    self.driver = Some(driver.clone());
+                }
+            }
             // Field-wide events (pit stops, off-tracks) belong to the trackers'
             // replay path, not the car's fuel/tyre picture; a pit write is
             // transient and handled live by the runtime, never from the store.
@@ -141,10 +184,9 @@ impl TeamState {
     }
 
     /// Advances the live tank only for a not-older reading.
-    fn set_fuel(&mut self, litres: f32, session_time: f64) {
-        if session_time >= self.fuel_as_of {
+    fn set_fuel(&mut self, litres: f32, envelope: &Envelope) {
+        if Version::advance(&mut self.fuel_as_of, envelope) {
             self.fuel_litres = Some(litres);
-            self.fuel_as_of = session_time;
         }
     }
 
@@ -219,6 +261,128 @@ mod tests {
 
     fn envelope(seq: u32, session_time: f64, event: Event) -> Envelope {
         Envelope { producer: 1, seq, session_time, event }
+    }
+
+    #[test]
+    fn multi_producer_backlog_matches_live_state() {
+        use super::super::ledger::Ledger;
+        use crate::telemetry::snapshot::TyreState;
+
+        let mut ledger = Ledger::default();
+        let mut live = TeamState::default();
+        // The newer driver's smaller ID sorts first in Ledger::after, so
+        // replay delivers the old driver's values last.
+        for (producer, time, old) in [(99, 10.0, true), (11, 20.0, false)] {
+            let corner = TyreState {
+                temps_c: [if old { 70.0 } else { 80.0 }; 3],
+                wear: [if old { 0.9 } else { 0.8 }; 3],
+                pressure_kpa: if old { 160.0 } else { 170.0 },
+            };
+            let events = [
+                Event::DriverScalars {
+                    fuel_litres: if old { 60.0 } else { 50.0 },
+                    service_fuel_litres: if old { Some(30) } else { None },
+                    tyres_armed: [old; 4],
+                    tyre_pressures_kpa: [if old { 165.0 } else { 175.0 }; 4],
+                },
+                Event::TyreReadings(TyreInfo { corners: [corner; 4] }),
+                Event::FuelTarget { requester: "Crew".to_owned(), litres_per_lap: if old { Some(2.5) } else { None } },
+                Event::TyrePolicySet {
+                    requester: "Crew".to_owned(),
+                    policy: if old { Some(TyrePolicy::Never) } else { None },
+                },
+                Event::StintBoundary { driver: if old { "Old" } else { "New" }.to_owned() },
+            ];
+            for (seq, event) in (1_u32..).zip(events) {
+                let frame = Envelope { producer, seq, session_time: time, event };
+                live.apply(&frame);
+                assert!(ledger.insert(frame));
+            }
+        }
+        let mut replayed = TeamState::default();
+        for frame in ledger.after(&[]) {
+            replayed.apply(&frame);
+        }
+        let live_car = live.synced_car().expect("live tank");
+        let replayed_car = replayed.synced_car().expect("replayed tank");
+        assert_eq!(replayed.fuel_target(), live.fuel_target());
+        assert_eq!(replayed.tyre_policy(), live.tyre_policy());
+        assert_eq!(replayed_car.driver, live_car.driver);
+        assert_eq!(replayed_car.service_fuel_litres, live_car.service_fuel_litres);
+        assert_eq!(replayed_car.tyres_armed, live_car.tyres_armed);
+        assert_eq!(replayed_car.tyre_pressures_kpa, live_car.tyre_pressures_kpa);
+        assert!((replayed_car.fuel_litres - live_car.fuel_litres).abs() < 0.001);
+        let replayed_tyres = replayed_car.tyres.expect("replayed tyres");
+        let live_tyres = live_car.tyres.expect("live tyres");
+        assert_eq!(replayed_tyres.corners[0].wear, live_tyres.corners[0].wear);
+    }
+
+    #[test]
+    fn equal_time_wire_writes_converge_in_either_order() {
+        let frames = [
+            Envelope {
+                producer: 11,
+                seq: 2,
+                session_time: 20.0,
+                event: Event::FuelTarget { requester: "A".to_owned(), litres_per_lap: Some(2.0) },
+            },
+            Envelope {
+                producer: 99,
+                seq: 1,
+                session_time: 20.0,
+                event: Event::FuelTarget { requester: "B".to_owned(), litres_per_lap: Some(3.0) },
+            },
+            Envelope {
+                producer: 99,
+                seq: 2,
+                session_time: 20.0,
+                event: Event::FuelTarget { requester: "B".to_owned(), litres_per_lap: None },
+            },
+        ];
+        let mut forward = TeamState::default();
+        let mut backward = TeamState::default();
+        for frame in &frames {
+            forward.apply(frame);
+        }
+        for frame in frames.iter().rev() {
+            backward.apply(frame);
+        }
+        assert_eq!(forward.fuel_target(), None);
+        assert_eq!(backward.fuel_target(), None);
+    }
+
+    #[test]
+    fn local_writes_at_the_same_tick_still_replace_each_other() {
+        let mut state = TeamState::default();
+        for litres_per_lap in [Some(2.5), Some(2.0), None] {
+            state.apply(&Envelope {
+                producer: 0,
+                seq: 0,
+                session_time: 20.0,
+                event: Event::FuelTarget { requester: "Crew".to_owned(), litres_per_lap },
+            });
+            assert_eq!(state.fuel_target(), litres_per_lap);
+        }
+    }
+
+    #[test]
+    fn a_later_lap_does_not_hide_the_latest_armed_service() {
+        let mut state = TeamState::default();
+        state.apply(&envelope(2, 20.0, Event::LapClosed { lap: 1, fuel_litres: 50.0, used_litres: 2.0 }));
+        state.apply(&envelope(
+            1,
+            10.0,
+            Event::DriverScalars {
+                fuel_litres: 52.0,
+                service_fuel_litres: Some(30),
+                tyres_armed: [true; 4],
+                tyre_pressures_kpa: [170.0; 4],
+            },
+        ));
+        let car = state.synced_car().expect("tank");
+        assert!((car.fuel_litres - 50.0).abs() < 0.001);
+        assert_eq!(car.service_fuel_litres, Some(30));
+        assert_eq!(car.tyres_armed, [true; 4]);
     }
 
     #[test]

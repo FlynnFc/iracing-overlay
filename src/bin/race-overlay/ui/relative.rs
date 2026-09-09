@@ -1,6 +1,6 @@
 // Rust guideline compliant 2026-02-16
 
-//! Renders the Relative widget, matching `design mocks/Screenshot_12.jpg`.
+//! Renders the Relative as a quiet timing card with an inset position rail.
 //!
 //! Layout is a status gutter outside the card on the left, then the card
 //! itself: a header (field strength, incidents), one row per nearby car, and
@@ -8,10 +8,10 @@
 //! outside the card so a stopwatch or PIT marker reads as an annotation on
 //! the row rather than as another column competing with the driver's name.
 //!
-//! Every dimension is measured off that image and passed through
-//! [`Metrics`]; see the parent module for why scaling works this way.
+//! Geometry passes through [`Metrics`] so typography, spacing and columns
+//! remain aligned at every configured scale.
 
-use egui::{Color32, Pos2, Rect, RichText, Stroke, Ui};
+use egui::{Color32, Pos2, Rect, RichText, Ui};
 use iracing_telem::flags::TrackLocation;
 
 use super::theme;
@@ -23,8 +23,7 @@ use super::{
 use crate::config::RelativeConfig;
 use crate::telemetry::snapshot::{CarSnapshot, RelativeMeta, TelemetrySnapshot, WeatherSnapshot};
 
-/// The card width the design mockup measures, and how far a config may pull
-/// it either way.
+/// The default content width and the supported user adjustment range.
 ///
 /// Most of the design's width is the run the driver's name sits in, so
 /// narrowing is really narrowing that run — the fixed columns keep their
@@ -71,39 +70,28 @@ pub fn outer_width(config: &RelativeConfig) -> f32 {
 const ROW_HEIGHT: f32 = 44.0;
 
 /// Type scale.
-const NAME_SIZE: f32 = 21.0;
+const NAME_SIZE: f32 = 20.0;
 /// The gap to the car on this row, at the end of it.
 ///
 /// A step above the name beside it: it is the number the whole widget exists
 /// to deliver, and the one thing on a row read mid-corner.
 const GAP_SIZE: f32 = 24.0;
-/// The position, in the readout face — see `ui::readout`.
-///
-/// Sized to fill its plate rather than to sit politely inside it. The
-/// position is the first thing read on a row and the plate is 44 points of
-/// otherwise empty slate, so the number takes the space.
-const POSITION_SIZE: f32 = 30.0;
-/// The iRating and its projected change, on the badge at the end of each row.
-///
-/// Set in the proportional face rather than the mono one every other number in
-/// this widget uses, and larger than the row's supporting text. A lap time or
-/// a gap is read as a column and wants its digits in fixed columns; this is
-/// read as a single value at a glance, and IBM Plex Mono at 14 was too light
-/// and too small to be caught that way against a bright chip.
-const BADGE_SIZE: f32 = 17.0;
+/// Compact position numerals anchor the inset tile without overpowering gaps.
+const POSITION_SIZE: f32 = 25.0;
+/// Supporting iRating and projected change, below the name and gap in hierarchy.
+const BADGE_SIZE: f32 = 15.0;
 const FOOTER_SIZE: f32 = 15.0;
 /// The recent-pace lap time beside each driver's name.
 const RECENT_LAP_SIZE: f32 = 15.0;
-const HEADER_VALUE_SIZE: f32 = 21.0;
+const HEADER_VALUE_SIZE: f32 = 18.0;
 
 /// How far past the name's left edge a severe driver's red block reaches.
 ///
 /// Measured from wherever the name starts, since the number column before it
-/// can be switched off. The class colour used to wash across this same
-/// stretch and no longer does — see [`paint_class_bar`].
+/// can be switched off. The class marker stays separate beside the position tile.
 const WASH_PAST_NAME: f32 = 16.0;
 
-/// The car number's column, between the class slash and the driver's name.
+/// The car number's column, between the status markers and the driver's name.
 ///
 /// Fixed width so every name starts on the same line whatever the number's
 /// length: three digits and the hash, in the mono face at [`NUMBER_SIZE`],
@@ -179,10 +167,10 @@ const BADGE_WIDTH_WITH_DELTA: f32 = 82.0;
 /// right-hand run, and after the name before its trailing marks.
 const NAME_CLEARANCE: f32 = 10.0;
 
-/// The outlined `SOF` chip in the header.
-const SOF_CHIP_WIDTH: f32 = 34.0;
+/// The quiet field-strength label reserves a consistent space before its value.
+const SOF_LABEL_WIDTH: f32 = 30.0;
 
-/// The scrolled-away-from-the-player marker beside it.
+/// The conditional focus and scroll context line below the session header.
 const SUBTITLE_SIZE: f32 = 12.0;
 
 /// The slot the manufacturer's mark that follows a driver's name may occupy.
@@ -194,7 +182,7 @@ const SUBTITLE_SIZE: f32 = 12.0;
 /// That is why the height is the number to change to resize them, and why it
 /// wants a few points of clearance under [`ROW_HEIGHT`].
 const BRAND_WIDTH: f32 = 40.0;
-const BRAND_HEIGHT: f32 = 38.0;
+const BRAND_HEIGHT: f32 = 30.0;
 
 /// The up/down chevron on the iRating badge.
 ///
@@ -219,7 +207,7 @@ const CHEVRON_GAP: f32 = 2.0;
 /// hole punched in the screen. Kept dark enough that white text still has its
 /// contrast on a bright surface — premultiplied, so the channels are the ink
 /// color already scaled by this alpha.
-const CARD_BG: Color32 = Color32::from_rgba_premultiplied(6, 6, 7, 175);
+const CARD_BG: Color32 = Color32::from_rgba_premultiplied(17, 19, 23, 218);
 
 /// Draws the Relative.
 ///
@@ -373,7 +361,7 @@ fn placeholder(ui: &mut Ui, metrics: Metrics, message: &str) {
     ui.label(RichText::new(message).size(metrics.px(FOOTER_SIZE)).color(text_secondary()));
 }
 
-/// The header: a boxed `SOF` label with the field strength beside it, then
+/// The header: a quiet field-strength label and value, then
 /// track conditions and the incident count together on the right.
 ///
 /// Conditions live up here rather than in the footer because they and the
@@ -386,65 +374,19 @@ fn draw_header(ui: &mut Ui, metrics: Metrics, meta: &RelativeMeta, weather: Weat
         ui.allocate_exact_size(egui::vec2(ui.available_width(), metrics.px(28.0)), egui::Sense::hover());
     let middle = rect.center().y;
 
-    let chip =
-        Rect::from_min_size(egui::pos2(rect.left(), middle - metrics.px(9.0)), metrics.vec2(SOF_CHIP_WIDTH, 18.0));
-    ui.painter().rect_stroke(chip, metrics.px(4.0), Stroke::new(1.0_f32, Color32::from_white_alpha(45)));
     paint_text(
         ui,
-        chip.center(),
-        egui::Align2::CENTER_CENTER,
+        egui::pos2(rect.left(), middle),
+        egui::Align2::LEFT_CENTER,
         RichText::new("SOF").size(metrics.px(11.0)).strong().color(text_tertiary()),
     );
-
     let sof_text = meta.sof.map_or_else(|| "-".to_owned(), |sof| format!("{:.1}k", sof as f32 / 1000.0));
-    let sof = RichText::new(sof_text).size(metrics.px(HEADER_VALUE_SIZE)).strong().color(text_primary());
-    let sof_width = text_width(ui, sof.clone());
-    paint_text(ui, egui::pos2(chip.right() + metrics.px(10.0), middle), egui::Align2::LEFT_CENTER, sof);
-
-    // Both notices below say the same kind of thing — this panel is not
-    // centred where you would assume — so they share a run of space to the
-    // right of the field strength, laid out one after the other.
-    let mut notice_left = chip.right() + metrics.px(20.0) + sof_width;
-
-    // Whose race this is, whenever it is not the player's own. A Relative
-    // quietly about somebody else is the one way spectator focus could
-    // mislead, and the only fix is to put the name on the panel. Drawn in the
-    // accent rather than in [`CAUTION`] because while spectating this is the
-    // normal state of the widget for the whole session, not a warning — an
-    // amber that never goes away is an amber nobody reads.
-    if let Some(driver) = &meta.spectating {
-        let watching =
-            RichText::new(format!("\u{25C9} {driver}")).size(metrics.px(SUBTITLE_SIZE)).strong().color(ACCENT);
-        let width = text_width(ui, watching.clone());
-        paint_text(ui, egui::pos2(notice_left, middle), egui::Align2::LEFT_CENTER, watching);
-        notice_left += width + metrics.px(12.0);
-    }
-
-    // Who is driving the player's own car when it is not the player. The same
-    // slot and colour as the spectating notice: for a team-mate's stint this
-    // is the normal state of the panel for hours at a time, not a warning.
-    if let Some(driver) = &meta.team_mate {
-        let driving =
-            RichText::new(format!("\u{21C4} {driver}")).size(metrics.px(SUBTITLE_SIZE)).strong().color(ACCENT);
-        let width = text_width(ui, driving.clone());
-        paint_text(ui, egui::pos2(notice_left, middle), egui::Align2::LEFT_CENTER, driving);
-        notice_left += width + metrics.px(12.0);
-    }
-
-    // A scrolled panel says so. Without this a driver glancing down mid-lap
-    // could read someone else's battle as their own, which is the one way
-    // this feature could actively mislead.
-    if scroll != 0 {
-        paint_text(
-            ui,
-            egui::pos2(notice_left, middle),
-            egui::Align2::LEFT_CENTER,
-            RichText::new(format!("{scroll:+} \u{25B2}\u{25BC}"))
-                .size(metrics.px(SUBTITLE_SIZE))
-                .strong()
-                .color(theme::caution()),
-        );
-    }
+    paint_text(
+        ui,
+        egui::pos2(rect.left() + metrics.px(SOF_LABEL_WIDTH + 8.0), middle),
+        egui::Align2::LEFT_CENTER,
+        RichText::new(sof_text).size(metrics.px(HEADER_VALUE_SIZE)).strong().color(text_primary()),
+    );
 
     let incidents_text = match meta.incident_limit {
         Some(limit) => format!("{}/{limit}", meta.incidents),
@@ -460,7 +402,32 @@ fn draw_header(ui: &mut Ui, metrics: Metrics, meta: &RelativeMeta, weather: Weat
     icons::cross(ui, cross, text_secondary());
 
     draw_conditions(ui, metrics, egui::pos2(cross.left() - metrics.px(18.0), middle), weather);
-    ui.add_space(metrics.px(10.0));
+    // Context gets its own line only when needed. Long spectator names must
+    // never paint across the incident count or changing weather at narrow widths.
+    if meta.spectating.is_some() || meta.team_mate.is_some() || scroll != 0 {
+        let mut notices = Vec::new();
+        // Keep the offset first so it survives elision of an unusually long name.
+        if scroll != 0 {
+            notices.push(format!("Offset {scroll:+}"));
+        }
+        if let Some(driver) = &meta.spectating {
+            notices.push(format!("Watching {driver}"));
+        }
+        if let Some(driver) = &meta.team_mate {
+            notices.push(format!("Driving {driver}"));
+        }
+        let (notice, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), metrics.px(18.0)), egui::Sense::hover());
+        let colour = if scroll != 0 { theme::caution() } else { ACCENT };
+        let text = elide_to_width(ui, &notices.join("  \u{00B7}  "), notice.width(), |text| {
+            RichText::new(text).size(metrics.px(SUBTITLE_SIZE)).color(colour)
+        });
+        paint_text(ui, notice.left_center(), egui::Align2::LEFT_CENTER, text);
+    }
+    ui.add_space(metrics.px(8.0));
+    let (rule, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), metrics.px(1.0)), egui::Sense::hover());
+    ui.painter().rect_filled(rule, 0.0, hairline());
+    ui.add_space(metrics.px(4.0));
 }
 
 /// Everything about the panel — as opposed to the car — one row is drawn
@@ -497,10 +464,12 @@ fn draw_car_row(ui: &mut Ui, metrics: Metrics, car: &CarSnapshot, row: RowContex
     let class = class_accent(&car.car_class_color, class_count);
     let accent = if in_pits && !car.is_focus { text_tertiary() } else { class };
     let plate_width = metrics.px(POSITION_PLATE_END);
-    // Square, because touching rows cannot be rounded without notching against
-    // each other; the card's own corners still shape the run as a whole.
+    // A softly inset focus surface anchors the player; Instrument keeps its
+    // continuous table geometry.
     if car.is_focus {
-        ui.painter().rect_filled(rect, egui::Rounding::ZERO, PLAYER_ROW_FILL);
+        let (focus_rect, radius) =
+            if theme::is_instrument() { (rect, 0.0) } else { (rect.shrink2(metrics.vec2(0.0, 2.0)), metrics.px(6.0)) };
+        ui.painter().rect_filled(focus_rect, radius, PLAYER_ROW_FILL);
     } else {
         if let Some(stripe) = row_stripe(odd) {
             ui.painter().rect_filled(rect, egui::Rounding::ZERO, stripe);
@@ -519,69 +488,70 @@ fn draw_car_row(ui: &mut Ui, metrics: Metrics, car: &CarSnapshot, row: RowContex
             ui.painter().rect_filled(block, egui::Rounding::ZERO, tint(super::ALERT, DANGER_WASH_ALPHA));
         }
     }
-    // Over the row's own fill, under everything that follows. Near-white on
-    // the player's own row, with the number in near-black on top: "you"
-    // reads from the plate alone, without spending a colour on it.
-    //
-    // No shadow behind it any more. A soft falloff off the plate's trailing
-    // edge is a smear across the one part of the row that has to stay
-    // readable, and it bought nothing but the suggestion of depth.
+    // A near-white focus tile identifies the player independently of class
+    // and lap colours. The shared painter preserves Instrument's position rail.
     let plate_fill = if car.is_focus { PLAYER_PLATE } else { POSITION_PLATE };
-    super::paint_position_plate(
-        ui,
-        rect,
-        plate_width,
-        egui::Rounding::ZERO,
-        plate_fill,
-        Some((metrics.px(CLASS_EDGE), accent)),
-    );
+    if config.ordered_columns() == crate::config::RelativeColumn::ALL {
+        super::paint_position_plate(
+            ui,
+            rect,
+            plate_width,
+            egui::Rounding::ZERO,
+            plate_fill,
+            Some((metrics.px(CLASS_EDGE), accent)),
+        );
+    }
 
     let middle = rect.center().y;
 
-    // The position, in the readout face, centred on its plate.
-    paint_text(
-        ui,
-        egui::pos2(rect.left() + plate_width / 2.0, middle),
-        egui::Align2::CENTER_CENTER,
-        readout(position_text(car), metrics.px(POSITION_SIZE)).color(position_color(car, in_pits)),
-    );
-    // The standing danger mark, in the bar slot beside the plate — part of
-    // the row's own furniture, read in the same glance as the position and
-    // name, rather than one more icon out in the gutter. The class colour
-    // still reads from the row's wash.
-    if let Some(level) = marked {
-        paint_danger_mark(ui, metrics, rect, middle, level);
-    }
-
-    // The car number, in the column before the name: it is what the spotter
-    // says and what the sim paints on the car ahead, so it is the thing that
-    // ties a row to the car in the mirror.
-    if config.show_car_number && !car.car_number.is_empty() {
+    if config.ordered_columns() == crate::config::RelativeColumn::ALL {
+        // The position, in the readout face, centred on its plate.
         paint_text(
             ui,
-            egui::pos2(rect.left() + metrics.px(NUMBER_X), middle),
-            egui::Align2::LEFT_CENTER,
-            RichText::new(format!("#{}", car.car_number))
-                .monospace()
-                .size(metrics.px(NUMBER_SIZE))
-                .color(if in_pits && !car.is_focus { text_tertiary() } else { text_secondary() }),
+            egui::pos2(rect.left() + plate_width / 2.0, middle),
+            egui::Align2::CENTER_CENTER,
+            readout(position_text(car), metrics.px(POSITION_SIZE)).color(position_color(car, in_pits)),
         );
-    }
+        // The standing danger mark, in the bar slot beside the plate — part of
+        // the row's own furniture, read in the same glance as the position and
+        // name, rather than one more icon out in the gutter. The class colour
+        // still reads from the row's wash.
+        if let Some(level) = marked {
+            paint_danger_mark(ui, metrics, rect, middle, level);
+        }
 
-    // The driver's flag, in the column before the name. A driver with none
-    // leaves the slot empty rather than pulling their name left, so names
-    // stay in one column down the card.
-    if show_flags {
-        let flag = Rect::from_min_size(
-            egui::pos2(rect.left() + metrics.px(name_col), middle - metrics.px(FLAG_HEIGHT / 2.0)),
-            metrics.vec2(FLAG_HEIGHT * super::flags::ASPECT, FLAG_HEIGHT),
-        );
-        super::flags::draw(ui, flag, car.flair_id, in_pits && !car.is_focus);
-    }
+        // The car number, in the column before the name: it is what the spotter
+        // says and what the sim paints on the car ahead, so it is the thing that
+        // ties a row to the car in the mirror.
+        if config.show_car_number && !car.car_number.is_empty() {
+            paint_text(
+                ui,
+                egui::pos2(rect.left() + metrics.px(NUMBER_X), middle),
+                egui::Align2::LEFT_CENTER,
+                RichText::new(format!("#{}", car.car_number))
+                    .monospace()
+                    .size(metrics.px(NUMBER_SIZE))
+                    .color(if in_pits && !car.is_focus { text_tertiary() } else { text_secondary() }),
+            );
+        }
 
-    let name_x = rect.left() + metrics.px(name_col + flag_slot);
-    draw_name_column(ui, metrics, car, rect, name_x, in_pits, config);
-    draw_row_trailing(ui, metrics, car, rect, in_pits, config.show_irating);
+        // The driver's flag, in the column before the name. A driver with none
+        // leaves the slot empty rather than pulling their name left, so names
+        // stay in one column down the card.
+        if show_flags {
+            let flag = Rect::from_min_size(
+                egui::pos2(rect.left() + metrics.px(name_col), middle - metrics.px(FLAG_HEIGHT / 2.0)),
+                metrics.vec2(FLAG_HEIGHT * super::flags::ASPECT, FLAG_HEIGHT),
+            );
+            super::flags::draw(ui, flag, car.flair_id, in_pits && !car.is_focus);
+        }
+
+        let name_x = rect.left() + metrics.px(name_col + flag_slot);
+        draw_name_column(ui, metrics, car, rect, name_x, in_pits, config);
+        draw_row_trailing(ui, metrics, car, rect, in_pits, config.show_irating);
+    } else {
+        draw_ordered_columns(ui, metrics, car, rect, config, in_pits, accent, marked);
+    }
     // On the row's own top edge rather than its bottom, so the run of rows
     // ends cleanly against the card instead of on a divider with nothing
     // under it. The first row has the header's rule above it already.
@@ -589,6 +559,114 @@ fn draw_car_row(ui: &mut Ui, metrics: Metrics, car: &CarSnapshot, row: RowContex
         super::paint_row_groove(ui, rect.top(), rect.left(), rect.right());
     }
     rect
+}
+
+fn draw_ordered_columns(
+    ui: &mut Ui,
+    metrics: Metrics,
+    car: &CarSnapshot,
+    rect: Rect,
+    config: &RelativeConfig,
+    in_pits: bool,
+    accent: Color32,
+    marked: Option<crate::config::DangerLevel>,
+) {
+    use crate::config::RelativeColumn as C;
+    let columns: Vec<_> = config.ordered_columns().into_iter().filter(|c| config.column_visible(*c)).collect();
+    let width = |c| match c {
+        C::Position => 46.0,
+        C::CarNumber => 56.0,
+        C::Manufacturer => 44.0,
+        C::LapTime => 80.0,
+        C::Rating => BADGE_WIDTH_WITH_DELTA + 8.0,
+        C::Gap => GAP_COLUMN_WIDTH + 12.0,
+        C::Driver => 0.0,
+    };
+    let fixed: f32 = columns.iter().map(|c| width(*c)).sum();
+    let name_width = (rect.width() / metrics.px(1.0) - fixed - 12.0).max(20.0);
+    let mut x = rect.left() + metrics.px(6.0);
+    for c in columns {
+        let w = metrics.px(if c == C::Driver { name_width } else { width(c) });
+        let cell = Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(x + w, rect.bottom()));
+        let middle = cell.center().y;
+        match c {
+            C::Position => {
+                ui.painter().rect_filled(
+                    cell.shrink2(metrics.vec2(2.0, 3.0)),
+                    metrics.px(3.0),
+                    if car.is_focus { PLAYER_PLATE } else { POSITION_PLATE },
+                );
+                ui.painter().rect_filled(Rect::from_min_size(cell.min, metrics.vec2(2.0, ROW_HEIGHT)), 0.0, accent);
+                paint_text(
+                    ui,
+                    cell.center(),
+                    egui::Align2::CENTER_CENTER,
+                    readout(position_text(car), metrics.px(POSITION_SIZE)).color(position_color(car, in_pits)),
+                );
+            }
+            C::CarNumber => {
+                paint_text(
+                    ui,
+                    egui::pos2(x + metrics.px(4.0), middle),
+                    egui::Align2::LEFT_CENTER,
+                    RichText::new(format!("#{}", car.car_number)).size(metrics.px(NUMBER_SIZE)).color(text_secondary()),
+                );
+            }
+            C::Driver => {
+                let flag = if config.show_flags { flag_slot() } else { 0.0 };
+                if config.show_flags {
+                    super::flags::draw(
+                        ui,
+                        Rect::from_min_size(
+                            egui::pos2(x, middle - metrics.px(FLAG_HEIGHT / 2.0)),
+                            metrics.vec2(FLAG_HEIGHT * super::flags::ASPECT, FLAG_HEIGHT),
+                        ),
+                        car.flair_id,
+                        in_pits,
+                    );
+                }
+                let name = elide_to_width(ui, &car.driver_name, (w - metrics.px(flag + 6.0)).max(0.0), |text| {
+                    RichText::new(text).size(metrics.px(NAME_SIZE)).color(row_text_color(car, in_pits))
+                });
+                paint_text(ui, egui::pos2(x + metrics.px(flag), middle), egui::Align2::LEFT_CENTER, name);
+            }
+            C::Manufacturer => super::logos::draw(
+                ui,
+                Rect::from_center_size(cell.center(), metrics.vec2(32.0, BRAND_HEIGHT)),
+                &car.car_screen_name,
+                metrics.px(RECENT_LAP_SIZE),
+                in_pits,
+            ),
+            C::LapTime => {
+                let text =
+                    config.lap_metric.value(car.recent_laps).map_or_else(|| "?".to_owned(), format_short_lap_time);
+                paint_text(
+                    ui,
+                    cell.center(),
+                    egui::Align2::CENTER_CENTER,
+                    RichText::new(text).monospace().size(metrics.px(RECENT_LAP_SIZE)).color(text_secondary()),
+                );
+            }
+            C::Rating => {
+                draw_irating_badge(ui, metrics, car, egui::pos2(cell.right() - metrics.px(4.0), middle), in_pits)
+            }
+            C::Gap => {
+                paint_text(
+                    ui,
+                    egui::pos2(cell.right() - metrics.px(4.0), middle),
+                    egui::Align2::RIGHT_CENTER,
+                    RichText::new(gap_text(car)).size(metrics.px(GAP_SIZE)).strong().color(gap_color(car, in_pits)),
+                );
+            }
+        }
+        if c == C::Position {
+            if let Some(level) = marked {
+                let shifted = cell.translate(egui::vec2(cell.width() - metrics.px(BAR_X + 3.0), 0.0));
+                paint_danger_mark(ui, metrics, shifted, middle, level);
+            }
+        }
+        x += w;
+    }
 }
 
 /// How far the name moves right to make room for a flag: the flag's width
@@ -621,7 +699,8 @@ fn draw_name_column(
     let name_room = (limit - metrics.px(NAME_CLEARANCE) - name_x).max(0.0);
     let ink = row_text_color(car, in_pits);
     let name = elide_to_width(ui, &car.driver_name, name_room, |text| {
-        RichText::new(text).size(metrics.px(NAME_SIZE)).strong().color(ink)
+        let name = RichText::new(text).size(metrics.px(NAME_SIZE)).color(ink);
+        if car.is_focus { name.strong() } else { name }
     });
     let name_width = text_width(ui, name.clone());
     paint_text(ui, egui::pos2(name_x, middle), egui::Align2::LEFT_CENTER, name);
@@ -642,7 +721,7 @@ fn draw_name_column(
     }
 
     if config.show_recent_lap
-        && let Some(recent) = car.best_recent_lap_secs
+        && let Some(recent) = config.lap_metric.value(car.recent_laps)
     {
         let recent = RichText::new(format_short_lap_time(recent))
             .monospace()
@@ -668,7 +747,7 @@ fn trailing_limit(metrics: Metrics, car: &CarSnapshot, rect: Rect, show_irating:
     limit
 }
 
-/// The right-hand run of a row: license badge, iRating badge, and the gap.
+/// The right-hand run of a row: rating with a licence marker, then the gap.
 ///
 /// Laid out right to left from the row's right edge so the gap number always
 /// lands in the same column regardless of how wide the badges turn out.
@@ -695,13 +774,8 @@ fn draw_row_trailing(ui: &mut Ui, metrics: Metrics, car: &CarSnapshot, rect: Rec
     }
 }
 
-/// The iRating badge: a white chip with black text, bordered in the driver's
-/// license-class color.
-///
-/// The license class rides on this badge's border rather than getting a
-/// badge of its own — the safety-rating number was the least-used value in
-/// the row, and folding its color in here buys back the width while keeping
-/// the class readable at a glance.
+/// Supporting rating and trend on a quiet surface; the short licence-colour
+/// marker preserves licence information without outlining every value.
 fn draw_irating_badge(ui: &Ui, metrics: Metrics, car: &CarSnapshot, right_center: Pos2, dimmed: bool) {
     let rating = format_irating(car.irating);
     let delta = car.irating_change_estimate.map(|change| {
@@ -717,17 +791,17 @@ fn draw_irating_badge(ui: &Ui, metrics: Metrics, car: &CarSnapshot, right_center
         egui::vec2(width, height),
     );
     let rounding = metrics.px(5.0);
-    let fill = if dimmed { Color32::from_white_alpha(120) } else { Color32::WHITE };
-    ui.painter().rect_filled(rect, rounding, fill);
-    ui.painter().rect_stroke(
-        rect,
-        rounding,
-        Stroke::new(metrics.px(2.0), tint(parse_hex_color(&car.license_color), if dimmed { 130 } else { 255 })),
+    ui.painter().rect_filled(rect, rounding, Color32::from_white_alpha(if dimmed { 4 } else { 9 }));
+    let marker = Rect::from_min_max(
+        egui::pos2(rect.left(), rect.top() + metrics.px(8.0)),
+        egui::pos2(rect.left() + metrics.px(2.0), rect.bottom() - metrics.px(8.0)),
     );
-
-    // Black on white, so the delta's red/green has to darken to stay legible
-    // against a light chip rather than the dark row it used to sit on.
-    let value_color = Color32::BLACK;
+    ui.painter().rect_filled(
+        marker,
+        metrics.px(1.0),
+        tint(parse_hex_color(&car.license_color), if dimmed { 100 } else { 230 }),
+    );
+    let value_color = if dimmed { text_tertiary() } else { text_secondary() };
     match delta {
         Some((delta_text, is_gain, delta_color)) => {
             paint_text(
@@ -736,7 +810,11 @@ fn draw_irating_badge(ui: &Ui, metrics: Metrics, car: &CarSnapshot, right_center
                 egui::Align2::LEFT_CENTER,
                 RichText::new(rating).size(metrics.px(BADGE_SIZE)).strong().color(value_color),
             );
-            let delta = RichText::new(delta_text).size(metrics.px(BADGE_SIZE)).strong().color(on_white(delta_color));
+            let delta = RichText::new(delta_text).size(metrics.px(BADGE_SIZE)).strong().color(if dimmed {
+                tint(delta_color, 120)
+            } else {
+                delta_color
+            });
             let delta_width = text_width(ui, delta.clone());
             let delta_left = rect.right() - metrics.px(6.0) - delta_width;
             paint_text(
@@ -761,7 +839,7 @@ fn draw_irating_badge(ui: &Ui, metrics: Metrics, car: &CarSnapshot, right_center
                 egui::vec2(size, size),
             );
             let name = if is_gain { "chevron-up" } else { "chevron-down" };
-            icons::svg(ui, chevron, name, on_white(delta_color));
+            icons::svg(ui, chevron, name, if dimmed { tint(delta_color, 120) } else { delta_color });
         }
         None => paint_text(
             ui,
@@ -770,16 +848,6 @@ fn draw_irating_badge(ui: &Ui, metrics: Metrics, car: &CarSnapshot, right_center
             RichText::new(rating).size(metrics.px(BADGE_SIZE)).strong().color(value_color),
         ),
     }
-}
-
-/// Darkens an accent so it stays readable on a white chip.
-///
-/// `SIGNAL` and `ALERT` are tuned for a near-black card; placed on white they
-/// wash out, so each channel is pulled two-thirds of the way toward black.
-#[expect(clippy::cast_possible_truncation, reason = "the result is at most 255 * 2 / 5 = 102, well inside u8")]
-fn on_white(color: Color32) -> Color32 {
-    let darken = |c: u8| (u16::from(c) * 2 / 5) as u8;
-    Color32::from_rgb(darken(color.r()), darken(color.g()), darken(color.b()))
 }
 
 /// Paints this row's gutter marker, if it has one.
@@ -850,7 +918,7 @@ fn position_color(car: &CarSnapshot, in_pits: bool) -> Color32 {
 
 /// The gap magnitude, unsigned: a row's position above or below the player's
 /// already says which side of them that car is on, so a sign would only
-/// repeat it. The mockup shows bare numbers for the same reason.
+/// repeat it.
 fn gap_text(car: &CarSnapshot) -> String {
     let gap = if car.is_focus { 0.0 } else { car.gap_to_player_secs.abs() };
     // Hundredths only while a car is genuinely alongside, where a tenth is
@@ -1081,11 +1149,12 @@ mod tests {
             off_tracks: 0,
             lap_diff: 0,
             best_recent_lap_secs: None,
+            recent_laps: [None; 3],
             penalty: None,
         }
     }
 
-    /// The mockup shows bare magnitudes: a car 1.8s behind reads `1.8`, not
+    /// Gaps show bare magnitudes: a car 1.8s behind reads `1.8`, not
     /// `-1.8`, because the row's own position already says which side of the
     /// player it's on.
     #[test]

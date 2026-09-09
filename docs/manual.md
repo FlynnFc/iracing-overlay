@@ -81,15 +81,18 @@ Windows apps for iRacing, written in Rust:
   Panels are click-through and draggable; drag positions persist
   automatically. The overlay keeps out of the taskbar and alt-tab — there is
   nothing to switch to — and lives in the notification area instead; its
-  tray menu has a tick per panel to show or hide it (saved, so it stays that
-  way next time), layout mode, **Settings…**, and quit.
+  native tray menu has **Open Settings** and **Quit Race Overlay**. Left-clicking
+  the icon opens Settings directly. General has an enable/disable switch and a
+  Configure shortcut for each widget.
 
-  **Settings…** opens a window over the overlay with every option below in
+  **Open Settings** opens a window over the overlay with every option below in
   it — show/hide and scale per panel, the Relative's car counts, the
   Standings' class and endurance options, the radar and pit-stall ranges,
   the Faster Class warning and alert distances,
-  Auto Fuel and its margin, plus *Reset all positions* for a panel dragged
-  off-screen. Its **Binds** page sets the wheel and keyboard binds: press
+  Auto Fuel and its margin. Layout, Content and Columns/Pages tabs keep controls
+  separate. Selecting a widget previews only that widget at its saved position;
+  switching pages keeps your placement. General also has *Reset all positions* for a panel dragged
+  off-screen. Its **Controls** page sets the wheel and keyboard binds: press
   *Bind…* on an action, then the button or key (Escape cancels; whatever was
   already held doesn't count). Changes apply as you make them and save on their own; close
   the window (or press Escape) to make the overlay click-through again.
@@ -112,7 +115,7 @@ Two Windows things to expect on first run:
   code-signed. *More info → Run anyway.*
 - The tray icon starts in the hidden overflow (the `^` chevron next to the
   clock); drag it onto the taskbar to pin it. The overlay lives there — the
-  tray menu has per-panel show/hide, layout mode, **Settings…**, and quit.
+  native tray menu opens Settings or quits. Widget visibility is on the General page.
 
 The overlay can be started before or after iRacing — it waits idle until the
 sim is running and reconnects if it restarts. `race-launcher.exe` optionally
@@ -151,7 +154,7 @@ programs when the overlay starts** to get the same from double-clicking
   [`config.toml`](config.toml) is the older list beside the exe: it is read
   once to seed `launcher.toml` if that doesn't exist yet, then ignored.
 - `%APPDATA%\race\race-overlay.toml` — `race-overlay`'s settings: each
-  widget's position, `visible` flag (also flipped from the tray menu), and
+  widget's position, `visible` flag (also set on Settings > General), and
   `scale`, plus how many cars Relative
   shows ahead/behind, the Radar Bars' `range_ms`/`car_length_m`/`range_cars`,
   the Pit Stall bar's `range_m`, and the wheel binds (set from the settings

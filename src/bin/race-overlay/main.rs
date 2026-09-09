@@ -23,6 +23,8 @@ mod config;
 mod demo;
 mod focus;
 mod input;
+#[cfg(feature = "licence")]
+mod licence;
 mod perf;
 mod sync;
 mod telemetry;
@@ -85,6 +87,9 @@ fn main() {
     }
     let demo = std::env::args().any(|arg| arg == "--demo");
     let demo_states = demo_states();
+    // Reproducible settings previews, e.g. --demo --demo-settings=standings
+    // --screenshot=settings.png. This flag never opens settings in a live run.
+    let demo_settings = std::env::args().find_map(|arg| arg.strip_prefix("--demo-settings=").map(str::to_owned));
     // `--demo-page=fuel` and friends, so a black box page can be held up
     // against its mockup; without it demo mode can only ever show page one.
     let demo_page =
@@ -107,6 +112,21 @@ fn main() {
         println!("note: {err:#}; using default overlay settings");
         OverlayConfig::default()
     });
+    // The temporary first-run flow completes before companion apps, telemetry,
+    // controls or the tray are started. Preview runs never persist completion.
+    // Built without the `licence` feature there is no setup step at all: that
+    // build carries straight on into the normal startup below.
+    #[cfg(feature = "licence")]
+    {
+        let licence_preview = std::env::args().any(|arg| arg == "--license-preview");
+        if licence_preview {
+            licence::show_first_start(true, screenshot);
+            return;
+        }
+        if !demo && !licence::show_first_start(false, screenshot.clone()) {
+            return;
+        }
+    }
     // The session programs, if the Launcher page asked for them to come up
     // with the overlay. Not in demo mode: looking at mockups is not a session.
     if !demo {
@@ -139,7 +159,7 @@ fn main() {
     // The tray is built before the window so a failure to register it is
     // reported plainly rather than leaving a running overlay with no way to
     // quit it.
-    let tray = match tray::Tray::new(|panel| config.panel_visible(panel)) {
+    let tray = match tray::Tray::new() {
         Ok(tray) => Some(tray),
         Err(err) => {
             println!("note: {err:#}; the overlay will run without a tray icon");
@@ -150,7 +170,13 @@ fn main() {
     // Captured before the overlay window exists, so it can be handed back —
     // see `focus::yield_foreground`.
     let launched_from = focus::foreground_window();
-    let demo = app::DemoOptions { enabled: demo, page: demo_page, screenshot, states: demo_states };
+    let demo = app::DemoOptions {
+        enabled: demo,
+        page: demo_page,
+        settings_page: demo_settings,
+        screenshot,
+        states: demo_states,
+    };
     egui_overlay::start(OverlayApp::new(rx, request_tx, config, demo, tray, launched_from));
 }
 

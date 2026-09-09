@@ -74,10 +74,6 @@ pub struct OverlayConfig {
     /// positioning a widget is something you do from the garage.
     #[serde(default = "default_true")]
     pub hide_in_garage: bool,
-    /// Count each car's trips off the track and show the tally in the
-    /// Standings and Relative gutters.
-    #[serde(default = "default_true")]
-    pub show_off_tracks: bool,
     /// Let OBS capture the overlay's window directly.
     ///
     /// The overlay normally carries `WS_EX_TOOLWINDOW`, which keeps it out of
@@ -89,10 +85,6 @@ pub struct OverlayConfig {
     /// the taskbar and alt-tab, which is noise for anyone not streaming.
     #[serde(default)]
     pub stream_mode: bool,
-    /// Show each driver's national flag before their name in the Standings
-    /// and Relative. The flag is the one on their iRacing profile.
-    #[serde(default = "default_true")]
-    pub show_flags: bool,
     /// Wheel and keyboard binds driving the black box; see [`BindsConfig`].
     #[serde(default)]
     pub binds: BindsConfig,
@@ -102,9 +94,6 @@ pub struct OverlayConfig {
     /// How manufacturer marks are chosen; see [`LogoConfig`].
     #[serde(default)]
     pub logos: LogoConfig,
-    /// The visual language every panel is drawn in; see `ui::theme`.
-    #[serde(default)]
-    pub theme: crate::ui::theme::Theme,
     /// Team sync connection settings; see [`SyncConfig`].
     #[serde(default)]
     pub sync: SyncConfig,
@@ -301,12 +290,30 @@ pub struct BlackBoxConfig {
     /// What the three bars on each wheel of the Tires page show.
     #[serde(default)]
     pub tyre_bars: TyreBars,
+    /// Page order used by both the rail and wheel navigation. Missing or
+    /// duplicate entries are normalised before use.
+    #[serde(default = "default_blackbox_page_order")]
+    pub page_order: Vec<crate::ui::blackbox::Page>,
+    /// Pages the driver has hidden. Session availability still applies;
+    /// Relative is restored if no configured page can be shown.
+    #[serde(default)]
+    pub hidden_pages: Vec<crate::ui::blackbox::Page>,
 }
 
 impl Default for BlackBoxConfig {
     fn default() -> Self {
-        Self { auto_fuel: false, fuel_margin_laps: default_fuel_margin_laps(), tyre_bars: TyreBars::default() }
+        Self {
+            auto_fuel: false,
+            fuel_margin_laps: default_fuel_margin_laps(),
+            tyre_bars: TyreBars::default(),
+            page_order: default_blackbox_page_order(),
+            hidden_pages: Vec::new(),
+        }
     }
+}
+
+fn default_blackbox_page_order() -> Vec<crate::ui::blackbox::Page> {
+    crate::ui::blackbox::Page::ALL.to_vec()
 }
 
 /// What the three bars across each wheel on the Tires page read.
@@ -422,13 +429,10 @@ impl Default for OverlayConfig {
             only_show_when_iracing_focused: default_true(),
             iracing_process_name: default_iracing_process_name(),
             hide_in_garage: default_true(),
-            show_off_tracks: default_true(),
             stream_mode: false,
-            show_flags: default_true(),
             binds: BindsConfig::default(),
             blackbox: BlackBoxConfig::default(),
             logos: LogoConfig::default(),
-            theme: crate::ui::theme::Theme::default(),
             sync: SyncConfig::default(),
             danger: BTreeMap::new(),
         }
@@ -704,6 +708,18 @@ pub struct RelativeConfig {
     /// Show the iRating badge (with its license-color border) before the gap.
     #[serde(default = "default_true")]
     pub show_irating: bool,
+    /// Show profile flags in this panel only.
+    #[serde(default = "default_true")]
+    pub show_flags: bool,
+    /// Show off-track counts in this panel's gutter only.
+    #[serde(default = "default_true")]
+    pub show_off_tracks: bool,
+    /// Which recent lap statistic the lap-time column shows.
+    #[serde(default)]
+    pub lap_metric: RelativeLapMetric,
+    /// Column order, with omitted entries appended and duplicates ignored.
+    #[serde(default = "default_relative_columns")]
+    pub column_order: Vec<RelativeColumn>,
 }
 
 impl Default for RelativeConfig {
@@ -721,6 +737,103 @@ impl Default for RelativeConfig {
             show_brand: true,
             show_recent_lap: true,
             show_irating: true,
+            show_flags: true,
+            show_off_tracks: true,
+            lap_metric: RelativeLapMetric::default(),
+            column_order: default_relative_columns(),
+        }
+    }
+}
+
+/// The lap-time statistic shown alongside a driver's name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RelativeLapMetric {
+    #[default]
+    AverageLast3,
+    BestLast3,
+    LastLap,
+}
+
+impl RelativeLapMetric {
+    pub const ALL: [Self; 3] = [Self::AverageLast3, Self::BestLast3, Self::LastLap];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AverageLast3 => "Average of last 3",
+            Self::BestLast3 => "Best of last 3",
+            Self::LastLap => "Last completed lap",
+        }
+    }
+
+    /// Samples are newest first. Missing, non-finite and non-positive lap
+    /// times never participate; early in a session the available laps count.
+    pub fn value(self, laps: [Option<f32>; 3]) -> Option<f32> {
+        let mut valid = laps.into_iter().flatten().filter(|secs| secs.is_finite() && *secs > 0.0);
+        match self {
+            Self::LastLap => valid.next(),
+            Self::BestLast3 => valid.min_by(f32::total_cmp),
+            Self::AverageLast3 => {
+                let (sum, count) = valid.fold((0.0_f32, 0_u8), |(sum, count), secs| (sum + secs, count + 1));
+                (count > 0).then(|| sum / f32::from(count))
+            }
+        }
+    }
+}
+
+/// Columns that can be arranged in the Relative. Visibility remains a
+/// separate choice, so hiding a column does not forget its position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RelativeColumn {
+    Position,
+    CarNumber,
+    Driver,
+    Manufacturer,
+    LapTime,
+    Rating,
+    Gap,
+}
+
+impl RelativeColumn {
+    pub const ALL: [Self; 7] =
+        [Self::Position, Self::CarNumber, Self::Driver, Self::Manufacturer, Self::LapTime, Self::Rating, Self::Gap];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Position => "Position & class",
+            Self::CarNumber => "Car number",
+            Self::Driver => "Driver name & flag",
+            Self::Manufacturer => "Manufacturer",
+            Self::LapTime => "Lap time",
+            Self::Rating => "iRating",
+            Self::Gap => "Gap",
+        }
+    }
+}
+
+fn default_relative_columns() -> Vec<RelativeColumn> {
+    RelativeColumn::ALL.to_vec()
+}
+
+impl RelativeConfig {
+    pub fn ordered_columns(&self) -> Vec<RelativeColumn> {
+        let mut order = Vec::with_capacity(RelativeColumn::ALL.len());
+        for column in self.column_order.iter().copied().chain(RelativeColumn::ALL) {
+            if !order.contains(&column) {
+                order.push(column);
+            }
+        }
+        order
+    }
+
+    pub fn column_visible(&self, column: RelativeColumn) -> bool {
+        match column {
+            RelativeColumn::CarNumber => self.show_car_number,
+            RelativeColumn::Manufacturer => self.show_brand,
+            RelativeColumn::LapTime => self.show_recent_lap,
+            RelativeColumn::Rating => self.show_irating,
+            RelativeColumn::Position | RelativeColumn::Driver | RelativeColumn::Gap => true,
         }
     }
 }
@@ -759,6 +872,28 @@ fn default_count() -> u8 {
 
 fn default_true() -> bool {
     true
+}
+
+/// Reorderable timing columns. Driver identity stays in its own band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StandingsColumn {
+    Gap,
+    Fastest,
+    Last,
+}
+impl StandingsColumn {
+    pub const ALL: [Self; 3] = [Self::Gap, Self::Fastest, Self::Last];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gap => "Gap",
+            Self::Fastest => "Fastest",
+            Self::Last => "Last",
+        }
+    }
+}
+fn default_standings_columns() -> Vec<StandingsColumn> {
+    StandingsColumn::ALL.to_vec()
 }
 
 /// Settings for the Standings widget.
@@ -820,6 +955,12 @@ pub struct StandingsConfig {
     /// Clamped to `ui::standings::NAME_WIDTH_RANGE` at use.
     #[serde(default = "default_standings_name_width")]
     pub name_width: f32,
+    #[serde(default = "default_true")]
+    pub show_flags: bool,
+    #[serde(default = "default_true")]
+    pub show_off_tracks: bool,
+    #[serde(default = "default_standings_columns")]
+    pub column_order: Vec<StandingsColumn>,
 }
 
 impl Default for StandingsConfig {
@@ -837,6 +978,9 @@ impl Default for StandingsConfig {
             show_tyres: true,
             show_position_change: true,
             name_width: default_standings_name_width(),
+            show_flags: true,
+            show_off_tracks: true,
+            column_order: default_standings_columns(),
         }
     }
 }
@@ -1190,7 +1334,27 @@ impl OverlayConfig {
     /// Returns an error if the file cannot be read or parsed.
     pub fn load_from(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        Self::parse(&text).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    /// Imports the old global row switches without overriding an explicit
+    /// per-panel choice. Obsolete theme keys are accepted and discarded.
+    fn parse(text: &str) -> anyhow::Result<Self> {
+        let mut value: toml::Value = toml::from_str(text)?;
+        if let Some(root) = value.as_table_mut() {
+            for key in ["show_flags", "show_off_tracks"] {
+                if let Some(legacy) = root.remove(key) {
+                    for panel in ["relative", "standings"] {
+                        let table = root.entry(panel).or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+                        if let Some(table) = table.as_table_mut() {
+                            table.entry(key).or_insert_with(|| legacy.clone());
+                        }
+                    }
+                }
+            }
+            root.remove("theme");
+        }
+        Ok(value.try_into()?)
     }
 
     /// Applies `change` to the settings on disk, leaving every other field.
@@ -1262,6 +1426,27 @@ fn migrate(from: &Path, to: &Path, config: &OverlayConfig) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recent_metric_uses_three_samples_and_defaults_to_average() {
+        use super::RelativeLapMetric as M;
+        let laps = [Some(102.0), Some(100.0), Some(101.0)];
+        assert_eq!(M::default(), M::AverageLast3);
+        assert_eq!(M::AverageLast3.value(laps), Some(101.0));
+        assert_eq!(M::BestLast3.value(laps), Some(100.0));
+        assert_eq!(M::LastLap.value(laps), Some(102.0));
+        assert_eq!(M::AverageLast3.value([None, Some(f32::NAN), Some(-2.0)]), None);
+        assert_eq!(M::AverageLast3.value([Some(99.0), None, None]), Some(99.0));
+    }
+
+    #[test]
+    fn relative_column_order_preserves_choices_and_repairs_duplicates() {
+        use super::{RelativeColumn as C, RelativeConfig};
+        let config = RelativeConfig { column_order: vec![C::Gap, C::Driver, C::Gap], ..RelativeConfig::default() };
+        let columns = config.ordered_columns();
+        assert_eq!(&columns[..2], &[C::Gap, C::Driver]);
+        assert_eq!(columns.len(), C::ALL.len());
+    }
+
     use super::*;
 
     #[test]

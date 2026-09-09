@@ -30,10 +30,11 @@ through to the sim except where a panel actually is.
   left blank rather than guessed — a made-up number on a pit board loses races.
 - **No slanted geometry.** Straight-edged blocks throughout.
 
-Start `race-overlay.exe` and it sits in the tray: a tick per panel, **Layout Mode** (draws every widget on
-stand-in data so it can be dragged into place), **Settings…** and **Quit**. Panels are dragged with the mouse
-and remember where they were put; settings apply as they are changed and are written to
-`%APPDATA%\race\race-overlay.toml` once they stop changing.
+Start `race-overlay.exe` and open **Settings** from its native tray menu (or left-click the icon).
+The **General** page enables or disables each widget; **Configure** opens its settings and previews only
+that widget. Layout, content and column controls are grouped into separate tabs. Drag a preview into place:
+its position stays put when switching pages and is saved automatically. Changes are written to
+`%APPDATA%\race\race-overlay.toml` once they stop changing. The tray menu also has **Quit**.
 
 ---
 
@@ -375,6 +376,7 @@ answer. Binds can also be set from a terminal with `race-overlay.exe --bind <act
 |---|---|
 | `--demo` | Render the fixed demo snapshot; iRacing is not needed. |
 | `--demo-page=<page>` | Open the black box on `relative`, `strategy`, `fuel`, `tires`, `in-car` or `weather`. |
+| `--demo-settings=<page>` | Open a settings page for a preview, e.g. `general`, `standings`, `black-box` or `binds`. Requires `--demo`; works with `--screenshot`. |
 | `--demo-state=<a,b>` | Put the demo snapshot into a named state — a caution, a box call, a spectator's seat — for a screenshot. |
 | `--screenshot=<path>` | Write one rendered frame to a PNG and quit. The window stays hidden for the run. |
 | `--sync-host=<port>` | Run the team-sync relay from a terminal, printing the invite code and the funnel command. The settings page does the same without a terminal. |
