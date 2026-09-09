@@ -1,0 +1,639 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Race Overlay — features</title>
+<style>
+  :root {
+    --ink: #08080a;
+    --card: #121216;
+    --card-2: #1a1a20;
+    --line: #26262e;
+    --text: #f2f2f5;
+    --text-2: #a8a8b4;
+    --text-3: #6f6f7c;
+    --signal: #34d399;
+    --alert: #ff5c57;
+    --caution: #ffb84d;
+    --accent: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 1.5rem; }
+  body {
+    margin: 0; background: var(--ink); color: var(--text);
+    font: 15px/1.65 "Inter", -apple-system, "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, kbd { font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 0.88em; }
+  code { background: var(--card-2); border: 1px solid var(--line); border-radius: 4px; padding: 0.1em 0.4em; }
+  pre { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; overflow-x: auto; }
+  pre code { background: none; border: 0; padding: 0; }
+
+  .layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 40px; max-width: 1500px; margin: 0 auto; padding: 0 28px 120px; }
+  nav { position: sticky; top: 0; align-self: start; max-height: 100vh; overflow-y: auto; padding: 28px 0; }
+  nav h2 { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-3); margin: 22px 0 8px; }
+  nav a { display: block; color: var(--text-2); padding: 3px 0; font-size: 13.5px; }
+  nav a:hover { color: var(--text); text-decoration: none; }
+
+  header.hero { padding: 56px 0 20px; border-bottom: 1px solid var(--line); margin-bottom: 36px; }
+  header.hero h1 { font-size: 40px; margin: 0 0 10px; letter-spacing: -0.02em; }
+  header.hero p { color: var(--text-2); max-width: 70ch; margin: 0 0 8px; font-size: 16px; }
+
+  section { padding-top: 28px; margin-bottom: 12px; }
+  h2 { font-size: 26px; margin: 34px 0 6px; letter-spacing: -0.01em; }
+  h3 { font-size: 18px; margin: 30px 0 4px; }
+  h4 { font-size: 15px; margin: 22px 0 4px; color: var(--text); }
+  .lede { color: var(--text-2); max-width: 78ch; margin: 6px 0 18px; }
+  p { max-width: 82ch; }
+  ul, ol { max-width: 82ch; padding-left: 20px; }
+  li { margin: 4px 0; }
+
+  figure { margin: 18px 0 26px; }
+  figure img { display: block; max-width: 100%; border-radius: 10px; border: 1px solid var(--line); background: #000; }
+  figcaption { color: var(--text-2); font-size: 13.5px; margin-top: 9px; max-width: 82ch; }
+  figcaption b { color: var(--text); font-weight: 600; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 22px; margin: 18px 0 26px; }
+  .grid figure { margin: 0; }
+
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin: 18px 0; }
+  .card h4 { margin-top: 0; }
+  .note { border-left: 3px solid var(--accent); }
+  .warn { border-left: 3px solid var(--caution); }
+
+  table { border-collapse: collapse; width: 100%; margin: 14px 0 24px; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--text-3); font-weight: 600; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; }
+  td code { white-space: nowrap; }
+
+  .tag { display: inline-block; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+         padding: 2px 7px; border-radius: 4px; vertical-align: middle; margin-left: 8px; }
+  .tag-new { background: rgba(52, 211, 153, 0.16); color: var(--signal); }
+  .tag-crew { background: rgba(96, 165, 250, 0.16); color: var(--accent); }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: baseline; }
+  footer { color: var(--text-3); font-size: 13px; border-top: 1px solid var(--line); margin-top: 60px; padding-top: 20px; }
+</style>
+</head>
+<body>
+<div class="layout">
+<nav>
+  <h2>Overview</h2>
+  <a href="#about">What this is</a>
+  <a href="#running">Running it</a>
+
+  <h2>Widgets</h2>
+  <a href="#relative">Relative</a>
+  <a href="#blackbox">Black box</a>
+  <a href="#standings">Standings</a>
+  <a href="#radar">Radar bars</a>
+  <a href="#fasterclass">Faster class</a>
+  <a href="#pitstall">Pit stall</a>
+
+  <h2>Systems</h2>
+  <a href="#statusborder">Status border</a>
+  <a href="#strategy">Strategy &amp; fuel</a>
+  <a href="#sync">Team sync</a>
+  <a href="#danger">Danger drivers</a>
+  <a href="#seats">Seat layouts</a>
+  <a href="#stream">Stream mode</a>
+  <a href="#perf">CPU behaviour</a>
+
+  <h2>Reference</h2>
+  <a href="#themes">Themes</a>
+  <a href="#settings">Settings window</a>
+  <a href="#binds">Wheel binds</a>
+  <a href="#cli">Command line</a>
+</nav>
+
+<main>
+<header class="hero">
+  <h1>Race Overlay</h1>
+  <p>An iRacing overlay for endurance and multi-class racing: seven draggable panels, a wheel-driven black box,
+     and a team-sync layer that lets a crew chief watch — and adjust — the car they are not sitting in.</p>
+  <p style="color: var(--text-3)">Every screenshot on this page is rendered by the overlay itself from a fixed demo
+     snapshot, so what is shown is exactly what the code draws.</p>
+</header>
+
+<section id="about">
+  <h2>What this is</h2>
+  <p class="lede">A single always-on-top window covering the screen, drawing panels over iRacing and passing
+    every click through to the sim except where a panel actually is.</p>
+  <ul>
+    <li><b>Five panels</b>, each independently positioned, scaled and switched off: Relative, Standings,
+      Radar Bars, Faster Class and Pit Stall.</li>
+    <li><b>A black box</b> sharing the Relative's frame — six pages walked with wheel buttons, with real pit
+      service control (fuel, tyres, pressures, tearoff, fast repair).</li>
+    <li><b>Estimates are labelled and honest.</b> Anything projected says so, and anything the sim has not
+      published is left blank rather than guessed — a made-up number on a pit board loses races.</li>
+    <li><b>No slanted geometry.</b> Straight-edged blocks throughout.</li>
+  </ul>
+</section>
+
+<section id="running">
+  <h2>Running it</h2>
+  <p>Start <code>race-overlay.exe</code> and it sits in the tray. Right-click the tray icon for:</p>
+  <ul>
+    <li>a tick per panel, to show or hide it;</li>
+    <li><b>Layout Mode</b> — draws every widget on stand-in data so it can be dragged into place without
+      waiting for the situation that would normally make it appear;</li>
+    <li><b>Settings…</b>, and <b>Quit</b>.</li>
+  </ul>
+  <p>Panels are dragged with the mouse and remember where they were put. Settings apply as they are changed
+    and are written to <code>%APPDATA%\race\race-overlay.toml</code> once they stop changing.</p>
+</section>
+
+<section id="relative">
+  <h2>Relative</h2>
+  <p class="lede">The cars around you in time order, with the status gutter outside the card on the left.
+    This is page one of the black box, so the tab rail across the top belongs to it.</p>
+
+  <figure>
+    <img src="img/relative-default.png" alt="The Relative panel">
+    <figcaption><b>The default row.</b> Position on its plate, car number, driver flag, name, manufacturer mark,
+      recent pace, the iRating badge (bordered in the licence-class colour, carrying the projected change), and
+      the gap. A car on a different lap is coloured — red for a car about to lap you, blue for one you have
+      lapped — and a car in the pits is greyed out whole. The class reads from the wash behind the name.
+      The header carries field strength, conditions and incidents; the footer the session clock and lap.</figcaption>
+  </figure>
+
+  <div class="grid">
+    <figure>
+      <img src="img/relative-minimal.png" alt="Relative with optional columns off">
+      <figcaption><b>Every column is optional.</b> Car number, manufacturer mark, recent lap and iRating badge
+        each switch off; the name column absorbs the space rather than leaving a hole.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/relative-narrow.png" alt="A narrowed Relative">
+      <figcaption><b>Width and depth are configurable.</b> Narrowing trims the name run — long names gain an
+        ellipsis — while the fixed columns keep their measured widths. Cars ahead and behind are set separately.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/relative-racechange.png" alt="Position change since the start">
+      <figcaption><b>Position change</b> can measure this lap or the whole race, or be switched off. A car
+        that has not moved shows nothing at all — on a panel about right now, silence is the usual state.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/relative-grid.png" alt="The grid countdown in the footer">
+      <figcaption><b>On the grid</b> the clock's place is taken by how many cars are gridded and how long is
+        left, because the race clock is holding at the full length and has nothing to say yet.</figcaption>
+    </figure>
+  </div>
+
+  <h3>Who this panel is about</h3>
+  <div class="grid">
+    <figure>
+      <img src="img/relative-spectating.png" alt="Spectating notice">
+      <figcaption><b>Spectating.</b> The panel centres on the camera car, and says whose race it is showing.
+        A Relative quietly about somebody else is the one way spectator focus could mislead.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/relative-teammate.png" alt="Team-mate driving notice">
+      <figcaption><b>A team-mate in your car.</b> Same slot, same colour: for a team-mate's stint this is the
+        normal state of the panel for hours at a time, not a warning.</figcaption>
+    </figure>
+  </div>
+
+  <h3>The status gutter</h3>
+  <p>Outside the card on the left, one slot per row, so an annotation about a car never competes with the
+    driver's name for space. A slot shows, in priority order: a black-flag marker, the session's fastest-lap
+    stopwatch, a <code>PIT</code> block while that car is in its stall or approaching, or its off-track tally.
+    Rows with nothing to report draw nothing.</p>
+</section>
+
+<section id="blackbox">
+  <h2>Black box</h2>
+  <p class="lede">Six pages in the Relative's frame, walked with two wheel buttons. Every control is a real
+    iRacing pit command, and every value shown is the sim's own echo of what is armed.</p>
+
+  <div class="grid">
+    <figure>
+      <img src="img/blackbox-fuel.png" alt="The Fuel page">
+      <figcaption><b>Fuel.</b> The tank arc with what is in it and what is armed to be added, laps of fuel at
+        the measured burn, and the arm/clear controls. Fuel steps in whole litres because that is what the sim's
+        command carries — showing tenths that never reach it would be a lie.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/blackbox-fuel-auto.png" alt="Auto Fuel armed">
+      <figcaption><b>Auto Fuel.</b> Keeps the load set to whatever finishes the race plus a margin in laps, and
+        re-arms it as the burn is measured. The Add row becomes read-only while it is on, because it is no
+        longer yours to set. The margin rides on the AUTO plate.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/blackbox-tires.png" alt="The Tires page, temperatures">
+      <figcaption><b>Tires.</b> Four corners, each with its armed tick, cold pressure and three bars across the
+        tread. A press arms the corner; a turn steps its pressure by a whole psi — the sim's own increment, so
+        every click changes something it can represent.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/blackbox-tires-wear.png" alt="The Tires page, wear bars">
+      <figcaption><b>Bars show temperature or wear</b>, from the last stop's readings. Before any stop the page
+        says so rather than drawing zeros as though they were measurements.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/blackbox-strategy.png" alt="The Pit Window page">
+      <figcaption><b>Pit Window.</b> Which lap to come in on, scored against the traffic you would come out
+        into — see <a href="#strategy">Strategy</a>.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/blackbox-incar.png" alt="The In-Car page">
+      <figcaption><b>In-Car.</b> Brake bias, ABS, traction control, throttle shape and dash page, as the car
+        publishes them. A reading, not a control: the sim accepts no remote writes for these.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/blackbox-weather.png" alt="The black box Weather page">
+      <figcaption><b>Weather.</b> Track and air temperature, live rain or the declared chance, fog, and the
+        wind as an arrow in the car's own frame. Current conditions, honestly labelled as such: iRacing
+        publishes no forecast.</figcaption>
+    </figure>
+  </div>
+
+  <div class="card note">
+    <h4>Pages appear only when they can say something true</h4>
+    <p style="margin:0">The Pit Window page appears once the race is seen to need more than one stop. While
+      spectating, the Fuel and Tires pages appear only when team sync is actually carrying the driver's data —
+      an empty page that looks live is worse than no page.</p>
+  </div>
+</section>
+
+<section id="standings">
+  <h2>Standings</h2>
+  <p class="lede">The official classification, read class-relative: in a multi-class field every class is
+    running its own race, and an overall number reads as a driver being fourteenth in a race they are leading.</p>
+
+  <figure>
+    <img src="img/standings-default.png" alt="The Standings panel">
+    <figcaption><b>Two cards and a gutter.</b> Your own class in full on the left, other classes' leaders on the
+      right, with the session badge and clock across the top. Rows tumble to their new slot when positions
+      change, so a change is seen to happen rather than the table silently being different.</figcaption>
+  </figure>
+
+  <div class="grid">
+    <figure>
+      <img src="img/standings-endurance.png" alt="Standings with endurance columns">
+      <figcaption><b>Endurance columns</b> — stint length, stops still owed, and the position each car is
+        projected to finish in once everyone has taken theirs. Being a stop up on a rival is worth more than
+        any plausible pace difference, and this is the column that says so. Auto by default: they appear when
+        the race is long enough to need them.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/standings-tyres.png" alt="Standings with the tyre column and stint laps">
+      <figcaption><b>Compound column and stint laps.</b> The compound letter appears only when the session
+        publishes compounds; wets are ringed blue.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/standings-oneclass.png" alt="Standings with other classes hidden">
+      <figcaption><b>Other classes can be dropped</b> entirely, leaving one card.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="radar">
+  <h2>Radar bars</h2>
+  <p class="lede">Two capsules framing your car, one per side, showing what is alongside. Colour encodes
+    threat, not direction — once your own car is drawn on the bar, position already says which side a car is on.</p>
+  <div class="grid">
+    <figure>
+      <img src="img/radar-default.png" alt="The radar bars">
+      <figcaption><b>The bars.</b> A car with clear air is slate; closer cars escalate. The gap between the two
+        capsules is set to frame your car's width in your own seating position.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/radar-numbers.png" alt="Radar bars with gaps in metres">
+      <figcaption><b>Gaps in metres</b>, optionally, for setting the range up the first time.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="fasterclass">
+  <h2>Faster class</h2>
+  <figure>
+    <img src="img/fasterclass-default.png" alt="The Faster Class card">
+    <figcaption><b>A quicker car is coming.</b> The card appears at a configurable gap and turns red at a
+      closer one, optionally flashing. In a multi-class race the Relative does show this — as one row among
+      eight, read foveally — and being lifted out of it is the point.</figcaption>
+  </figure>
+</section>
+
+<section id="pitstall">
+  <h2>Pit stall</h2>
+  <div class="grid">
+    <figure>
+      <img src="img/pitstall-approach.png" alt="Approaching the pit stall">
+      <figcaption><b>On the way in.</b> The bar empties as the marks come up; the range it covers is
+        configurable, and a shorter range magnifies the last metre.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/pitstall-inbox.png" alt="Stopped in the box">
+      <figcaption><b>In the box.</b> Stopping in the right place is worth more than it sounds: an overshoot is
+        a reverse, a crew that will not come out, or a penalty.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="statusborder">
+  <h2>Status border<span class="tag tag-new">new</span></h2>
+  <p class="lede">The black box wears the session's state on its edge, so the one thing that matters right now
+    is visible without reading a single row.</p>
+
+  <figure>
+    <img src="img/relative-box.png" alt="The BOX BOX status border">
+    <figcaption><b>BOX BOX.</b> The border sits flush on the widget's own edge and its left limb widens into a
+      filled band across the whole status gutter — the gutter's own markers draw on top of it, so the border
+      passes under them rather than detouring around them. The plate straddles the top edge.</figcaption>
+  </figure>
+
+  <div class="grid">
+    <figure>
+      <img src="img/relative-caution.png" alt="Caution border">
+      <figcaption><b>CAUTION</b> — a full-course yellow.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/relative-lastlap.png" alt="Last lap border">
+      <figcaption><b>LAST LAP</b> — the white flag.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/relative-finish.png" alt="Finish border">
+      <figcaption><b>FINISH</b> — the chequered, which outranks everything.</figcaption>
+    </figure>
+  </div>
+
+  <h3>When BOX BOX fires</h3>
+  <ul>
+    <li><b>By hand</b>, from a toggle on the Pit Window page — a crew chief's call, or your own reminder.</li>
+    <li><b>By fuel</b>, once you could not safely complete another lap after this one, and only in the lap's
+      back half, so the call is a settled "turn in at the end of this lap" rather than a first-corner guess.
+      With no measured burn it never fires: a made-up "box now" is the one false instruction that costs a race.</li>
+  </ul>
+  <p>It comes on steady and only pulses inside 400 m of the pit entry, so the flash means "turn in now". A
+    hand-called BOX BOX clears itself once the car is on pit road.</p>
+  <div class="card warn">
+    <p style="margin:0"><b>Priority.</b> Chequered &gt; box call &gt; white &gt; yellow. A box call outranks the
+      flags behind it because boxing under a yellow is exactly what you do.</p>
+  </div>
+</section>
+
+<section id="strategy">
+  <h2>Strategy &amp; fuel</h2>
+  <p class="lede">The projections a crew chief would otherwise be doing on paper, with every one of them
+    labelled for how much it can be trusted.</p>
+
+  <figure>
+    <img src="img/blackbox-strategy.png" alt="The pit window page">
+    <figcaption><b>The pit window.</b> Each candidate lap is scored against the traffic you would rejoin into —
+      the tall column is the recommendation, the red line where the tank runs out. Underneath: whether the rate
+      the recommendation asks for is actually being driven this lap, how much of the field could be seen
+      (<i>confidence</i>), and the lap the tank reaches.</figcaption>
+  </figure>
+
+  <h3>The stop-skip suggestion</h3>
+  <p>The note reading <b>"save to 2.58 L/lap to skip a stop"</b> is the Spa call surfaced: it searches for the
+    smallest per-lap saving that removes a whole stop from the remaining race, and says so only when the saving
+    is reachable. No measured burn, no known tank capacity, or a caution voiding the projection all leave it
+    unsaid rather than guessed.</p>
+
+  <h3>Known stop costs</h3>
+  <p>Stops are costed from what has actually been observed — each car's own measured time stationary — rather
+    than a single shared guess, so a car taking tyres every stop is projected with its real loss. Rivals' stop
+    lengths are what the tyre inference is drawn from.</p>
+</section>
+
+<section id="sync">
+  <h2>Team sync<span class="tag tag-new">new</span></h2>
+  <p class="lede">In a team session every member's sim publishes the same world, but only the seated driver's
+    sim publishes the car. Team sync shares the measurements, so a spectating crew chief sees the fuel, tyres
+    and strategy of the car they are not sitting in — and a member who disconnects gets everything they missed.</p>
+
+  <h3>How it works</h3>
+  <ul>
+    <li><b>An event ledger, not state streaming.</b> A closed lap is ~32 bytes every couple of minutes; a live
+      scalars tick runs at 1 Hz and <i>only while somebody is listening</i>. A five-member team costs 1–2 KB/s
+      in total.</li>
+    <li><b>iRacing's own session clock stamps every event</b>, so members merge them deterministically whatever
+      the network delays. Accuracy comes from the timestamp, not from sending fast.</li>
+    <li><b>Recovery is the ledger read back.</b> A member who joins late or reconnects asks for what they are
+      missing and replays it through the same handlers as live events — so a rebuilt overlay is identical to
+      one that never dropped.</li>
+    <li><b>Rooms are keyed by iRacing's SubSessionID</b>, so members find each other with no configuration, and
+      an invite code keeps strangers in the same subsession out.</li>
+  </ul>
+
+  <h3>Hosting<span class="tag tag-new">new</span></h3>
+  <p>One member ticks <b>Host the relay from this PC</b> in Settings → Team Sync. The relay runs inside the
+    overlay — no terminal, no second program — and binds to that machine only. Teammates reach it through the
+    host's Tailscale Funnel, so only the host installs anything:</p>
+  <pre><code>tailscale funnel 41230</code></pre>
+  <p>The address that prints goes in every teammate's <b>Relay URL</b> as <code>wss://…</code>, with the same
+    invite code. A host who leaves the invite field empty gets one generated and saved the moment hosting
+    starts; while hosting, that overlay connects to its own relay automatically and the URL field is greyed
+    out. Failures (a port already taken, an unreadable invite) are reported on the page rather than retried
+    silently.</p>
+
+  <h3>What a crew chief sees</h3>
+  <div class="grid">
+    <figure>
+      <img src="img/blackbox-fuel-crew.png" alt="The Fuel page while spectating">
+      <figcaption><b>The driver's real tank</b><span class="tag tag-crew">crew</span> — level, burn and armed
+        load, tagged with whose car it is. The page unlocks while spectating only once sync is carrying data.
+        Fuel can be adjusted from here: it travels the wire as intent, and the driver's own overlay arms it.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/blackbox-tires-crew.png" alt="The Tires page while spectating">
+      <figcaption><b>The driver's tyre life</b><span class="tag tag-crew">crew</span> — the last stop's wear,
+        temperatures and the pressures they came off at, plus what is armed for the next stop. This is what the
+        double-stint decision is actually made on.</figcaption>
+    </figure>
+  </div>
+
+  <div class="card warn">
+    <h4>Nobody's pit box is touched without consent</h4>
+    <ul style="margin-bottom:0">
+      <li>The driver arms <b>Let my team adjust my pit box</b> once per session. Off, remote requests are ignored.</li>
+      <li>A change is <b>announced, never prompted</b> — a passive "set by &lt;name&gt;" note. A driver mid-corner
+        cannot answer a dialog.</li>
+      <li>Every change lands in the sim's own black box, where the driver can see and override it.</li>
+      <li>A write applies <b>once, live</b>. A reconnecting driver replaying an hour-old ledger never has a
+        stale command sprung on them — that property is covered by an end-to-end test.</li>
+    </ul>
+  </div>
+
+  <h3>Standing calls</h3>
+  <figure>
+    <img src="img/blackbox-strategy-crew.png" alt="The Strategy page with crew controls">
+    <figcaption><b>The crew chief's Strategy page.</b><span class="tag tag-crew">crew</span> Below the window:
+      the manual BOX BOX, the shared <b>fuel target</b>, and the standing <b>tyre policy</b>.</figcaption>
+  </figure>
+
+  <h4>Shared fuel target</h4>
+  <p>A crew chief sets a litres-per-lap target and it appears in the driver's Relative footer, with their
+    current burn beside it and the lap the tank reaches at that rate — green at or under target, amber over.
+    It is session state: it survives driver swaps and reaches a new driver who was a spectator when it was set,
+    without anyone re-sending it.</p>
+  <figure>
+    <img src="img/relative-fueltarget.png" alt="The fuel target in the Relative footer">
+    <figcaption><b>TGT 2.62 &middot; 2.71 &middot; L28</b> — the target, what is actually being burned, and the lap
+      the tank makes at that burn. Amber here because 2.71 is over the 2.62 asked for; it turns green at or
+      under target, with a hair of slack so sensor jitter cannot flicker the colour.</figcaption>
+  </figure>
+
+  <h4>Standing tyre policy<span class="tag tag-new">new</span></h4>
+  <p>The answer to "do we take tyres at the next stop?", made durable. A press cycles it:</p>
+  <table>
+    <tr><th>Setting</th><th>What the driver's overlay does at each stop</th></tr>
+    <tr><td><code>driver's call</code></td><td>Nothing — the directive is off.</td></tr>
+    <tr><td><code>every stop</code></td><td>Arms all four.</td></tr>
+    <tr><td><code>never</code></td><td>Clears all four — the double-stint call.</td></tr>
+    <tr><td><code>wear under N%</code></td><td>Takes tyres only when the worst corner's remaining tread is at or
+      under the threshold (default 80%, stepped by 5). With no wear measured yet it takes tyres: fresh rubber is
+      the mistake that cannot lose a race.</td></tr>
+  </table>
+  <p>It is decided at the <b>pit-road entry edge</b>, once per entry, against the latest measured wear — so a
+    policy set mid-stint still lands on the very next stop — and it goes through the same consent gate and
+    "set by" note as any other crew write.</p>
+</section>
+
+<section id="danger">
+  <h2>Danger drivers<span class="tag tag-new">new</span></h2>
+  <p class="lede">You see somebody drive badly and want the overlay to remember it — now and in every future
+    session, so the moment they show up around you again the warning is already there.</p>
+  <figure>
+    <img src="img/relative-danger.png" alt="Danger marks on Relative rows">
+    <figcaption><b>Three levels, worked into the row itself</b> rather than added as another icon on the end:
+      <span class="swatch" style="background:var(--caution)"></span><b>caution</b> is a short amber bar beside
+      the position plate, <span class="swatch" style="background:var(--caution)"></span><b>warning</b> takes the
+      row's full height, and <span class="swatch" style="background:var(--alert)"></span><b>severe</b> is
+      full-height in the alert red with the row's wash turning red behind it. The level reads from how much of
+      the row the mark claims.</figcaption>
+  </figure>
+  <p><b>Right-click any row</b> to mark that driver or clear the mark — the driver is marked where they are
+    seen, with no list and no separate screen. Marks are keyed by iRacing customer id, which is the one
+    identifier stable across sessions, and are written to the settings file straight away. A car whose entry
+    publishes no customer id says so rather than offering a mark that would not survive the session.</p>
+</section>
+
+<section id="seats">
+  <h2>Seat layouts</h2>
+  <p class="lede">Where you want the panels while driving is not where you want them while watching.</p>
+  <p>Every panel keeps two positions: a <b>driving</b> layout and a <b>watching</b> one. The watching layout is
+    used whenever you are not in the car — spectating, or sitting out while a team-mate drives — and it seeds
+    itself from the driving layout the first time it is used, so the two only diverge once you actually drag
+    something while watching. The General settings page names which one is in force, because a panel that
+    "won't stay where I put it" after a seat change would otherwise read as a bug.</p>
+</section>
+
+<section id="stream">
+  <h2>Stream mode<span class="tag tag-new">new</span></h2>
+  <p class="lede">Capture the overlay in OBS without capturing the whole screen.</p>
+  <p>The overlay normally hides itself from the taskbar and alt-tab, which also hides it from OBS's window
+    picker. <b>Stream mode</b> (General settings) puts it back in both, so OBS lists <i>Race Overlay</i> as a
+    Window Capture source — use the <i>Windows 10 (1903 and up)</i> capture method and layer it over your game
+    capture. The taskbar button is the visible confirmation it took effect. It applies immediately, with no
+    restart.</p>
+</section>
+
+<section id="perf">
+  <h2>CPU behaviour</h2>
+  <p class="lede">iRacing is sensitive to CPU starvation, and an overlay that glitches the sim is worse than no
+    overlay.</p>
+  <ul>
+    <li><b>Background threads are marked for efficiency cores.</b> Telemetry reading, the input reader and
+      every sync socket thread run under EcoQoS, which asks Windows to schedule them off
+      the cores the sim wants.</li>
+    <li><b>The frame loop is paced, not spun.</b> The overlay draws at its own interval and sleeps in between,
+      rather than repainting every time the desktop mouse moves across it.</li>
+    <li><b>Asset lookups are resolved once</b> and remembered — manufacturer marks and icons used to cost tens
+      of thousands of filesystem calls a second across a full field.</li>
+    <li><b>Sync sends nothing nobody is listening to.</b> The 1 Hz scalars tick is gated on somebody being in
+      the room, and quantized so an unchanged value sends nothing at all.</li>
+  </ul>
+</section>
+
+<section id="themes">
+  <h2>Themes</h2>
+  <div class="grid">
+    <figure>
+      <img src="img/theme-panel.png" alt="The Panel theme">
+      <figcaption><b>Panel</b> — the default: translucent near-black cards with alternating row stripes.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/theme-instrument.png" alt="The Instrument theme">
+      <figcaption><b>Instrument</b> — a tighter bezel, more opaque, no alternating fill: rows are told apart by
+        the dividers between them.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="settings">
+  <h2>Settings window</h2>
+  <p class="lede">Every knob in the settings file, without the file. Changes apply to the live panels as they
+    are made — the panel behind the window is the preview — and are saved once they settle.</p>
+  <table>
+    <tr><th>Page</th><th>What is on it</th></tr>
+    <tr><td>General</td><td>Theme, hide-while-unfocused, hide-in-garage, off-track tally, driver flags,
+      stream mode, which seat layout is in force, and <b>Reset all positions</b>.</td></tr>
+    <tr><td>Relative</td><td>Visibility, scale, card width, cars ahead/behind, and every optional column.</td></tr>
+    <tr><td>Standings</td><td>Visibility, scale, name-column width, other classes, stint laps, compound column,
+      position change, endurance mode, pit-loss and tyre-change thresholds.</td></tr>
+    <tr><td>Logos</td><td>Manufacturer mark style and colour, with every known brand drawn as it will appear
+      and a per-brand override.</td></tr>
+    <tr><td>Radar Bars</td><td>Car length, range in car lengths and in time, bar size, the gap between the two
+      capsules, and gaps in metres.</td></tr>
+    <tr><td>Faster Class / Pit Stall</td><td>Each panel's own switches — including the Faster Class
+      warn/alert gaps and flash.</td></tr>
+    <tr><td>Black Box</td><td>Auto Fuel and its margin, and whether the tyre bars show temperatures or wear.</td></tr>
+    <tr><td>Team Sync<span class="tag tag-new">new</span></td><td>On/off, <b>host the relay from this PC</b> and
+      its port, relay URL, invite code, and the pit-control consent.</td></tr>
+    <tr><td>Binds</td><td>One row per wheel action, with press-to-capture. A control already bound elsewhere is
+      taken anyway and the clash shown on both rows.</td></tr>
+    <tr><td>Launcher</td><td>The programs to start with the overlay.</td></tr>
+  </table>
+</section>
+
+<section id="binds">
+  <h2>Wheel binds</h2>
+  <p class="lede">The black box is meant to be driven from the wheel at speed. Seven actions, bound to buttons
+    or keys:</p>
+  <table>
+    <tr><th>Action</th><th>On a page</th><th>On the Relative</th></tr>
+    <tr><td>Next page / Previous page</td><td>Walk the tab rail</td><td>—</td></tr>
+    <tr><td>Next / Previous</td><td>Move the cursor down or up the page's rows</td><td>Scroll the field toward the
+      cars behind or ahead</td></tr>
+    <tr><td>Increment / Decrement</td><td>Raise or lower the selected value</td><td>—</td></tr>
+    <tr><td>Toggle</td><td>Tick or untick the selected option</td><td>Recentre on the player</td></tr>
+  </table>
+  <p>Whatever is already held when a capture starts does not count, so a shifter resting in gear cannot be the
+    answer. Binds can also be set from a terminal with <code>race-overlay.exe --bind &lt;action&gt;</code>.</p>
+</section>
+
+<section id="cli">
+  <h2>Command line</h2>
+  <table>
+    <tr><th>Flag</th><th>What it does</th></tr>
+    <tr><td><code>--demo</code></td><td>Render the fixed demo snapshot; iRacing is not needed.</td></tr>
+    <tr><td><code>--demo-page=&lt;page&gt;</code></td><td>Open the black box on <code>relative</code>,
+      <code>strategy</code>, <code>fuel</code>, <code>tires</code>, <code>in-car</code> or <code>weather</code>.</td></tr>
+    <tr><td><code>--demo-state=&lt;a,b&gt;</code><span class="tag tag-new">new</span></td><td>Put the demo snapshot
+      into a named state — a caution, a box call, a spectator's seat — for a screenshot.</td></tr>
+    <tr><td><code>--screenshot=&lt;path&gt;</code></td><td>Write one rendered frame to a PNG and quit. The window
+      stays hidden for the run.</td></tr>
+    <tr><td><code>--sync-host=&lt;port&gt;</code></td><td>Run the team-sync relay from a terminal, printing the
+      invite code and the funnel command. The settings page does the same thing without a terminal.</td></tr>
+    <tr><td><code>--sync-join=&lt;url,subsession,code,name,custid&gt;</code></td><td>Join a relay and talk to it —
+      a diagnostic for checking a link end to end.</td></tr>
+    <tr><td><code>--bind &lt;action&gt;</code></td><td>Capture a wheel button for one action and save it.</td></tr>
+    <tr><td><code>--list-devices</code></td><td>Every input device the overlay can see.</td></tr>
+    <tr><td><code>--dump-vars</code> / <code>--dump-all-vars</code> / <code>--dump-session-info</code></td>
+      <td>What the sim is actually publishing right now. The first thing to reach for when a value reads wrong.</td></tr>
+  </table>
+</section>
+
+<footer>
+  Race Overlay — feature reference, generated from the demo snapshot.
+  Design notes and decisions live in <code>plans/</code>.
+</footer>
+</main>
+</div>
+</body>
+</html>

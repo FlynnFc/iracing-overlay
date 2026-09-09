@@ -1,0 +1,51 @@
+# Builds the Windows binaries and publishes them as a GitHub release whenever
+# a version tag (v0.2.0, v1.0.0, ...) is pushed:
+#
+#   git tag v0.2.0
+#   git push origin v0.2.0
+#
+# The zip it produces is the whole install: the two exes at the root with the
+# runtime asset folders (icons, logos) beside them, which is exactly the layout
+# `ui::find_asset_dir` resolves. Fonts and the tray icon are embedded at build
+# time and need no files.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $staging = "race-tools"
+          New-Item -ItemType Directory $staging | Out-Null
+          Copy-Item target\release\race-overlay.exe, target\release\race-launcher.exe $staging
+          New-Item -ItemType Directory "$staging\assets" | Out-Null
+          Copy-Item -Recurse assets\icons, assets\logos, assets\flags "$staging\assets"
+          Copy-Item config.toml, README.md, LICENSE $staging
+          Compress-Archive -Path "$staging\*" -DestinationPath "race-tools-windows-x64.zip"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: race-tools-windows-x64.zip
+          generate_release_notes: true

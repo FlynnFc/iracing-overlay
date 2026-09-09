@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 480">
+  <!-- The fallback for a driver with no flag on their profile: a quiet globe
+       on slate, deliberately more muted than any real flag so it reads as
+       "none chosen" rather than as a country. Original drawing, same 4:3
+       frame as the flag-icons set beside it. -->
+  <rect width="640" height="480" fill="#414a59"/>
+  <circle cx="320" cy="240" r="168" fill="none" stroke="#d5dce6" stroke-width="34"/>
+  <ellipse cx="320" cy="240" rx="76" ry="168" fill="none" stroke="#d5dce6" stroke-width="22"/>
+  <path d="M152 240h336" fill="none" stroke="#d5dce6" stroke-width="22"/>
+  <path d="M176 156h288M176 324h288" fill="none" stroke="#d5dce6" stroke-width="22"/>
+</svg>

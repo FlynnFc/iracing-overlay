@@ -1,0 +1,104 @@
+[package]
+name = "race-tools"
+version = "0.1.0"
+edition = "2024"
+description = "iRacing overlay and session launcher"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1.0.103"
+egui = { version = "0.29", default-features = false }
+# Team sync (see plans/team-sync.md): invite-code entropy, compact wire
+# encoding, and the WebSocket both sides of the relay speak. `native-tls`
+# so a client can reach a `wss://` Tailscale Funnel URL through SChannel
+# without bundling a TLS stack.
+getrandom = "0.3"
+postcard = { version = "1.1", features = ["use-std"] }
+tungstenite = { version = "0.26", features = ["native-tls"] }
+egui_extras = { version = "0.29", features = ["svg", "file"] }
+egui_overlay = "0.9"
+iracing-telem = "0.2"
+mimalloc = "0.1.52"
+png = "0.17"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_yaml = "0.9"
+sysinfo = "0.38.4"
+toml = "1.1.2"
+tray-icon = "0.24"
+windows = { version = "0.62", features = [
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    # Thread QoS (EcoQoS) so background threads prefer E-cores and yield to
+    # iRacing's — see `perf`.
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Lint configuration per M-STATIC-VERIFICATION.
+[lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+cargo = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+
+allow_attributes_without_reason = "warn"
+as_pointer_underscore = "warn"
+assertions_on_result_states = "warn"
+clone_on_ref_ptr = "warn"
+deref_by_slicing = "warn"
+disallowed_script_idents = "warn"
+empty_drop = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+fn_to_numeric_cast_any = "warn"
+if_then_some_else_none = "warn"
+map_err_ignore = "warn"
+redundant_type_annotations = "warn"
+renamed_function_params = "warn"
+semicolon_outside_block = "warn"
+undocumented_unsafe_blocks = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unneeded_field_pattern = "warn"
+unused_result_ok = "warn"
+
+# May cause issues with structured logging otherwise.
+literal_string_with_formatting_args = "allow"
+
+# iracing-telem pins old versions of windows/bitflags/syn; not fixable here.
+multiple_crate_versions = "allow"
+
+[profile.release]
+strip = true
+# The overlay's hot loop is egui tessellation and telemetry float math, both of
+# which cross crate boundaries every frame; cross-crate inlining is worth more
+# here than build time. `panic = "abort"` is safe because nothing in this repo
+# catches an unwind — there is no `catch_unwind` and no `#[should_panic]` test —
+# and a panicking overlay has nothing useful to unwind to anyway.
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[build-dependencies]
+winresource = "0.1"

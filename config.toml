@@ -1,0 +1,31 @@
+# The launcher's program list used to live here. It now lives in
+# %APPDATA%\race\launcher.toml, edited from the overlay's Launcher settings
+# page; this file is read once to seed that list if it doesn't exist yet,
+# and ignored after. Kept so an old install carries its list over.
+
+[[programs]]
+name = "iRacing UI"
+path = 'C:\Program Files (x86)\iRacing\ui\iRacingUI.exe'
+
+[[programs]]
+name = "Trading Paints"
+path = 'C:\Program Files (x86)\Rhinode LLC\Trading Paints\Trading Paints.exe'
+
+[[programs]]
+name = "Crew Chief"
+path = 'C:\Program Files (x86)\Britton IT Ltd\CrewChiefV4\CrewChiefV4.exe'
+
+[[programs]]
+name = "Coach Dave Delta"
+path = 'C:\Users\masta\AppData\Local\CoachDaveDelta\Coach Dave Delta.exe'
+
+[[programs]]
+name = "SimPro Manager"
+path = 'C:\Program Files (x86)\Simagic\Simpro3\bin\simpro3.exe'
+
+# Last, so the overlay's own window comes up on top of the others. It waits
+# idle until iRacing is running and reconnects on its own, so starting it
+# here rather than after the sim is fine.
+[[programs]]
+name = "Race Overlay"
+path = 'C:\Users\masta\Documents\GitHub\race\target\release\race-overlay.exe'

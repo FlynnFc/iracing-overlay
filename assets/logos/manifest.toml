@@ -1,0 +1,50 @@
+# Manufacturer marks: which variant each brand gets by default, and which
+# colour files are legible on the overlay's dark ground. Hand-editable; the
+# overlay reads it once at startup. See plans/logo-styles.md.
+
+# The variant a brand gets when the style is "Curated" (the default). A brand
+# not listed here gets "icon". Values: icon, badge, horizontal, wordmark, each
+# optionally with a "-colour" suffix.
+[curated]
+alfa-romeo = "icon-colour"
+aston-martin = "horizontal"
+bentley = "icon-colour"
+bmw = "icon-colour"
+bugatti = "icon-colour"
+byd = "badge-colour"
+cadillac = "icon-colour"
+fiat = "badge-colour"
+ford = "badge-colour"
+gmc = "wordmark"
+honda = "icon-colour"
+hummer = "wordmark"
+hyundai = "icon-colour"
+jeep = "icon-colour"
+kia = "wordmark"
+koenigsegg = "icon-colour"
+lamborghini = "badge-colour"
+landrover = "icon-colour"
+lotus = "icon-colour"
+lucid = "wordmark"
+maserati = "icon-colour"
+mazda = "icon-colour"
+mb = "icon-colour"
+mclaren = "icon-colour"
+mitsubishi = "icon-colour"
+pagani = "horizontal"
+porsche = "icon-colour"
+rivian = "icon-colour"
+subaru = "icon-colour"
+tesla = "icon-colour"
+toyota = "icon-colour"
+volkswagen = "icon-colour"
+
+# Colour files that still read on #101418. Measured by rendering each colour
+# file over that ground and keeping the ones where at least a quarter of the
+# mono mark's ink comes out at a contrast of 2:1 or better. A brand missing
+# from a shape's list gets the mono file when colour is asked for.
+[colour_legible]
+icon = ["alfa-romeo", "bentley", "bmw", "bugatti", "byd", "cadillac", "fiat", "ford", "honda", "jeep", "koenigsegg", "lamborghini", "landrover", "lotus", "maserati", "mazda", "mb", "mclaren", "mitsubishi", "porsche", "rivian", "subaru", "tesla", "toyota"]
+badge = ["alfa-romeo", "aston-martin", "bentley", "bmw", "byd", "cadillac", "dodge", "ferrari", "fiat", "ford", "honda", "jeep", "koenigsegg", "lamborghini", "lotus", "mazda", "mitsubishi", "porsche", "rivian", "rolls-royce", "subaru", "tesla", "toyota"]
+horizontal = ["alfa-romeo", "bentley", "bmw", "bugatti", "byd", "cadillac", "dodge", "ford", "honda", "jeep", "koenigsegg", "landrover", "mazda", "mclaren", "mitsubishi", "nissan", "porsche", "rivian", "subaru", "tesla", "toyota"]
+wordmark = ["audi", "bmw", "byd", "honda", "jaguar", "jeep", "mazda", "nissan", "subaru", "tesla", "toyota", "volkswagen"]

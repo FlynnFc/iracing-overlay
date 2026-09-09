@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The viewBox carries ~15% padding a side so the mark sits at the same
+     optical size as the cardog-icons crests beside it, which pad theirs. -->
+<svg width="25" height="23" version="1.1" viewBox="-3.7 -3.45 24.6 23" xmlns="http://www.w3.org/2000/svg">
+<title>Dallara D mark</title>
+<desc>The stylised D from the Dallara wordmark; the mark is a trademark of Dallara Group, used only to identify the car a driver is in.</desc>
+ <g fill="#fdc300">
+  <path d="M16.086 0h-2.18v8.729h-8.15c-.887 0-1.61.721-1.61 1.609 0 .885.723 1.607 1.61 1.607h11.367V1.038C17.123.464 16.658 0 16.086 0"/>
+  <path d="M5.755 12.871a2.538 2.538 0 01-2.536-2.534 2.54 2.54 0 012.536-2.534l7.49.001-1.021-2.417c-.238-.561-.579-.802-1.14-.802H5.742A5.76 5.76 0 000 10.337a5.76 5.76 0 005.755 5.752h10.33c.573 0 1.038-.464 1.038-1.037v-2.18H5.755z"/>
+ </g>
+</svg>

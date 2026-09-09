@@ -1,0 +1,3 @@
+/target
+# `race-overlay --dump-vars` output, for local telemetry spelunking.
+/vars_dump.txt
