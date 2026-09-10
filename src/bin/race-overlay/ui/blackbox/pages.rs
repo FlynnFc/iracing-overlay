@@ -263,9 +263,9 @@ pub fn fuel(
     }
 }
 
-/// The stop-skip search's bounds: half a lap of reserve (the box call's own
-/// figure), savings up to 0.2 L/lap — a tenth or two, not lift-and-coast —
-/// searched in hundredth steps.
+/// The stop-skip search's bounds: its own half-lap planning reserve, savings
+/// up to 0.2 L/lap — a tenth or two, not lift-and-coast — searched in
+/// hundredth steps.
 const SKIP_RESERVE_LAPS: f32 = 0.5;
 const SKIP_MAX_SAVE_LPL: f32 = 0.2;
 const SKIP_SEARCH_STEP: f32 = 0.01;

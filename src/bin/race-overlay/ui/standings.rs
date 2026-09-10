@@ -1700,6 +1700,51 @@ mod tests {
     }
 
     #[test]
+    fn a_completed_stop_increments_the_row_while_the_remaining_forecast_falls() {
+        let ctx = egui::Context::default();
+        crate::app::install_fonts(&ctx);
+        let mut rendered = Vec::new();
+        for (completed, remaining) in [(0, 2), (1, 1)] {
+            let mut car = entry(1, 0.0, 0);
+            car.pit_stops = completed;
+            // Keep the per-car forecast deliberately populated: the row must
+            // still take its value from the observed completed-stop count.
+            car.stops_remaining = Some(remaining);
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    draw_strategy_row(
+                        ui,
+                        Metrics::new(1.0),
+                        Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(ENDURANCE_WIDTH, ROW_HEIGHT)),
+                        &Row::Driver(&car),
+                        RowStyle { odd: false, rounding: Rounding::ZERO },
+                        Some(7),
+                        false,
+                    );
+                    draw_strategy_line(
+                        ui,
+                        Metrics::new(1.0),
+                        Rect::from_min_size(egui::pos2(0.0, 50.0), egui::vec2(600.0, SUMMARY_HEIGHT)),
+                        EnduranceMeta { stops_remaining: Some(remaining), ..EnduranceMeta::default() },
+                    );
+                });
+            });
+            let numbers: Vec<(f32, i32)> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => text.galley.text().parse().ok().map(|value| (text.pos.y, value)),
+                    _ => None,
+                })
+                .collect();
+            let row = numbers.iter().find(|(y, _)| *y < 50.0).map(|(_, value)| *value);
+            let summary = numbers.iter().find(|(y, _)| *y >= 50.0).map(|(_, value)| *value);
+            rendered.push((row, summary));
+        }
+        assert_eq!(rendered, [(Some(0), Some(2)), (Some(1), Some(1))]);
+    }
+
+    #[test]
     fn the_stops_column_renders_completed_stops_even_when_nine_more_are_projected() {
         let ctx = egui::Context::default();
         crate::app::install_fonts(&ctx);
@@ -1720,10 +1765,14 @@ mod tests {
                     );
                 });
             });
-            let text: Vec<&str> = output.shapes.iter().filter_map(|shape| match &shape.shape {
-                egui::Shape::Text(text) => Some(text.galley.text()),
-                _ => None,
-            }).collect();
+            let text: Vec<&str> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                })
+                .collect();
             assert!(text.contains(&completed.to_string().as_str()), "completed {completed}: {text:?}");
             assert!(!text.contains(&"9"), "the forecast belongs in the summary, not this column");
         }

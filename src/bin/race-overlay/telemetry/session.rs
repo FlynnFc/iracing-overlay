@@ -824,6 +824,13 @@ impl SessionTrackers {
     /// with no stops in it comes to report several, and why each car ends up
     /// apparently on a different strategy from the next.
     fn sync_to_session(&mut self, session_num: Option<i32>) {
+        // A missing `SessionNum` is an unavailable sample, not a new session.
+        // Resetting here and again when the same number returned erased stint
+        // history during ordinary telemetry gaps.
+        let Some(session_num) = session_num else {
+            return;
+        };
+        let session_num = Some(session_num);
         if self.session_num == session_num {
             return;
         }
@@ -3352,6 +3359,9 @@ struct ClassifiedCar {
     fastest_time: f32,
     last_time: f32,
     pit_stops: i32,
+    /// Present only for a real scorer row. Live fallback rows use zero for
+    /// display but must not establish an official-stop baseline.
+    official_pit_stops: Option<i32>,
 }
 
 impl From<&ResultsPosition> for ClassifiedCar {
@@ -3364,6 +3374,7 @@ impl From<&ResultsPosition> for ClassifiedCar {
             fastest_time: row.fastest_time,
             last_time: row.last_time,
             pit_stops: row.pit_stops,
+            official_pit_stops: Some(row.pit_stops.max(0)),
         }
     }
 }
@@ -3426,6 +3437,7 @@ fn live_classification(info: &SessionInfoCache, arrays: StandingsRawArrays<'_>) 
                 fastest_time: 0.0,
                 last_time: 0.0,
                 pit_stops: 0,
+                official_pit_stops: None,
             }
         })
         .collect()
@@ -3790,6 +3802,8 @@ fn build_standings(
                 row.car_idx,
                 session_time_secs,
                 lap,
+                row.official_pit_stops,
+                track_location != TrackLocation::NotInWorld,
                 matches!(track_location, TrackLocation::InPitStall | TrackLocation::ApproachingPits),
                 track_location == TrackLocation::InPitStall,
                 idx.and_then(|i| arrays.lap_dist_pcts.get(i)).copied().filter(|pct| pct.is_finite() && *pct >= 0.0),
@@ -3951,23 +3965,22 @@ const STOPPED_CONFIRM_SECS: f64 = 2.0;
 /// service.
 const MIN_STOP_SECS: f64 = 3.0;
 
-/// How much of a pit-lane visit may pass unwatched before it is taken on
-/// trust as a stop.
+/// Missing in-world position time that makes a continuous lane visit more
+/// likely to contain an unseen stop than an observed drive-through.
 ///
-/// Telling a stop from a drive-through means watching the car for the whole
-/// visit: a stretch with no position reading is a stretch it could have been
-/// standing still in. The two ways to be wrong are not equal. Calling a
-/// drive-through a stop costs one phantom stop on a projection; calling a
-/// stop a drive-through leaves a stint running for the rest of the race,
-/// which is the fault all of this exists to fix. So a visit that could not be
-/// watched throughout is treated as the stop it almost always is, and only a
-/// visit seen from end to end can be ruled a drive-through. A second covers a
-/// dropped sample or two without covering a service.
+/// It permits a stint reset and an exit-to-exit range for sparse rival
+/// telemetry, but never supplies a stop duration. `NotInWorld` time is
+/// excluded because that may be a tow or garage stay rather than missing lane
+/// position.
 const POSITION_BLIND_TOLERANCE_SECS: f64 = 1.0;
 
 /// Per-car pit-lane transition tracking, so Standings can show current and
 /// typical stint length without a direct SDK var for either.
 #[derive(Debug, Default, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "orthogonal observations: world presence, lane continuity, stall presence and complete stint boundary"
+)]
 struct StintState {
     /// `SessionTime`/lap count when the car most recently left the pits, if
     /// it's been seen doing so at least once this session.
@@ -3978,6 +3991,14 @@ struct StintState {
     /// [`MIN_FUEL_STINT_LAPS`] never enter.
     completed: std::collections::VecDeque<(i32, f64)>,
     was_in_pit_lane: bool,
+    /// Whether any trustworthy surface has been seen for this car.
+    seen_in_world: bool,
+    /// A `NotInWorld` tick interrupted the last trustworthy transition.
+    ///
+    /// It is not an off-track or pit-exit observation. In particular, a car
+    /// that vanishes from the circuit and next appears in its box was towed;
+    /// treating that as a normal lane visit invents a stop and a fresh stint.
+    observation_interrupted: bool,
     /// `SessionTime` and lap at which the current pit-lane visit began, so a
     /// visit that turns out to be a stop closes its stint at the lane entry
     /// rather than wherever the car came to rest.
@@ -3994,16 +4015,46 @@ struct StintState {
     /// drive-through — see [`MIN_STOP_SECS`].
     stopped_since: Option<f64>,
     stopped_total_secs: f64,
-    /// `SessionTime` at the previous tick of the current lane visit, and how
-    /// much of the visit has passed with no position reading to judge it by
-    /// — see [`POSITION_BLIND_TOLERANCE_SECS`].
+    /// `SessionTime` at the previous trustworthy tick of the current visit.
     last_tick_secs: f64,
+    /// False when the visit began outside observable telemetry. Such a visit
+    /// may be a tow or garage stay and cannot close a racing stint.
+    lane_visit_observed: bool,
+    /// In-world lane time for which no position was published.
     blind_secs: f64,
+    /// Whether the sim directly placed the car in its pit stall this visit.
+    stall_observed: bool,
+    /// Whether the visit crossed a `NotInWorld` gap. Service observed outside
+    /// the gap remains real, but the gap makes its duration and range unsafe
+    /// to learn from.
+    lane_visit_interrupted: bool,
+    /// Whether the current stint was observed from its beginning. An overlay
+    /// attached halfway through a race must not learn a fuel range from the
+    /// tail of the first stint it happens to see.
+    current_start_observed: bool,
     /// Recent completed stops' stationary times, oldest first; bounded to
     /// [`STINT_SAMPLES`].
     pit_secs: std::collections::VecDeque<f64>,
     pit_count: u32,
     last_pit_secs: Option<f64>,
+    /// Highest genuine scorer count seen. The first value establishes a
+    /// historical offset; later increases reconcile lane visits.
+    official_stops_seen: Option<i32>,
+    /// Stops the scorer knew about before this tracker measured them.
+    official_offset: i32,
+    /// Scorer increases not yet paired with a local lane outcome.
+    official_unmatched: u32,
+    /// Locally detected stops the scorer has not caught up with yet.
+    local_unscored: u32,
+    /// Latest exit whose evidence was insufficient to call either a stop or
+    /// a drive-through. A later scorer increase may confirm its boundary.
+    /// The flag records whether confirmation should still move the current
+    /// boundary; a later local reset supersedes that part while retaining the
+    /// pending count reconciliation.
+    pending_uncertain_exit: Option<(f64, i32, bool)>,
+    /// Fully observed nonstop visits awaiting any scorer count they may
+    /// receive. Matching them changes the displayed total, never the stint.
+    pending_drive_throughs: u32,
 }
 
 /// One car's current and typical stint length, in both time and laps.
@@ -4020,9 +4071,17 @@ struct StintReading {
     last_pit_secs: Option<f64>,
     /// Its typical stationary time across recent completed stops.
     avg_pit_secs: Option<f64>,
-    /// Stops this car has made in this session, as measured here — the drive
-    /// out of its box at the start is not one of them.
+    /// Stops completed in this session, combining the scorer's historical
+    /// baseline with visits measured since this started watching.
     completed_stops: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LaneVisitOutcome {
+    Stop,
+    DriveThrough,
+    Uncertain { exit_secs: f64, exit_lap: i32 },
+    Ignored,
 }
 
 impl StintState {
@@ -4035,6 +4094,7 @@ impl StintState {
     /// projection for the rest of the race. A median throws it away — while
     /// keeping what is genuine: a car that stops every 16 laps where the rest
     /// of its class runs 17 really is going a lap early, and reads as 16.
+    #[cfg(test)]
     fn update(
         &mut self,
         session_time_secs: f64,
@@ -4043,6 +4103,79 @@ impl StintState {
         in_pit_stall: bool,
         lap_dist_pct: Option<f32>,
     ) -> StintReading {
+        self.update_with_presence(session_time_secs, lap, true, in_pit_lane, in_pit_stall, lap_dist_pct)
+    }
+
+    /// The standings integration variant of [`Self::update`], where an
+    /// absent surface is kept distinct from a real observation off pit road.
+    #[cfg(test)]
+    fn update_with_presence(
+        &mut self,
+        session_time_secs: f64,
+        lap: i32,
+        in_world: bool,
+        in_pit_lane: bool,
+        in_pit_stall: bool,
+        lap_dist_pct: Option<f32>,
+    ) -> StintReading {
+        self.update_with_official(
+            session_time_secs,
+            lap,
+            None,
+            in_world,
+            in_pit_lane,
+            in_pit_stall,
+            lap_dist_pct,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "one normalized per-car telemetry sample plus its scorer count")]
+    fn update_with_official(
+        &mut self,
+        session_time_secs: f64,
+        lap: i32,
+        official_stops: Option<i32>,
+        in_world: bool,
+        in_pit_lane: bool,
+        in_pit_stall: bool,
+        lap_dist_pct: Option<f32>,
+    ) -> StintReading {
+        self.observe_official_stops(official_stops);
+        if !in_world {
+            // Once the car leaves observable telemetry, a later official
+            // increase cannot safely be assigned to an older drive-through.
+            self.pending_drive_throughs = 0;
+            self.observation_interrupted |= self.seen_in_world;
+            if self.was_in_pit_lane {
+                // Do not let an unobserved garage/driver-swap interval become
+                // stationary service time when the car next appears.
+                if let Some(since) = self.stopped_since.take() {
+                    self.stopped_total_secs += (self.last_tick_secs - since).max(0.0);
+                }
+                self.lane_visit_interrupted = true;
+            }
+            self.last_tick_secs = session_time_secs;
+            return self.reading(session_time_secs, lap);
+        }
+
+        if in_pit_lane && !self.was_in_pit_lane {
+            // Any scorer increment after a new visit begins belongs to newer
+            // activity; an older observed drive-through cannot claim it.
+            self.pending_drive_throughs = 0;
+        }
+        let resumed_after_gap = std::mem::take(&mut self.observation_interrupted);
+        // A delayed scorer update normally arrives after pit exit. Settle it
+        // against an earlier local outcome before this tick can begin another
+        // lane visit.
+        self.reconcile_official_stops(
+            session_time_secs,
+            lap,
+            in_pit_lane || self.was_in_pit_lane,
+            false,
+            resumed_after_gap,
+        );
+        let left_pit_lane = !in_pit_lane && self.was_in_pit_lane;
+        let mut visit_outcome = None;
         if in_pit_lane {
             let since_last_tick =
                 if self.was_in_pit_lane { (session_time_secs - self.last_tick_secs).max(0.0) } else { 0.0 };
@@ -4052,12 +4185,27 @@ impl StintState {
                 self.last_moved_secs = session_time_secs;
                 self.stopped_since = None;
                 self.stopped_total_secs = 0.0;
+                self.lane_visit_observed = self.seen_in_world && !resumed_after_gap;
                 self.blind_secs = 0.0;
+                self.stall_observed = in_pit_stall;
+                self.lane_visit_interrupted = false;
+                if resumed_after_gap {
+                    // Track -> absent -> box is a tow/garage transition, not
+                    // a witnessed stint boundary. Do not let a later genuine
+                    // stop turn the whole span into a fuel-range sample.
+                    self.current_start_observed = false;
+                }
+            } else if resumed_after_gap {
+                // Start motion/stationary inference afresh after the gap, so
+                // the unseen interval itself can never become service time.
+                self.anchor_pct = lap_dist_pct;
+                self.last_moved_secs = session_time_secs;
             }
             self.last_tick_secs = session_time_secs;
-            if lap_dist_pct.is_none() {
+            if lap_dist_pct.is_none() && !resumed_after_gap {
                 self.blind_secs += since_last_tick;
             }
+            self.stall_observed |= in_pit_stall;
             match (lap_dist_pct, self.anchor_pct) {
                 (Some(pct), Some(anchor)) if (pct - anchor).abs() > PIT_MOVED_PCT => {
                     self.anchor_pct = Some(pct);
@@ -4087,15 +4235,36 @@ impl StintState {
                 if let Some(since) = self.stopped_since.take() {
                     self.stopped_total_secs += (session_time_secs - since).max(0.0);
                 }
-                self.close_lane_visit(session_time_secs, lap);
+                visit_outcome = Some(self.close_lane_visit(session_time_secs, lap));
             }
             if self.current_start_secs.is_none() {
                 self.current_start_secs = Some(session_time_secs);
                 self.current_start_lap = Some(lap);
+                // A lap-zero baseline is the beginning of a race. Otherwise
+                // it is complete only when this tick is an observed exit from
+                // the initial garage, rather than the first tick received
+                // halfway through somebody's stint.
+                self.current_start_observed = lap <= 0 || (left_pit_lane && !resumed_after_gap);
             }
         }
         self.was_in_pit_lane = in_pit_lane;
+        self.seen_in_world = true;
 
+        if let Some(outcome) = visit_outcome {
+            self.record_lane_outcome(outcome);
+            self.reconcile_official_stops(
+                session_time_secs,
+                lap,
+                false,
+                matches!(outcome, LaneVisitOutcome::Stop),
+                false,
+            );
+        }
+
+        self.reading(session_time_secs, lap)
+    }
+
+    fn reading(&self, session_time_secs: f64, lap: i32) -> StintReading {
         StintReading {
             current_secs: self.current_start_secs.map_or(0.0, |s| (session_time_secs - s).max(0.0)),
             current_laps: self.current_start_lap.map_or(0, |l| (lap - l).max(0)),
@@ -4103,8 +4272,114 @@ impl StintState {
             avg_laps: lower_median_i32(self.completed.iter().map(|&(laps, _)| laps)),
             last_pit_secs: self.last_pit_secs,
             avg_pit_secs: lower_median_f64(self.pit_secs.iter().copied()),
-            completed_stops: i32::try_from(self.pit_count).unwrap_or(i32::MAX),
+            completed_stops: self.completed_stop_count(),
         }
+    }
+
+    /// Records only genuine scorer rows. The first is a baseline, not a fresh
+    /// stop; later monotonic increases are reconciled with lane outcomes.
+    fn observe_official_stops(&mut self, stops: Option<i32>) {
+        let Some(stops) = stops.map(|stops| stops.max(0)) else { return };
+        match self.official_stops_seen {
+            None => {
+                let local = i32::try_from(self.pit_count).unwrap_or(i32::MAX);
+                self.official_offset = (stops - local).max(0);
+                self.local_unscored = u32::try_from((local - stops).max(0)).unwrap_or(u32::MAX);
+                self.official_stops_seen = Some(stops);
+            }
+            Some(previous) if stops > previous => {
+                self.official_unmatched = self
+                    .official_unmatched
+                    .saturating_add(u32::try_from(stops - previous).unwrap_or(u32::MAX));
+                self.official_stops_seen = Some(stops);
+            }
+            _ => {}
+        }
+    }
+
+    fn record_lane_outcome(&mut self, outcome: LaneVisitOutcome) {
+        match outcome {
+            LaneVisitOutcome::Stop => {
+                // This boundary is newer than any earlier uncertain exit, so
+                // later confirmation may affect the count but must not rewind
+                // the current stint to that older boundary.
+                if let Some((_, _, reset_boundary)) = self.pending_uncertain_exit.as_mut() {
+                    *reset_boundary = false;
+                }
+                if self.official_unmatched > 0 {
+                    self.official_unmatched -= 1;
+                } else {
+                    self.local_unscored = self.local_unscored.saturating_add(1);
+                }
+            }
+            LaneVisitOutcome::DriveThrough => {
+                self.pending_drive_throughs = self.pending_drive_throughs.saturating_add(1);
+            }
+            LaneVisitOutcome::Uncertain { exit_secs, exit_lap } => {
+                self.pending_uncertain_exit = Some((exit_secs, exit_lap, true));
+            }
+            LaneVisitOutcome::Ignored => {}
+        }
+    }
+
+    /// Matches scorer increases to already-known events before treating one
+    /// as an otherwise invisible stop. Official-only events reset the current
+    /// boundary but never add range or service samples.
+    fn reconcile_official_stops(
+        &mut self,
+        session_time_secs: f64,
+        lap: i32,
+        lane_visit_active: bool,
+        current_boundary_just_reset: bool,
+        returned_after_gap: bool,
+    ) {
+        let locally_matched = self.official_unmatched.min(self.local_unscored);
+        self.official_unmatched -= locally_matched;
+        self.local_unscored -= locally_matched;
+
+        let drives_matched = self.official_unmatched.min(self.pending_drive_throughs);
+        self.official_unmatched -= drives_matched;
+        self.pending_drive_throughs -= drives_matched;
+        self.add_official_offset(drives_matched);
+
+        if self.official_unmatched > 0
+            && let Some((exit_secs, exit_lap, reset_boundary)) = self.pending_uncertain_exit.take()
+        {
+            self.official_unmatched -= 1;
+            self.add_official_offset(1);
+            if reset_boundary && !current_boundary_just_reset {
+                self.reset_from_official(exit_secs, exit_lap, true);
+            }
+        }
+
+        if self.official_unmatched == 0 || lane_visit_active {
+            return;
+        }
+        let unmatched = std::mem::take(&mut self.official_unmatched);
+        self.add_official_offset(unmatched);
+        if returned_after_gap && !current_boundary_just_reset {
+            self.reset_from_official(session_time_secs, lap, false);
+        }
+    }
+
+    fn add_official_offset(&mut self, stops: u32) {
+        self.official_offset = self
+            .official_offset
+            .saturating_add(i32::try_from(stops).unwrap_or(i32::MAX));
+    }
+
+    fn reset_from_official(&mut self, session_time_secs: f64, lap: i32, exit_observed: bool) {
+        self.current_start_secs = Some(session_time_secs);
+        self.current_start_lap = Some(lap);
+        self.current_start_observed = exit_observed;
+        self.last_pit_secs = None;
+    }
+
+    fn completed_stop_count(&self) -> i32 {
+        let local = self
+            .official_offset
+            .saturating_add(i32::try_from(self.pit_count).unwrap_or(i32::MAX));
+        self.official_stops_seen.map_or(local, |official| official.max(local))
     }
 
     /// Settles a finished pit-lane visit: a stop where the car spent
@@ -4122,24 +4397,37 @@ impl StintState {
     /// in it a stop for every car, a first "stint" one out-lap long, and from
     /// that a remaining-stop projection for the whole field that is pure
     /// noise.
-    fn close_lane_visit(&mut self, session_time_secs: f64, lap: i32) {
+    fn close_lane_visit(&mut self, session_time_secs: f64, lap: i32) -> LaneVisitOutcome {
         let stopped_secs = self.stopped_total_secs;
         let entered = self.lane_entered.take();
-        // Only a visit watched from end to end can be ruled a drive-through;
-        // one the sim gave us no position for is taken as a stop, which is
-        // what a pit-lane visit nearly always is. See
-        // [`POSITION_BLIND_TOLERANCE_SECS`].
-        let watched = self.blind_secs <= POSITION_BLIND_TOLERANCE_SECS;
         self.stopped_total_secs = 0.0;
-        self.blind_secs = 0.0;
         self.anchor_pct = None;
-        if watched && stopped_secs < MIN_STOP_SECS {
-            return;
+        let service_observed = stopped_secs >= MIN_STOP_SECS;
+        let blind_stop_inferred = self.blind_secs > POSITION_BLIND_TOLERANCE_SECS && !self.lane_visit_interrupted;
+        let service_time_uncertain =
+            self.lane_visit_interrupted || (self.blind_secs > POSITION_BLIND_TOLERANCE_SECS && !self.stall_observed);
+        self.blind_secs = 0.0;
+        // A visit first seen after the car vanished may be a tow or garage
+        // stay. A visit entered normally is still a stop when service was
+        // observed, or (as a conservative fallback for sparse rival data)
+        // when its whole continuous transit was position-blind.
+        if !self.lane_visit_observed && self.current_start_secs.is_none() {
+            return LaneVisitOutcome::Ignored;
+        }
+        if !self.lane_visit_observed {
+            return LaneVisitOutcome::Uncertain { exit_secs: session_time_secs, exit_lap: lap };
+        }
+        if !service_observed && !blind_stop_inferred {
+            return if self.lane_visit_interrupted {
+                LaneVisitOutcome::Uncertain { exit_secs: session_time_secs, exit_lap: lap }
+            } else {
+                LaneVisitOutcome::DriveThrough
+            };
         }
         let (Some((start_secs, start_lap)), Some((lane_secs, _))) =
             (self.current_start_secs.zip(self.current_start_lap), entered)
         else {
-            return;
+            return LaneVisitOutcome::Uncertain { exit_secs: session_time_secs, exit_lap: lap };
         };
         // Use exit-to-exit lap counts, matching the current stint's reset
         // below. Where the lane crosses the timing line, measuring to entry
@@ -4148,7 +4436,7 @@ impl StintState {
         // A stop a few laps in was for damage or a penalty, not fuel — see
         // `MIN_FUEL_STINT_LAPS`. It stays a stop; it just says nothing about
         // the car's range.
-        if stint_laps >= MIN_FUEL_STINT_LAPS {
+        if !self.lane_visit_interrupted && self.current_start_observed && stint_laps >= MIN_FUEL_STINT_LAPS {
             if self.completed.len() >= STINT_SAMPLES {
                 self.completed.pop_front();
             }
@@ -4157,7 +4445,7 @@ impl StintState {
         // An unwatched visit can reset the stint without supplying a service
         // measurement. Recording zero here makes NET price later stops as
         // drive-throughs immediately after the first such visit.
-        self.last_pit_secs = (stopped_secs >= MIN_STOP_SECS).then_some(stopped_secs);
+        self.last_pit_secs = (service_observed && !service_time_uncertain).then_some(stopped_secs);
         if let Some(measured_secs) = self.last_pit_secs {
             if self.pit_secs.len() >= STINT_SAMPLES {
                 self.pit_secs.pop_front();
@@ -4167,6 +4455,8 @@ impl StintState {
         self.pit_count = self.pit_count.saturating_add(1);
         self.current_start_secs = Some(session_time_secs);
         self.current_start_lap = Some(lap);
+        self.current_start_observed = true;
+        LaneVisitOutcome::Stop
     }
 }
 
@@ -4290,16 +4580,27 @@ struct StintTracker {
 }
 
 impl StintTracker {
+    #[expect(clippy::too_many_arguments, reason = "one normalized per-car telemetry sample")]
     fn update(
         &mut self,
         car_idx: i32,
         session_time_secs: f64,
         lap: i32,
+        official_stops: Option<i32>,
+        in_world: bool,
         in_pit_lane: bool,
         in_pit_stall: bool,
         lap_dist_pct: Option<f32>,
     ) -> StintReading {
-        self.cars.entry(car_idx).or_default().update(session_time_secs, lap, in_pit_lane, in_pit_stall, lap_dist_pct)
+        self.cars.entry(car_idx).or_default().update_with_official(
+            session_time_secs,
+            lap,
+            official_stops,
+            in_world,
+            in_pit_lane,
+            in_pit_stall,
+            lap_dist_pct,
+        )
     }
 }
 
@@ -6097,6 +6398,207 @@ mod tests {
         assert_eq!(reading.avg_pit_secs, None, "missing service must not become a zero-second stop");
     }
 
+    /// Per-car position can disappear only while the rival is at its box.
+    /// The known lane entry and exit still make this one continuous visit;
+    /// dropping it would leave the old stint running indefinitely.
+    #[test]
+    fn a_continuous_lane_visit_with_position_missing_during_service_still_resets_once() {
+        let mut stint = StintState::default();
+        stint.update_with_presence(0.0, 0, true, true, true, None);
+        stint.update_with_presence(30.0, 0, true, false, false, Some(0.05));
+        stint.update_with_presence(800.0, 8, true, false, false, Some(0.90));
+        stint.update_with_presence(810.0, 8, true, true, false, Some(0.97));
+        stint.update_with_presence(815.0, 8, true, true, false, None);
+        stint.update_with_presence(835.0, 8, true, true, false, None);
+        let reading = stint.update_with_presence(845.0, 8, true, false, false, Some(0.01));
+
+        assert_eq!(reading.completed_stops, 1);
+        assert_eq!(reading.current_laps, 0);
+        assert_eq!(reading.avg_laps, Some(8), "known boundaries still provide an exit-to-exit range");
+        assert_eq!(reading.last_pit_secs, None, "blind time cannot become a measured service duration");
+    }
+
+    /// `NotInWorld` is absence, not an off-pit-road tick. Closing on it used
+    /// to split one driver-swap/repair visit and count it twice.
+    #[test]
+    fn a_not_in_world_gap_inside_an_observed_stop_does_not_split_or_time_the_gap() {
+        let mut stint = StintState::default();
+        stint.update_with_presence(0.0, 0, true, true, true, None);
+        stint.update_with_presence(30.0, 0, true, false, false, Some(0.05));
+        stint.update_with_presence(800.0, 8, true, false, false, Some(0.90));
+        stint.update_with_presence(810.0, 8, true, true, false, Some(0.97));
+        stint.update_with_presence(815.0, 8, true, true, true, Some(0.99));
+        stint.update_with_presence(825.0, 8, true, true, true, Some(0.99));
+        stint.update_with_presence(830.0, 8, false, false, false, None);
+        stint.update_with_presence(850.0, 8, true, true, true, Some(0.99));
+        let reading = stint.update_with_presence(860.0, 8, true, false, false, Some(0.01));
+
+        assert_eq!(reading.completed_stops, 1, "the one entered visit settles once");
+        assert_eq!(reading.current_laps, 0);
+        assert_eq!(reading.avg_laps, None, "an interrupted visit cannot teach a fuel range");
+        assert_eq!(reading.last_pit_secs, None, "partial observed time is not the full service time");
+    }
+
+    /// A tow has no witnessed pit entry. Reappearing in the box and later
+    /// leaving it must not make the car look freshly out of a racing stop.
+    #[test]
+    fn a_tow_from_track_to_garage_does_not_reset_or_poison_the_next_range() {
+        let mut stint = StintState::default();
+        stint.update_with_presence(0.0, 0, true, false, false, Some(0.10));
+        stint.update_with_presence(800.0, 8, true, false, false, Some(0.80));
+        stint.update_with_presence(805.0, 8, false, false, false, None);
+        stint.update_with_presence(900.0, 8, true, true, true, Some(0.99));
+        stint.update_with_presence(930.0, 8, true, true, true, Some(0.99));
+        let after_tow = stint.update_with_presence(940.0, 8, true, false, false, Some(0.01));
+
+        assert_eq!(after_tow.completed_stops, 0);
+        assert_eq!(after_tow.current_laps, 8, "garage departure is not a racing pit-exit reset");
+
+        stint.update_with_presence(1700.0, 17, true, true, true, Some(0.99));
+        let after_real_stop = stint.update_with_presence(1730.0, 17, true, false, false, Some(0.01));
+        assert_eq!(after_real_stop.completed_stops, 1, "the later observed stop still counts");
+        assert_eq!(after_real_stop.avg_laps, None, "the span across the tow is not a fuel stint");
+    }
+
+    /// Attaching the overlay midway through somebody's stint gives only its
+    /// tail. It can count the first observed stop, but not call that tail the
+    /// car's typical fuel range.
+    #[test]
+    fn a_first_partial_mid_race_stint_is_excluded_from_range_history() {
+        let mut stint = StintState::default();
+        stint.update_with_presence(1000.0, 10, true, false, false, Some(0.50));
+        stint.update_with_presence(1600.0, 17, true, true, true, Some(0.99));
+        let reading = stint.update_with_presence(1630.0, 17, true, false, false, Some(0.01));
+
+        assert_eq!(reading.completed_stops, 1);
+        assert_eq!(reading.avg_laps, None, "seven observed laps are not necessarily a seven-lap tank");
+        assert_eq!(reading.current_laps, 0);
+    }
+
+    #[test]
+    fn a_late_attach_baseline_plus_a_local_stop_is_shown_before_the_scorer_catches_up() {
+        let mut stint = StintState::default();
+        stint.update_with_official(1000.0, 10, Some(2), true, false, false, Some(0.5));
+        stint.update_with_official(1600.0, 17, Some(2), true, true, true, Some(0.99));
+        let exit = stint.update_with_official(1630.0, 17, Some(2), true, false, false, Some(0.01));
+
+        assert_eq!(exit.completed_stops, 3, "two historical stops plus the one just observed");
+        assert_eq!(exit.current_laps, 0);
+
+        let scored = stint.update_with_official(1700.0, 18, Some(3), true, false, false, Some(0.5));
+        assert_eq!(scored.completed_stops, 3, "the delayed scorer update acknowledges rather than duplicates it");
+        assert_eq!(scored.current_laps, 1, "the delayed count must not reset the stint twice");
+    }
+
+    #[test]
+    fn a_stop_scored_while_in_the_stall_still_resets_once_at_exit() {
+        let mut stint = StintState::default();
+        stint.update_with_official(0.0, 0, Some(0), true, false, false, Some(0.1));
+        stint.update_with_official(800.0, 8, Some(0), true, true, false, Some(0.97));
+        stint.update_with_official(810.0, 8, Some(1), true, true, true, Some(0.99));
+        stint.update_with_official(830.0, 8, Some(1), true, true, true, Some(0.99));
+        let exit = stint.update_with_official(840.0, 8, Some(1), true, false, false, Some(0.01));
+
+        assert_eq!(exit.completed_stops, 1);
+        assert_eq!(exit.current_laps, 0);
+        assert_eq!(exit.avg_laps, Some(8), "direct evidence still teaches the observed range");
+    }
+
+    #[test]
+    fn a_delayed_official_count_confirms_an_interrupted_exit_without_teaching_history() {
+        let mut stint = StintState::default();
+        stint.update_with_official(0.0, 0, Some(0), true, false, false, Some(0.1));
+        stint.update_with_official(800.0, 8, Some(0), true, true, false, Some(0.97));
+        stint.update_with_official(810.0, 8, Some(0), false, false, false, None);
+        stint.update_with_official(830.0, 8, Some(0), true, true, false, Some(0.99));
+        let uncertain = stint.update_with_official(840.0, 8, Some(0), true, false, false, Some(0.01));
+        assert_eq!(uncertain.completed_stops, 0);
+        assert_eq!(uncertain.current_laps, 8, "the interrupted visit is not guessed before confirmation");
+
+        let confirmed = stint.update_with_official(900.0, 9, Some(1), true, false, false, Some(0.5));
+        assert_eq!(confirmed.completed_stops, 1);
+        assert_eq!(confirmed.current_laps, 1, "the known exit boundary is applied when the scorer confirms it");
+        assert_eq!(confirmed.avg_laps, None);
+        assert_eq!(confirmed.last_pit_secs, None);
+    }
+
+    #[test]
+    fn an_offline_official_stop_resets_current_state_but_cannot_teach_the_next_range() {
+        let mut stint = StintState::default();
+        stint.update_with_official(0.0, 0, Some(0), true, false, false, Some(0.1));
+        stint.update_with_official(800.0, 8, Some(1), false, false, false, None);
+        let returned = stint.update_with_official(900.0, 9, Some(1), true, false, false, Some(0.5));
+        assert_eq!(returned.completed_stops, 1);
+        assert_eq!(returned.current_laps, 0);
+
+        stint.update_with_official(1600.0, 17, Some(1), true, true, true, Some(0.99));
+        let next_exit = stint.update_with_official(1630.0, 17, Some(1), true, false, false, Some(0.01));
+        assert_eq!(next_exit.completed_stops, 2);
+        assert_eq!(next_exit.avg_laps, None, "an approximate post-offline start cannot become a fuel-range sample");
+    }
+
+    #[test]
+    fn a_first_official_count_below_the_local_count_does_not_erase_the_stop() {
+        let mut stint = StintState::default();
+        stint.update_with_official(0.0, 0, None, true, false, false, Some(0.1));
+        stint.update_with_official(700.0, 8, None, true, true, true, Some(0.99));
+        let local = stint.update_with_official(730.0, 8, None, true, false, false, Some(0.01));
+        assert_eq!(local.completed_stops, 1);
+
+        let stale = stint.update_with_official(800.0, 9, Some(0), true, false, false, Some(0.5));
+        assert_eq!(stale.completed_stops, 1, "a first stale scorer row is a baseline, not a rollback");
+        let caught_up = stint.update_with_official(900.0, 10, Some(1), true, false, false, Some(0.7));
+        assert_eq!(caught_up.completed_stops, 1);
+        assert_eq!(caught_up.current_laps, 2, "catch-up must not reset the already observed boundary");
+    }
+
+    #[test]
+    fn an_observed_drive_through_never_resets_the_fuel_stint_when_officially_counted() {
+        let mut stint = StintState::default();
+        stint.update_with_official(0.0, 0, Some(0), true, false, false, Some(0.1));
+        stint.update_with_official(700.0, 8, Some(0), true, true, false, Some(0.97));
+        stint.update_with_official(710.0, 8, Some(0), true, true, false, Some(0.98));
+        stint.update_with_official(720.0, 8, Some(0), true, true, false, Some(0.99));
+        stint.update_with_official(730.0, 8, Some(0), true, false, false, Some(0.01));
+        let scored = stint.update_with_official(800.0, 9, Some(1), true, false, false, Some(0.5));
+
+        assert_eq!(scored.completed_stops, 1, "the official convention still controls the displayed count");
+        assert_eq!(scored.current_laps, 9, "a known nonstop transit does not start a new fuel stint");
+        assert_eq!(scored.avg_laps, None);
+    }
+
+    #[test]
+    fn an_old_drive_through_cannot_claim_the_score_for_a_later_real_stop() {
+        let mut stint = StintState::default();
+        stint.update_with_official(0.0, 0, Some(0), true, false, false, Some(0.1));
+        stint.update_with_official(700.0, 8, Some(0), true, true, false, Some(0.97));
+        stint.update_with_official(710.0, 8, Some(0), true, true, false, Some(0.98));
+        stint.update_with_official(720.0, 8, Some(0), true, false, false, Some(0.01));
+
+        // The next pit entry expires that earlier drive-through credit. This
+        // scorer increase belongs to the real stop now in progress.
+        stint.update_with_official(1500.0, 17, Some(1), true, true, true, Some(0.99));
+        stint.update_with_official(1525.0, 17, Some(1), true, true, true, Some(0.99));
+        let exit = stint.update_with_official(1530.0, 17, Some(1), true, false, false, Some(0.01));
+
+        assert_eq!(exit.completed_stops, 1, "one scored real stop must not become drive-through offset plus local stop");
+        assert_eq!(exit.current_laps, 0);
+        assert_eq!(exit.avg_laps, Some(17));
+    }
+
+    #[test]
+    fn an_official_correction_while_continuously_on_track_preserves_the_stint_boundary() {
+        let mut stint = StintState::default();
+        stint.update_with_official(0.0, 0, Some(0), true, false, false, Some(0.1));
+        stint.update_with_official(700.0, 8, Some(0), true, true, true, Some(0.99));
+        stint.update_with_official(730.0, 8, Some(0), true, false, false, Some(0.01));
+
+        let corrected = stint.update_with_official(800.0, 9, Some(2), true, false, false, Some(0.5));
+        assert_eq!(corrected.completed_stops, 2, "the scorer still controls the completed total");
+        assert_eq!(corrected.current_laps, 1, "an on-track correction is not a fresh pit exit");
+        assert_eq!(corrected.avg_laps, Some(8), "existing observed range history is retained");
+    }
+
     #[test]
     fn a_blind_stop_preserves_the_previous_service_estimate() {
         let mut stint = StintState::default();
@@ -6543,21 +7045,39 @@ mod tests {
     fn a_new_session_starts_from_a_clean_history() {
         let mut trackers = SessionTrackers::default();
         trackers.sync_to_session(Some(1));
-        trackers.stint.update(0, 0.0, 0, true, true, None);
-        trackers.stint.update(0, 30.0, 0, false, false, None);
-        trackers.stint.update(0, 300.0, 3, true, true, None);
-        trackers.stint.update(0, 340.0, 3, false, false, None);
+        trackers.stint.update(0, 0.0, 0, None, true, true, true, None);
+        trackers.stint.update(0, 30.0, 0, None, true, false, false, None);
+        trackers.stint.update(0, 300.0, 3, None, true, true, true, None);
+        trackers.stint.update(0, 340.0, 3, None, true, false, false, None);
         trackers.multi_stop_race = true;
         assert_eq!(
-            trackers.stint.update(0, 400.0, 4, false, false, None).completed_stops,
+            trackers.stint.update(0, 400.0, 4, None, true, false, false, None).completed_stops,
             1,
             "the practice stop is real"
         );
 
         trackers.sync_to_session(Some(2));
-        assert_eq!(trackers.stint.update(0, 0.0, 0, false, false, None).completed_stops, 0);
+        assert_eq!(trackers.stint.update(0, 0.0, 0, None, true, false, false, None).completed_stops, 0);
         assert!(!trackers.multi_stop_race);
         assert_eq!(trackers.player_pace.update(1, 80.0, false), Some(80.0), "pace is measured afresh too");
+    }
+
+    #[test]
+    fn a_temporarily_missing_session_number_preserves_the_current_session() {
+        let mut trackers = SessionTrackers::default();
+        trackers.sync_to_session(Some(2));
+        trackers.stint.update(0, 0.0, 0, None, true, false, false, Some(0.1));
+        trackers.stint.update(0, 700.0, 8, None, true, true, true, Some(0.99));
+        trackers.stint.update(0, 730.0, 8, None, true, false, false, Some(0.01));
+
+        trackers.sync_to_session(None);
+        trackers.sync_to_session(Some(2));
+
+        assert_eq!(
+            trackers.stint.update(0, 800.0, 9, None, true, false, false, Some(0.5)).completed_stops,
+            1,
+            "an unavailable SessionNum sample is not a session change"
+        );
     }
 
     /// The projection divides the session clock by this, so a single slow lap

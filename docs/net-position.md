@@ -26,7 +26,9 @@ re-enters the projection when it returns. These ranks assume absent cars do not
 resume racing. NET is withheld for a class during an ongoing pit visit or when an active contender has
 no usable live progress. This avoids charging an unfinished stop twice or
 presenting a missing car as zero seconds behind. It resumes when the inputs are
-usable. Stops borrowed from class history are also shown in the Stops column.
+usable. Borrowed stint history may supply a remaining-stop forecast for NET and
+the **STOPS TO GO** footer. The per-car **Stops** column always shows completed
+stops observed in the session.
 
 ## Limits and validation
 

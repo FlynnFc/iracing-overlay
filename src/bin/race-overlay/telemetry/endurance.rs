@@ -113,14 +113,6 @@ pub fn stops_remaining(laps_left: i32, stint_laps_so_far: i32, avg_stint_laps: i
     Some(1 + (laps_needing_a_stop - 1) / avg_stint_laps)
 }
 
-/// Laps of fuel kept in hand when deciding the last lap to pit on.
-///
-/// Half a lap: enough that the "box this lap" call fires while there is still
-/// a lap's fuel to reach the pits on, not once the tank is already dry. Small
-/// deliberately — the call names the *last* lap you can pit on, so a large
-/// reserve would call the stop a lap early and defeat the point.
-const BOX_RESERVE_LAPS: f32 = 0.5;
-
 /// Whether the fuel margin makes the current lap the one to pit on.
 ///
 /// The "box this lap" trigger behind the black box's BOX BOX border. It is
@@ -129,23 +121,27 @@ const BOX_RESERVE_LAPS: f32 = 0.5;
 /// the call is a settled "turn in at the end of this lap" rather than a
 /// first-corner guess there is still time to reconsider.
 ///
-/// `fuel_litres` and `burn_per_lap` come from the tank and the measured
-/// rolling burn; `lap_fraction` is how far round the current lap the car is
-/// (0.0 at the line, ~1.0 approaching it). Returns `false` with no measured
+/// `fuel_litres` comes from the live tank and `burn_per_lap` is the highest
+/// consumption among the five most recent racing laps. `lap_fraction` is the
+/// time-weighted fraction of the current lap already driven (0.0 at the line,
+/// 1.0 approaching it). Returns `false` with invalid inputs or no measured
 /// burn — a made-up "box now" is the one false instruction that costs a race.
 #[must_use]
 pub fn box_this_lap(fuel_litres: f32, burn_per_lap: Option<f32>, lap_fraction: f32) -> bool {
-    let Some(burn) = burn_per_lap.filter(|burn| *burn > 0.0) else {
+    let Some(burn) = burn_per_lap.filter(|burn| burn.is_finite() && *burn > 0.0) else {
         return false;
     };
-    if lap_fraction < 0.5 {
+    if !fuel_litres.is_finite()
+        || fuel_litres < 0.0
+        || !lap_fraction.is_finite()
+        || !(0.5..=1.0).contains(&lap_fraction)
+    {
         return false;
     }
     let laps_of_fuel = fuel_litres / burn;
-    // Fuel to finish this lap plus one more, kept above the reserve. Below
-    // that, another lap after this one would run under the reserve, so this
-    // lap is the one to pit on.
-    let laps_to_finish_the_next = (1.0 - lap_fraction) + 1.0 + BOX_RESERVE_LAPS;
+    // Fuel to finish this lap plus one complete lap after it. An exact fit can
+    // run the extra lap, so only a genuine shortfall makes this the lap to pit.
+    let laps_to_finish_the_next = (1.0 - lap_fraction) + 1.0;
     laps_of_fuel < laps_to_finish_the_next
 }
 
@@ -263,6 +259,18 @@ mod tests {
     }
 
     #[test]
+    fn box_this_lap_rejects_invalid_telemetry() {
+        assert!(!box_this_lap(f32::NAN, Some(2.0), 0.9));
+        assert!(!box_this_lap(f32::INFINITY, Some(2.0), 0.9));
+        assert!(!box_this_lap(-1.0, Some(2.0), 0.9));
+        assert!(!box_this_lap(2.0, Some(f32::NAN), 0.9));
+        assert!(!box_this_lap(2.0, Some(f32::INFINITY), 0.9));
+        assert!(!box_this_lap(2.0, Some(2.0), f32::NAN));
+        assert!(!box_this_lap(2.0, Some(2.0), -0.1));
+        assert!(!box_this_lap(2.0, Some(2.0), 1.1));
+    }
+
+    #[test]
     fn box_this_lap_waits_for_the_back_half_of_the_lap() {
         // One lap of fuel left (2 L at 2 L/lap): a definite stop this lap.
         assert!(!box_this_lap(2.0, Some(2.0), 0.4), "not yet — still the front half");
@@ -270,16 +278,27 @@ mod tests {
     }
 
     #[test]
-    fn box_this_lap_stays_dark_with_fuel_for_another_lap() {
-        // Plenty in the tank (three laps' worth): no call even late in the lap.
-        assert!(!box_this_lap(6.0, Some(2.0), 0.95));
+    fn box_this_lap_stays_dark_when_another_lap_exactly_fits() {
+        // At 90% round, 2.2 L exactly covers the remaining 0.1 lap and the
+        // complete lap after it at 2 L/lap.
+        assert!(!box_this_lap(2.2, Some(2.0), 0.9));
     }
 
     #[test]
     fn box_this_lap_fires_when_the_next_lap_would_run_dry() {
-        // 2.6 L at 2 L/lap is 1.3 laps: finishing this lap (0.1 to go) leaves
-        // ~1.2, under the 1 + 0.5 reserve needed for another — so box now.
-        assert!(box_this_lap(2.6, Some(2.0), 0.9));
+        // At 90% round, anything below 2.2 L cannot finish this lap and one
+        // complete lap after it.
+        assert!(box_this_lap(2.19, Some(2.0), 0.9));
+    }
+
+    #[test]
+    fn box_this_lap_advances_to_the_actual_last_viable_lap() {
+        // With 2.6 L late in this lap, the car can still run the next lap, so
+        // the call stays dark. After crossing the line and burning into that
+        // final lap, it waits for the back-half gate and then calls the stop.
+        assert!(!box_this_lap(2.6, Some(2.0), 0.9));
+        assert!(!box_this_lap(2.2, Some(2.0), 0.1));
+        assert!(box_this_lap(1.4, Some(2.0), 0.5));
     }
 
     #[test]

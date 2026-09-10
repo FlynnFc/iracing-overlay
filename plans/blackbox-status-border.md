@@ -81,14 +81,17 @@ default, argued above.
 
 Two independent triggers, OR'd into the Box state:
 
-**Auto, from the fuel calc.** The pit window already knows the last lap the
-tank reaches (`telemetry/pit_window.rs`, `endurance::laps_remaining`, and the
-per-lap burn). The call is: *this is the lap you must pit on, and you are
-committed to it.* So it lights when
+**Auto, from the fuel calc.** The call compares the live tank level with the
+highest consumption among the five most recent racing laps. It means: *this
+is the lap you must pit on, and you are committed to it.* So it lights when
 
-- the current lap is the last the fuel margin allows before the tank runs
-  under its reserve, **and**
+- the tank cannot finish the current lap and one complete additional lap
+  (an exact fit remains dark), **and**
 - you are **past half way round it** (`fuel_use.lap_fraction >= 0.5`).
+
+There is no extra fuel reserve in the call threshold. The measured burn is
+already conservative because it selects the highest recent racing-lap use;
+adding another half lap here made BOX BOX appear one lap early.
 
 The half-lap gate is the point you raised: early in the lap there is still a
 decision to make (save harder, reassess), but once you are through the lap's
@@ -97,10 +100,10 @@ when the border lights and the driver commits to the pit entry. It clears the
 moment the car is on pit road or the stop is taken (`pit_service.on_pit_road`,
 or the lap counter advancing past a completed stop).
 
-Honest-or-silent, like every projection here: with no measured burn yet, or
-under caution where the burn figure is meaningless, there is no auto call —
-the border simply doesn't light. A made-up "box now" is the one false
-instruction that actually costs a race.
+Honest-or-silent, like every projection here: with no measured burn yet or an
+invalid tank, burn, or lap-fraction reading, there is no auto call — the
+border simply doesn't light. A made-up "box now" is the one false instruction
+that actually costs a race.
 
 **Manual, from the Strategy tab.** A `Call BOX BOX` toggle on the pit-window
 page (a new `Control::BoxBox`), so a spectator or the driver can raise the
