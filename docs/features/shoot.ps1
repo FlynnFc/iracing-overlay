@@ -9,9 +9,11 @@
 #
 # Usage:  powershell -ExecutionPolicy Bypass -File docs/features/shoot.ps1
 
+param([string]$Binary = '', [string[]]$Only = @())
+
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$exe = Join-Path $root 'target/release/race-overlay.exe'
+$exe = if ($Binary) { $Binary } else { Join-Path $root 'target/release/race-overlay.exe' }
 $outDir = Join-Path $PSScriptRoot 'img'
 $scratch = Join-Path $env:TEMP 'race-overlay-shots'
 
@@ -102,6 +104,7 @@ function Invoke-Trim {
 function Invoke-Shot {
   param([string]$Name, [string]$Panel, [string]$Page = '', [string]$State = '',
         [string]$PanelLines = '', [string]$Tables = '', [string]$Top = '', [double]$Scale = 1.0)
+  if ($Only.Count -gt 0 -and $Name -notin $Only) { return }
   Write-Host "shooting $Name"
   Write-ShotConfig -Visible $Panel -PanelLines $PanelLines -Tables $Tables -Top $Top -Scale $Scale
   $png = Join-Path $outDir "$Name.png"
@@ -132,6 +135,7 @@ try {
   Invoke-Shot -Name 'relative-box'        -Panel relative -State 'box'
   Invoke-Shot -Name 'relative-spectating' -Panel relative -State 'spectating'
   Invoke-Shot -Name 'relative-teammate'   -Panel relative -State 'teammate'
+  Invoke-Shot -Name 'relative-outlap'     -Panel relative -State 'outlap'
   Invoke-Shot -Name 'relative-grid'       -Panel relative -State 'grid'
   Invoke-Shot -Name 'relative-danger'     -Panel relative -Tables "[danger]`n1000 = 'severe'`n1002 = 'warning'`n1004 = 'caution'"
   Invoke-Shot -Name 'relative-fueltarget' -Panel relative -State 'spectating,sync'
@@ -155,7 +159,13 @@ try {
   Invoke-Shot -Name 'standings-default'   -Panel standings
   Invoke-Shot -Name 'standings-tyres'     -Panel standings -PanelLines "show_tyres = true`nshow_stint_laps = true"
   Invoke-Shot -Name 'standings-endurance' -Panel standings -PanelLines "endurance_mode = 'on'"
+  Invoke-Shot -Name 'standings-next'      -Panel standings -PanelLines "endurance_mode = 'on'`ngap_mode = 'next-classified'"
+  Invoke-Shot -Name 'standings-tow'       -Panel standings -State 'tow'
   Invoke-Shot -Name 'standings-oneclass'  -Panel standings -PanelLines "show_other_classes = false"
+  Invoke-Shot -Name 'standings-full'      -Panel standings -State 'spectating' -PanelLines "spectator_full = true`nfull_rows = 8`nshow_other_classes = true"
+  Invoke-Shot -Name 'standings-estimated' -Panel standings -State 'spectating,estimated' -PanelLines "spectator_full = true`nfull_rows = 8`nshow_other_classes = false"
+  Invoke-Shot -Name 'standings-auto'      -Panel standings -PanelLines "gap_mode = 'auto'`ngap_auto_seconds = 5"
+  Invoke-Shot -Name 'standings-team-strength' -Panel standings -State 'spectating,team-strength' -PanelLines "spectator_full = true`nfull_rows = 8`nshow_other_classes = false"
   Invoke-Shot -Name 'radar-default'       -Panel radar -Scale 0.6
   Invoke-Shot -Name 'radar-numbers'       -Panel radar -Scale 0.6 -PanelLines "show_numbers = true"
   Invoke-Shot -Name 'fasterclass-default' -Panel fasterclass

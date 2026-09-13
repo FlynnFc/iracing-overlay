@@ -152,6 +152,11 @@ programs when the overlay starts** to get the same from double-clicking
   window's Binds page, or by `--bind <action>` for scripting). Created
   automatically on first run/drag; no need to hand-author it.
 
+  Changes merge against the latest file, so another overlay or `--bind` process cannot undo unrelated
+  settings. Writes use a process lock and atomic replacement, retry after a save failure, and flush on
+  normal exit. A save failure appears in Settings. `race-overlay.exe --check-config` diagnoses loading
+  and reports the Relative layout and bind count without printing the relay URL or invite.
+
   Deliberately outside the repo: it used to live beside the exe in
   `target\release`, where a `cargo clean` — or deleting `target\` to force a
   rebuild — took every bind and panel position with it. An older file found
@@ -185,6 +190,27 @@ programs when the overlay starts** to get the same from double-clicking
   player isn't in, each showing just its leader. Off, the panel is the
   player's own class alone.
 
+  `[standings] spectator_full` (`false`) expands the table while watching a
+  spectator camera or a team-mate drive. The expanded view includes every
+  classified car in the selected class sections: the watched class alone by
+  default, or every class when `show_other_classes` is on. Its headings stay
+  fixed above one shared scroll area, so the driver, timing, strategy and
+  status columns remain aligned. Click **FULL** in the interactive standings
+  heading to change the saved choice; it becomes **COMPACT** while expanded.
+  `[standings] full_rows` (`16`, clamped from `8` to `30`) controls how many
+  driver rows fit before the panel scrolls.
+
+  `[standings] gap_mode` is `"leader"`, `"next-classified"`, or `"auto"`. Auto alternates GAP and INT
+  every `[standings] gap_auto_seconds` (`5`, clamped from `1` through `120`) and marks the live heading
+  **AUTO**. Settings → Standings → Content selects the mode and enables the interval control for Auto;
+  clicking the GAP/INT/AUTO heading cycles all three. INT compares consecutive classified cars in the same
+  class, including cars on different laps.
+
+  An unrendered car keeps its official scored position if live position data is unavailable. `TOW`
+  requires a positive `PlayerCarTowTime` for the player's own car and shows time remaining. No rival
+  tow is inferred from a renderer blink or disconnect. Relative still requires current nearby-car data;
+  it does not invent a live relative gap for an absent car.
+
   `show_off_tracks` (`true`) counts each car's trips off the track and
   shows the tally in the Standings and Relative gutters: the skid mark lights
   orange while a car is off, and stays as a quiet chip with the count once it
@@ -194,6 +220,15 @@ programs when the overlay starts** to get the same from double-clicking
   iRacing profile — before their name in the Standings and Relative. A
   driver who hasn't picked one gets an empty slot, so names stay in one
   column. Also on the General page.
+
+  In a team race, the iRating pill can carry one to three tiny chevrons. Green
+  up chevrons mean the current driver ranks stronger within drivers seen for
+  that entry's team; red down chevrons mean the reverse. The rank starts from
+  iRating, then uses clean completed-stint average pace once at least two
+  known drivers have measured stints. Hover the rating for the current rank,
+  basis, and every known team driver with their iRating and clean average when
+  available. The list says **drivers seen so far** because iRacing does not
+  publish a full team roster; a solo or unranked entry shows no extreme mark.
 
   `[blackbox] tyre_bars` (`"temps"`) is what the three bars on each wheel of
   the Tires page show, from the last stop: `"temps"` for the carcass
@@ -205,12 +240,30 @@ programs when the overlay starts** to get the same from double-clicking
   length, in laps, beside its stint bar in the strategy band. The **Stops**
   column counts completed pit stops: one completed service reads `1`.
 
+  A plain stint value and solid bar are observed. `~12` is one inferred age;
+  `~9–15` is an inferred range, and its bar is hatched. `?` means no
+  observed or defensible inferred boundary exists. Hover an inferred row to
+  see whether lap timing, a driver change, or a strategy prior supplied the
+  estimate. A driver change establishes a service visit, not fuelling; a
+  strategy prior explicitly assumes typical refills. Completed stops remain
+  observed counts in every case.
+
   `[standings] endurance_mode` is `"auto"` by default: the strategy band
   (stint, completed stops, projected net position) appears once a race is
   seen to need more than one stop. `"on"` also shows stint and stop counts
   in practice; `"off"` hides the band. The summary below appears in races
   regardless of this setting and labels future estimates **STOPS TO GO**.
   Practice and qualifying never project stops to the end of their timer.
+
+  NET estimates class order after all expected stops through the race finish. `~NET` indicates that a
+  class projection depends on scoring data for an unrendered car or an inferred stint boundary. When
+  remaining stops have a range, the summary prints that range; a NET result can stay withheld until it
+  resolves. Unknown progress or an ongoing pit visit can also withhold NET until the evidence is usable. See [NET calculation](net-position.md) and
+  [stint tracking](stint-tracking.md) for assumptions.
+
+  Relative's `OUT` badge lasts from a confirmed pit exit to the next lap crossing. A car blinking out
+  alone cannot trigger it. SOF is latched from the available session roster and stays fixed for that
+  session; it is an estimate, not a downloaded official results value.
 
   Every widget is laid out at the exact pixel size of its design mockup, so
   `scale = 1.0` reproduces the design. Set a panel's `scale` to resize it —
@@ -232,6 +285,20 @@ programs when the overlay starts** to get the same from double-clicking
   default pick per brand. Add a brand by dropping in
   `<lowercase-hyphenated-name>.svg`; cars with no matching file fall back to
   a short text abbreviation. See [`assets/logos/README.md`](assets/logos/README.md).
+
+## Team sync before an endurance race
+
+Every member should run the same build (sync protocol 8). Use the Copy/Paste controls or Ctrl+A/C/V/X
+for the relay URL and invite. Changing either reconnects. Only the seated driver publishes private fuel
+and tyre readings; they disappear from spectator pages after five seconds without fresh data. A teammate
+watching the team car receives the same synced pages as a spectator. Watching a different car cannot show
+the team car's tank under that car's name.
+
+The relay and surviving clients retain the shared ledger in memory. Rejoining clients request missing
+history; a surviving replica can repair a restarted relay. Recovered commands never operate the pit box,
+and live commands expire after two seconds. Practice, qualifying and race use separate rooms.
+Rival public stop/stint history remains local, and a simultaneous restart of all holders loses shared
+history. Run the [live rehearsal checklist](endurance-audit.md#live-rehearsal) before the event.
 
 ## Comparing against the design mockups
 

@@ -31,11 +31,13 @@ use super::{
     format_minutes_seconds, format_session_length, icons, lap_text, logos, margin, paint_hatch, paint_text, readout,
     row_stripe, table_card_rounding, text_primary, text_secondary, text_tertiary, text_width, tint,
 };
-use crate::config::{EnduranceMode, StandingsConfig};
+use crate::config::{EnduranceMode, StandingsConfig, StandingsGapMode};
 use crate::telemetry::snapshot::{
     ClassSection, EnduranceMeta, GridStatus, SessionKind, StandingsEntry, TelemetrySnapshot,
 };
 use crate::telemetry::standings::windowed_class_positions;
+use crate::telemetry::stint_estimation::{EstimateBasis, StintAge};
+use crate::telemetry::team_driver_pace::{KnownTeamDriver, StrengthBasis, TeamDriverStrength};
 
 /// A class id no car can have, standing in for "the player isn't classified
 /// yet", so no class matches and every one falls to its leaders-only view.
@@ -118,11 +120,11 @@ const STINT_X: f32 = 12.0;
 const STINT_BAR_SIZE: (f32, f32) = (56.0, 8.0);
 /// The bar shortened to make room for the lap count beside it, when that is
 /// switched on, and the count's type and gap.
-const STINT_BAR_SHORT: f32 = 36.0;
+const STINT_BAR_SHORT: f32 = 32.0;
 const STINT_LAPS_GAP: f32 = 5.0;
 const STINT_LAPS_SIZE: f32 = 11.0;
-const STOPS_X: f32 = 80.0;
-const NET_X: f32 = 128.0;
+const STOPS_X: f32 = 94.0;
+const NET_X: f32 = 137.0;
 const GUTTER_GAP: f32 = 8.0;
 const GUTTER_WIDTH: f32 = 32.0;
 
@@ -158,6 +160,13 @@ const SKIP_RULE_INSET: f32 = 12.0;
 const SKIP_RULE_DASH: f32 = 5.0;
 const SKIP_RULE_GAP: f32 = 5.0;
 const TOP_BAR_HEIGHT: f32 = 38.0;
+/// The full spectator table stays useful on a single monitor by scrolling
+/// after a bounded number of logical rows. The config value is guarded here
+/// too, because a hand-edited TOML file must not grow the panel without end.
+const FULL_ROWS_RANGE: std::ops::RangeInclusive<usize> = 8..=30;
+/// Clear screen kept below an expanded table, so its border does not sit on
+/// the monitor edge when a watched-layout position is already low.
+const FULL_VIEW_BOTTOM_CLEARANCE: f32 = 16.0;
 
 /// Type scale.
 const NAME_SIZE: f32 = 18.0;
@@ -180,6 +189,11 @@ const LOGO_SIZE: f32 = 28.0;
 /// The iRating pill's half-height and width, beside the mark.
 const PILL_HALF_HEIGHT: f32 = 11.0;
 const PILL_WIDTH: f32 = 52.0;
+/// A fixed slot inside the iRating pill keeps a team-strength mark from
+/// making names jump as drivers swap or evidence arrives.
+const TEAM_STRENGTH_ICON_WIDTH: f32 = 11.0;
+const TEAM_STRENGTH_ICON_SIZE: f32 = 8.0;
+const TEAM_STRENGTH_ICON_STEP: f32 = 6.0;
 
 /// Column positions within a driver row, in pixels from its left edge.
 ///
@@ -212,7 +226,7 @@ const FLAG_GAP: f32 = 8.0;
 /// The room the top bar's car count and its icon keep on the right: the
 /// icon's centre sits 34 in from the edge and the icon is 20 wide, plus a
 /// little clearance. The optional runs after the clock stop here.
-const TOP_BAR_COUNT_RESERVED: f32 = 52.0;
+const TOP_BAR_COUNT_RESERVED: f32 = 112.0;
 
 /// How long a row takes to slide into a changed slot, in seconds.
 ///
@@ -342,17 +356,37 @@ impl Row<'_> {
     }
 }
 
+/// A click made in the standings heading. Persistence belongs to the app so
+/// this draw stays a read-only consumer of the supplied configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandingsAction {
+    GapMode(StandingsGapMode),
+    SpectatorFull(bool),
+}
+
 /// `options` carries the top-level switches a driver row reads: the off-track
 /// tally in the gutter, and the flag before each name.
-pub fn draw(ui: &mut Ui, snapshot: Option<&TelemetrySnapshot>, config: &StandingsConfig, options: super::RowOptions) {
+/// Draws the panel and returns a heading selection for the app to persist.
+/// The app owns persistence, so this leaves the supplied configuration shared
+/// with the frame's other panel draws.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the panel's top-level draw keeps its layout and interaction flow in one ordered pass"
+)]
+pub fn draw(
+    ui: &mut Ui,
+    snapshot: Option<&TelemetrySnapshot>,
+    config: &StandingsConfig,
+    options: super::RowOptions,
+) -> Option<StandingsAction> {
     let metrics = Metrics::new(config.scale);
     let Some(snapshot) = snapshot else {
         placeholder(ui, metrics, "waiting for iRacing\u{2026}");
-        return;
+        return None;
     };
     if snapshot.standings.is_empty() {
         placeholder(ui, metrics, "waiting for session standings\u{2026}");
-        return;
+        return None;
     }
     // The player's own row is what opens their class out into a window around
     // them. Without it — before the first flying lap, or sitting in the pits
@@ -374,10 +408,18 @@ pub fn draw(ui: &mut Ui, snapshot: Option<&TelemetrySnapshot>, config: &Standing
     // take a stand-in accent instead; see `ui::class_accent`.
     let class_count = snapshot.class_sections.len();
     let my_class_id = player.map(|p| p.car_class_id).or(snapshot.focus_car_class_id).unwrap_or(NO_CLASS);
-    let rows = plan_rows(snapshot, my_class_id, player.map_or(0, |p| p.class_position), config.show_other_classes);
+    let watching = snapshot.relative_meta.spectating.is_some() || snapshot.relative_meta.team_mate.is_some();
+    let spectator_full = watching && config.spectator_full;
+    let rows = plan_rows(
+        snapshot,
+        my_class_id,
+        player.map_or(0, |p| p.class_position),
+        config.show_other_classes,
+        spectator_full,
+    );
     if rows.is_empty() {
         placeholder(ui, metrics, "waiting for session standings\u{2026}");
-        return;
+        return None;
     }
 
     // The tumble: where each row's slot has moved since the last frame, so
@@ -419,67 +461,100 @@ pub fn draw(ui: &mut Ui, snapshot: Option<&TelemetrySnapshot>, config: &Standing
         grid: snapshot.relative_meta.grid,
     };
 
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
+    let clicks = ui
+        .horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
 
-        // One card, not two. Two cards meant two drop shadows, and the right
-        // one fell across the left one's edge as a dark seam down the middle
-        // of what is meant to read as a single table. The timing half is
-        // instead a lighter fill painted inside this one card.
-        let card =
-            card_frame(metrics, STANDINGS_BG, margin(metrics, 0.0, 0.0), table_card_rounding(metrics)).show(ui, |ui| {
-                ui.vertical(|ui| {
-                    draw_columns(
-                        ui,
-                        metrics,
-                        &rows,
-                        &tumble,
-                        &meta,
-                        ColumnsSpec {
-                            class_count,
-                            show_endurance,
-                            show_summary,
-                            show_tyres,
-                            show_position_change,
-                            player_avg_stint_laps: player.and_then(|p| p.avg_stint_laps),
-                            show_stint_laps: config.show_stint_laps,
-                            show_flags: options.show_flags,
-                            name_width: name_width(config),
-                            timing_order: timing_order(&config.column_order),
-                        },
-                    );
-                    if show_summary {
-                        let (band, _response) = ui.allocate_exact_size(
-                            egui::vec2(ui.min_rect().width(), metrics.px(SUMMARY_HEIGHT)),
-                            egui::Sense::hover(),
+            // One card, not two. Two cards meant two drop shadows, and the right
+            // one fell across the left one's edge as a dark seam down the middle
+            // of what is meant to read as a single table. The timing half is
+            // instead a lighter fill painted inside this one card.
+            let card = card_frame(metrics, STANDINGS_BG, margin(metrics, 0.0, 0.0), table_card_rounding(metrics)).show(
+                ui,
+                |ui| {
+                    ui.vertical(|ui| {
+                        let clicks = draw_columns(
+                            ui,
+                            metrics,
+                            &rows,
+                            &tumble,
+                            &meta,
+                            ColumnsSpec {
+                                class_count,
+                                show_endurance,
+                                show_summary,
+                                show_tyres,
+                                show_position_change,
+                                player_avg_stint_laps: player.and_then(|p| p.avg_stint_laps),
+                                show_stint_laps: config.show_stint_laps,
+                                show_flags: options.show_flags,
+                                show_off_tracks: options.show_off_tracks,
+                                name_width: name_width(config),
+                                timing_order: timing_order(&config.column_order),
+                                gap: resolved_gap_mode(ui, config),
+                                watching,
+                                spectator_full,
+                                full_rows: config.full_rows.clamp(*FULL_ROWS_RANGE.start(), *FULL_ROWS_RANGE.end()),
+                                snapshot,
+                            },
                         );
-                        draw_strategy_line(ui, metrics, band, endurance);
-                    }
-                });
-            });
+                        if show_summary {
+                            let (band, _response) = ui.allocate_exact_size(
+                                egui::vec2(ui.min_rect().width(), metrics.px(SUMMARY_HEIGHT)),
+                                egui::Sense::hover(),
+                            );
+                            draw_strategy_line(ui, metrics, band, endurance);
+                        }
+                        clicks
+                    })
+                    .inner
+                },
+            );
 
-        ui.add_space(metrics.px(GUTTER_GAP));
-        column(
-            ui,
-            ColumnSpec {
-                metrics,
-                width: GUTTER_WIDTH,
-                fill: None,
-                side: Side::Standalone,
-                // Outside the card entirely, so nothing here is a corner.
-                at_card_bottom: true,
-                grooved: false,
-            },
-            &rows,
-            &tumble,
-            |_, _, _| {},
-            |ui, metrics, rect, row, style| draw_gutter_row(ui, metrics, rect, row, style, options.show_off_tracks),
-        );
+            if !spectator_full {
+                ui.add_space(metrics.px(GUTTER_GAP));
+                column(
+                    ui,
+                    ColumnSpec {
+                        metrics,
+                        width: GUTTER_WIDTH,
+                        fill: None,
+                        side: Side::Standalone,
+                        // Outside the card entirely, so nothing here is a corner.
+                        at_card_bottom: true,
+                        grooved: false,
+                    },
+                    &rows,
+                    &tumble,
+                    |_, _, _| {},
+                    |ui, metrics, rect, row, style| {
+                        draw_gutter_row(ui, metrics, rect, row, style, options.show_off_tracks);
+                    },
+                );
 
-        // The class rule spans the whole table, so it's painted last, over
-        // every band.
-        paint_class_rules(ui, metrics, &rows, card.response.rect, show_endurance, show_tyres, name_width(config));
-    });
+                // The class rule spans the whole compact table, so it is
+                // painted last, over every band. In the full table each class
+                // banner stays inside the scrolling clip instead.
+                paint_class_rules(
+                    ui,
+                    metrics,
+                    &rows,
+                    card.response.rect,
+                    show_endurance,
+                    show_tyres,
+                    name_width(config),
+                );
+            }
+            card.inner
+        })
+        .inner;
+    if clicks.spectator_full {
+        Some(StandingsAction::SpectatorFull(!spectator_full))
+    } else if clicks.gap_mode {
+        Some(StandingsAction::GapMode(config.gap_mode.toggled()))
+    } else {
+        None
+    }
 }
 
 /// The knobs `draw_columns` needs beyond the row plan itself.
@@ -488,7 +563,7 @@ pub fn draw(ui: &mut Ui, snapshot: Option<&TelemetrySnapshot>, config: &Standing
     clippy::struct_excessive_bools,
     reason = "each mirrors an independent config switch; a state machine would misdescribe them"
 )]
-struct ColumnsSpec {
+struct ColumnsSpec<'a> {
     class_count: usize,
     show_endurance: bool,
     /// Whether the strategy line runs across the card's foot, which is what
@@ -507,9 +582,71 @@ struct ColumnsSpec {
     show_stint_laps: bool,
     /// Whether each driver's flag is drawn before their name.
     show_flags: bool,
+    /// Whether status chips appear in the narrow gutter beside each row.
+    show_off_tracks: bool,
     /// The driver band's width, already clamped — see [`name_width`].
     name_width: f32,
     timing_order: [crate::config::StandingsColumn; 3],
+    gap: GapDisplay,
+    /// Whether the watched car belongs to somebody else, including a team
+    /// mate. Only in that state does the header offer the compact/full view.
+    watching: bool,
+    spectator_full: bool,
+    full_rows: usize,
+    snapshot: &'a TelemetrySnapshot,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct StandingsClicks {
+    gap_mode: bool,
+    spectator_full: bool,
+}
+
+/// What one frame actually draws for the timing-gap column. Auto keeps the
+/// same measured column and only changes its value/header, never the layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GapDisplay {
+    mode: StandingsGapMode,
+    automatic: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AutoGapPhase {
+    started_at: f64,
+    period_secs: u32,
+}
+
+/// Resolves an automatic setting from egui's monotonic clock. The phase is
+/// recorded when Auto (or its period) becomes active, which gives a driver a
+/// full chosen interval before the first switch regardless of frame rate.
+fn resolved_gap_mode(ui: &Ui, config: &StandingsConfig) -> GapDisplay {
+    if config.gap_mode != StandingsGapMode::Auto {
+        ui.ctx().data_mut(|data| data.remove::<AutoGapPhase>(egui::Id::new("standings-auto-gap-phase")));
+        return GapDisplay { mode: config.gap_mode, automatic: false };
+    }
+    let now = ui.input(|input| input.time);
+    let period_secs = config.gap_auto_period_seconds();
+    let phase = ui.ctx().data_mut(|data| {
+        let id = egui::Id::new("standings-auto-gap-phase");
+        let phase = data
+            .get_temp::<AutoGapPhase>(id)
+            .filter(|phase| phase.period_secs == period_secs)
+            .unwrap_or(AutoGapPhase { started_at: now, period_secs });
+        data.insert_temp(id, phase);
+        phase
+    });
+    GapDisplay { mode: auto_gap_mode_at(now - phase.started_at, period_secs), automatic: true }
+}
+
+/// The pure timer rule makes Auto independent of rendered-frame cadence.
+fn auto_gap_mode_at(elapsed_secs: f64, period_secs: u32) -> StandingsGapMode {
+    let period_secs = period_secs.clamp(1, 120);
+    let period = f64::from(period_secs);
+    if elapsed_secs.max(0.0).rem_euclid(period * 2.0) < period {
+        StandingsGapMode::Leader
+    } else {
+        StandingsGapMode::NextClassified
+    }
 }
 
 /// Lays the table's columns side by side from one shared row plan.
@@ -523,8 +660,11 @@ fn draw_columns(
     rows: &[Row<'_>],
     tumble: &HashMap<i32, f32>,
     meta: &TopBarMeta,
-    spec: ColumnsSpec,
-) {
+    spec: ColumnsSpec<'_>,
+) -> StandingsClicks {
+    if spec.spectator_full {
+        return draw_scrollable_columns(ui, metrics, rows, tumble, meta, spec);
+    }
     let ColumnsSpec {
         class_count,
         show_endurance,
@@ -536,7 +676,13 @@ fn draw_columns(
         show_flags,
         name_width,
         timing_order,
+        gap,
+        watching,
+        spectator_full,
+        snapshot,
+        ..
     } = spec;
+    let mut clicks = StandingsClicks::default();
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         // With the strategy line across the foot of the card, no band reaches
@@ -547,7 +693,9 @@ fn draw_columns(
             ColumnSpec { metrics, width: name_width, fill: None, side: Side::Left, at_card_bottom, grooved: true },
             rows,
             tumble,
-            |ui, metrics, rect| draw_left_top_bar(ui, metrics, rect, meta),
+            |ui, metrics, rect| {
+                clicks.spectator_full = draw_left_top_bar(ui, metrics, rect, meta, watching, spectator_full);
+            },
             |ui, metrics, rect, row, style| {
                 draw_left_row(ui, metrics, rect, row, style, class_count, show_flags, show_position_change);
             },
@@ -565,8 +713,12 @@ fn draw_columns(
             },
             rows,
             tumble,
-            |ui, metrics, rect| draw_right_top_bar(ui, metrics, rect, show_tyres, timing_order),
-            |ui, metrics, rect, row, style| draw_right_row(ui, metrics, rect, row, style, show_tyres, timing_order),
+            |ui, metrics, rect| {
+                clicks.gap_mode = draw_right_top_bar(ui, metrics, rect, show_tyres, timing_order, gap);
+            },
+            |ui, metrics, rect, row, style| {
+                draw_right_row(ui, metrics, rect, row, style, show_tyres, timing_order, gap.mode, snapshot);
+            },
         );
         if show_endurance {
             column(
@@ -581,13 +733,226 @@ fn draw_columns(
                 },
                 rows,
                 tumble,
-                draw_strategy_top_bar,
+                |ui, metrics, rect| draw_strategy_top_bar(ui, metrics, rect),
                 |ui, metrics, rect, row, style| {
                     draw_strategy_row(ui, metrics, rect, row, style, player_avg_stint_laps, show_stint_laps);
                 },
             );
         }
     });
+    clicks
+}
+
+/// The expanded spectator table keeps its headings outside the vertical
+/// scroll area. All data bands share one scroll area, so their class banners,
+/// rows and timing values stay on the same line as the viewer scrolls.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the shared scroll area lays every fixed header and aligned data band in one pass"
+)]
+fn draw_scrollable_columns(
+    ui: &mut Ui,
+    metrics: Metrics,
+    rows: &[Row<'_>],
+    tumble: &HashMap<i32, f32>,
+    meta: &TopBarMeta,
+    spec: ColumnsSpec<'_>,
+) -> StandingsClicks {
+    let ColumnsSpec {
+        class_count,
+        show_endurance,
+        show_summary,
+        show_tyres,
+        show_position_change,
+        player_avg_stint_laps,
+        show_stint_laps,
+        show_flags,
+        show_off_tracks,
+        name_width,
+        timing_order,
+        gap,
+        watching,
+        spectator_full,
+        full_rows,
+        snapshot,
+        ..
+    } = spec;
+    let timing_side = if show_endurance { Side::Standalone } else { Side::Right };
+    let mut clicks = StandingsClicks::default();
+
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        column_header(
+            ui,
+            ColumnSpec {
+                metrics,
+                width: name_width,
+                fill: None,
+                side: Side::Left,
+                at_card_bottom: false,
+                grooved: true,
+            },
+            |ui, metrics, rect| {
+                clicks.spectator_full = draw_left_top_bar(ui, metrics, rect, meta, watching, spectator_full);
+            },
+        );
+        column_header(
+            ui,
+            ColumnSpec {
+                metrics,
+                width: timing_width(show_tyres),
+                fill: Some(STANDINGS_TILE_BG),
+                side: timing_side,
+                at_card_bottom: false,
+                grooved: true,
+            },
+            |ui, metrics, rect| {
+                clicks.gap_mode = draw_right_top_bar(ui, metrics, rect, show_tyres, timing_order, gap);
+            },
+        );
+        if show_endurance {
+            column_header(
+                ui,
+                ColumnSpec {
+                    metrics,
+                    width: ENDURANCE_WIDTH,
+                    fill: Some(STANDINGS_STRATEGY_BG),
+                    side: Side::Right,
+                    at_card_bottom: false,
+                    grooved: true,
+                },
+                |ui, metrics, rect| draw_strategy_top_bar(ui, metrics, rect),
+            );
+        }
+        ui.add_space(metrics.px(GUTTER_GAP));
+        column_header(
+            ui,
+            ColumnSpec {
+                metrics,
+                width: GUTTER_WIDTH,
+                fill: None,
+                side: Side::Standalone,
+                at_card_bottom: false,
+                grooved: false,
+            },
+            |_, _, _| {},
+        );
+    });
+
+    ui.scope(|ui| {
+        // The app's normal floating scrollbars fade away while idle. A full
+        // field needs a visible affordance, so this table alone uses the
+        // thin style: it reserves six pixels and keeps its handle on screen.
+        ui.spacing_mut().scroll = egui::style::ScrollStyle::thin();
+        egui::ScrollArea::vertical()
+            .id_salt("standings-spectator-full")
+            .max_height(full_body_height(ui, metrics, rows, full_rows, show_summary))
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    column_body(
+                        ui,
+                        ColumnSpec {
+                            metrics,
+                            width: name_width,
+                            fill: None,
+                            side: Side::Left,
+                            at_card_bottom: false,
+                            grooved: true,
+                        },
+                        rows,
+                        tumble,
+                        |ui, metrics, rect, row, style| {
+                            draw_left_row(ui, metrics, rect, row, style, class_count, show_flags, show_position_change);
+                        },
+                    );
+                    column_body(
+                        ui,
+                        ColumnSpec {
+                            metrics,
+                            width: timing_width(show_tyres),
+                            fill: Some(STANDINGS_TILE_BG),
+                            side: timing_side,
+                            at_card_bottom: false,
+                            grooved: true,
+                        },
+                        rows,
+                        tumble,
+                        |ui, metrics, rect, row, style| {
+                            draw_right_row(ui, metrics, rect, row, style, show_tyres, timing_order, gap.mode, snapshot);
+                        },
+                    );
+                    if show_endurance {
+                        column_body(
+                            ui,
+                            ColumnSpec {
+                                metrics,
+                                width: ENDURANCE_WIDTH,
+                                fill: Some(STANDINGS_STRATEGY_BG),
+                                side: Side::Right,
+                                at_card_bottom: false,
+                                grooved: true,
+                            },
+                            rows,
+                            tumble,
+                            |ui, metrics, rect, row, style| {
+                                draw_strategy_row(
+                                    ui,
+                                    metrics,
+                                    rect,
+                                    row,
+                                    style,
+                                    player_avg_stint_laps,
+                                    show_stint_laps,
+                                );
+                            },
+                        );
+                    }
+                    ui.add_space(metrics.px(GUTTER_GAP));
+                    column_body(
+                        ui,
+                        ColumnSpec {
+                            metrics,
+                            width: GUTTER_WIDTH,
+                            fill: None,
+                            side: Side::Standalone,
+                            at_card_bottom: false,
+                            grooved: false,
+                        },
+                        rows,
+                        tumble,
+                        |ui, metrics, rect, row, style| draw_gutter_row(ui, metrics, rect, row, style, show_off_tracks),
+                    );
+                });
+            });
+    });
+    clicks
+}
+
+/// The body height retains whole logical rows through the configured driver
+/// count, including any class banner that precedes them.
+fn full_body_height(ui: &Ui, metrics: Metrics, rows: &[Row<'_>], visible_drivers: usize, show_summary: bool) -> f32 {
+    let mut height = 0.0;
+    let mut drivers = 0;
+    for row in rows {
+        height += metrics.px(row.height());
+        if matches!(row, Row::Driver(_)) {
+            drivers += 1;
+            if drivers >= visible_drivers {
+                break;
+            }
+        }
+    }
+    // `Ui::available_height` describes the Area's unbounded layout, not the
+    // monitor below this moved panel. The input screen rect is the physical
+    // limit the spectator sees, and the strategy summary remains fixed below
+    // the scroll body when it is present.
+    let screen_bottom = ui.ctx().input(|input| input.screen_rect().bottom());
+    let footer = if show_summary { metrics.px(SUMMARY_HEIGHT) } else { 0.0 };
+    let available = (screen_bottom - ui.cursor().top() - footer - metrics.px(FULL_VIEW_BOTTOM_CLEARANCE)).max(0.0);
+    height.min(available)
 }
 
 fn placeholder(ui: &mut Ui, metrics: Metrics, message: &str) {
@@ -609,6 +974,7 @@ fn plan_rows<'a>(
     my_class_id: i32,
     my_class_position: i32,
     show_other_classes: bool,
+    full: bool,
 ) -> Vec<Row<'a>> {
     let mut by_class: HashMap<i32, Vec<&'a StandingsEntry>> = HashMap::new();
     for entry in &snapshot.standings {
@@ -633,7 +999,11 @@ fn plan_rows<'a>(
         // the window — hiding the player — whenever the middle of a class is
         // still missing.
         let field_size = entries.iter().map(|e| e.class_position).max().unwrap_or(0);
-        if section.car_class_id == my_class_id {
+        if full {
+            let mut full_class = entries.clone();
+            full_class.sort_by_key(|entry| entry.class_position);
+            rows.extend(full_class.into_iter().filter(|entry| entry.class_position > 0).map(Row::Driver));
+        } else if section.car_class_id == my_class_id {
             for slot in windowed_class_positions(
                 field_size,
                 my_class_position,
@@ -661,12 +1031,84 @@ fn plan_rows<'a>(
 ///
 /// `top_bar` and `row` paint into rectangles this function computes, so all
 /// three columns walk the same plan and land on identical y positions.
+fn column_header(ui: &mut Ui, spec: ColumnSpec, top_bar: impl FnOnce(&mut Ui, Metrics, Rect)) {
+    let ColumnSpec { metrics, width, fill, side, .. } = spec;
+    let (rect, _response) =
+        ui.allocate_exact_size(egui::vec2(metrics.px(width), metrics.px(TOP_BAR_HEIGHT)), egui::Sense::hover());
+    if let Some(fill) = fill.map(theme::tile_fill).filter(|fill| *fill != Color32::TRANSPARENT) {
+        let rounding = if matches!(side, Side::Right) {
+            Rounding { ne: metrics.px(TABLE_CARD_ROUNDING), ..Rounding::ZERO }
+        } else {
+            Rounding::ZERO
+        };
+        ui.painter().rect_filled(rect, rounding, fill);
+    }
+    top_bar(ui, metrics, rect);
+}
+
+/// Paint one vertically scrollable band. It deliberately mirrors the row
+/// walk in [`column`]; only the fixed top bar lives outside this allocation.
+fn column_body(
+    ui: &mut Ui,
+    spec: ColumnSpec,
+    rows: &[Row<'_>],
+    offsets: &HashMap<i32, f32>,
+    mut row: impl FnMut(&mut Ui, Metrics, Rect, &Row<'_>, RowStyle),
+) {
+    let ColumnSpec { metrics, width, fill, grooved, .. } = spec;
+    let height = rows.iter().map(|row| metrics.px(row.height())).sum::<f32>();
+    let (rect, _response) = ui.allocate_exact_size(egui::vec2(metrics.px(width), height), egui::Sense::hover());
+    if let Some(fill) = fill.map(theme::tile_fill).filter(|fill| *fill != Color32::TRANSPARENT) {
+        ui.painter().rect_filled(rect, Rounding::ZERO, fill);
+    }
+
+    let mut y = rect.top();
+    let saved_clip = ui.clip_rect();
+    let mut driver_ordinal = 0_usize;
+    for (index, entry) in rows.iter().enumerate() {
+        let row_rect =
+            Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(rect.width(), metrics.px(entry.height())));
+        let odd = driver_ordinal % 2 == 1;
+        if matches!(entry, Row::Driver(_)) {
+            driver_ordinal += 1;
+        }
+        let style = RowStyle { odd, rounding: Rounding::ZERO };
+        let offset = match entry {
+            Row::Driver(driver) => offsets.get(&driver.car_idx).copied().unwrap_or(0.0),
+            Row::ClassHeader(_) | Row::Skip => 0.0,
+        };
+        if offset == 0.0 {
+            row(ui, metrics, row_rect, entry, style);
+        } else {
+            ui.set_clip_rect(rect.intersect(saved_clip));
+            row(ui, metrics, row_rect.translate(egui::vec2(0.0, offset)), entry, style);
+            ui.set_clip_rect(saved_clip);
+        }
+        let follows_driver = index > 0 && matches!(rows[index - 1], Row::Driver(_));
+        if grooved && follows_driver && matches!(entry, Row::Driver(_)) {
+            super::paint_row_groove(ui, row_rect.top(), row_rect.left(), row_rect.right());
+        }
+        if matches!(entry, Row::Skip) {
+            super::dashed_line_h(
+                ui,
+                row_rect.center().y,
+                row_rect.left() + metrics.px(SKIP_RULE_INSET),
+                row_rect.right() - metrics.px(SKIP_RULE_INSET),
+                metrics.px(SKIP_RULE_DASH),
+                metrics.px(SKIP_RULE_GAP),
+                egui::Stroke::new(metrics.px(1.0), super::hairline()),
+            );
+        }
+        y = row_rect.bottom();
+    }
+}
+
 fn column(
     ui: &mut Ui,
     spec: ColumnSpec,
     rows: &[Row<'_>],
     offsets: &HashMap<i32, f32>,
-    top_bar: impl FnOnce(&Ui, Metrics, Rect),
+    top_bar: impl FnOnce(&mut Ui, Metrics, Rect),
     mut row: impl FnMut(&mut Ui, Metrics, Rect, &Row<'_>, RowStyle),
 ) {
     let ColumnSpec { metrics, width, fill, side, at_card_bottom, grooved } = spec;
@@ -765,7 +1207,14 @@ fn column(
 }
 
 /// The left card's top bar: session type, race clock, and total car count.
-fn draw_left_top_bar(ui: &Ui, metrics: Metrics, rect: Rect, meta: &TopBarMeta) {
+fn draw_left_top_bar(
+    ui: &mut Ui,
+    metrics: Metrics,
+    rect: Rect,
+    meta: &TopBarMeta,
+    watching: bool,
+    spectator_full: bool,
+) -> bool {
     let inner = rect.shrink2(metrics.vec2(14.0, 0.0));
     let middle = inner.center().y;
 
@@ -855,6 +1304,32 @@ fn draw_left_top_bar(ui: &Ui, metrics: Metrics, rect: Rect, meta: &TopBarMeta) {
         fit(ui, RichText::new(format!("\u{21C4} {driver}")).size(metrics.px(SPECTATING_SIZE)).strong().color(ACCENT));
     }
 
+    let view_toggle = if watching {
+        let toggle =
+            Rect::from_center_size(egui::pos2(inner.right() - metrics.px(82.0), middle), metrics.vec2(48.0, 22.0));
+        let response = ui
+            .interact(toggle, ui.id().with("standings-spectator-full"), egui::Sense::click())
+            .on_hover_text(if spectator_full {
+                "Show the compact standings window"
+            } else {
+                "Show every classified driver in a scrollable standings table"
+            });
+        let fill = if spectator_full { ACCENT.gamma_multiply(0.24) } else { Color32::from_white_alpha(10) };
+        ui.painter().rect_filled(toggle, metrics.px(5.0), fill);
+        paint_text(
+            ui,
+            toggle.center(),
+            egui::Align2::CENTER_CENTER,
+            RichText::new(if spectator_full { "COMPACT" } else { "FULL" })
+                .size(metrics.px(10.0))
+                .strong()
+                .color(if response.hovered() { Color32::WHITE } else { text_secondary() }),
+        );
+        response.clicked()
+    } else {
+        false
+    };
+
     paint_text(
         ui,
         egui::pos2(inner.right(), middle),
@@ -867,24 +1342,47 @@ fn draw_left_top_bar(ui: &Ui, metrics: Metrics, rect: Rect, meta: &TopBarMeta) {
         // The painter-drawn car stands in when the asset folder is missing.
         icons::car(ui, car_icon, text_secondary());
     }
+    view_toggle
 }
 
 /// The right card's top bar: the timing column headings.
 fn draw_right_top_bar(
-    ui: &Ui,
+    ui: &mut Ui,
     metrics: Metrics,
     rect: Rect,
     show_tyres: bool,
     order: [crate::config::StandingsColumn; 3],
-) {
+    gap: GapDisplay,
+) -> bool {
     let middle = rect.center().y;
-    for (label, x) in timing_columns(metrics, rect, order) {
+    let columns = timing_columns(metrics, rect, order);
+    let gap_header = Rect::from_min_max(
+        egui::pos2(columns[0].1 - metrics.px(4.0), rect.top()),
+        egui::pos2(columns[0].1 + metrics.px(56.0), rect.bottom()),
+    );
+    let gap_response = ui.interact(gap_header, ui.id().with("standings-gap-mode"), egui::Sense::click()).on_hover_text(
+        "Click to cycle GAP, INT and AUTO. Auto alternates the class-leader gap and interval on its configured timer.",
+    );
+    for (index, (label, x)) in columns.into_iter().enumerate() {
+        let label = if index == 0 { gap.mode.header_label() } else { label };
         paint_text(
             ui,
             egui::pos2(x, middle),
             egui::Align2::LEFT_CENTER,
-            RichText::new(label).size(metrics.px(COLUMN_LABEL_SIZE)).color(text_secondary()),
+            RichText::new(label).size(metrics.px(COLUMN_LABEL_SIZE)).color(if index == 0 && gap_response.hovered() {
+                ACCENT
+            } else {
+                text_secondary()
+            }),
         );
+        if index == 0 && gap.automatic {
+            paint_text(
+                ui,
+                egui::pos2(x + metrics.px(30.0), middle),
+                egui::Align2::LEFT_CENTER,
+                RichText::new("AUTO").monospace().size(metrics.px(8.0)).strong().color(text_tertiary()),
+            );
+        }
     }
     if show_tyres {
         paint_text(
@@ -894,6 +1392,7 @@ fn draw_right_top_bar(
             RichText::new("Tyre").size(metrics.px(COLUMN_LABEL_SIZE)).color(text_secondary()),
         );
     }
+    gap_response.clicked()
 }
 
 /// The timing card's three column headings and their left edges.
@@ -1102,9 +1601,10 @@ fn draw_driver_row(
     });
     paint_text(ui, egui::pos2(name_x, middle), egui::Align2::LEFT_CENTER, name);
     ui.painter().rect_filled(pill, metrics.px(6.0), Color32::from_white_alpha(if dimmed { 3 } else { 7 }));
+    let (rating_rect, strength_rect) = team_strength_layout(pill, metrics);
     paint_text(
         ui,
-        pill.center(),
+        rating_rect.center(),
         egui::Align2::CENTER_CENTER,
         RichText::new(format_irating(entry.irating)).monospace().size(metrics.px(RATING_SIZE)).color(if dimmed {
             text_tertiary()
@@ -1112,9 +1612,120 @@ fn draw_driver_row(
             text_secondary()
         }),
     );
+    draw_team_strength(ui, metrics, strength_rect, pill, entry, dimmed);
 
     // Keep strategy detail available without adding another visible column.
     stint_tooltip(ui, rect, entry);
+}
+
+/// Splits the fixed iRating pill into its number and strength-mark slots.
+/// Keeping both inside the existing pill guarantees that a team roster update
+/// never reflows the driver's name or the timing/strategy columns.
+fn team_strength_layout(pill: Rect, metrics: Metrics) -> (Rect, Rect) {
+    let icon_width = metrics.px(TEAM_STRENGTH_ICON_WIDTH);
+    let icon = Rect::from_min_max(egui::pos2(pill.right() - icon_width, pill.top()), pill.max);
+    (Rect::from_min_max(pill.min, egui::pos2(icon.left(), pill.bottom())), icon)
+}
+
+/// The small vertical stack beside an iRating is a relative team-driver
+/// strength: green up chevrons mean stronger/faster among drivers encountered
+/// for this entry's team; red down chevrons mean the reverse. It is deliberately
+/// a mark, not another number, because the rank and evidence belong on hover.
+fn draw_team_strength(
+    ui: &mut Ui,
+    metrics: Metrics,
+    rect: Rect,
+    hover_rect: Rect,
+    entry: &StandingsEntry,
+    dimmed: bool,
+) {
+    let Some(strength) = entry.team_driver_strength.as_ref() else { return };
+    let hover_text = team_strength_hover_text(entry).expect("the strength above guarantees a tooltip");
+    let response =
+        ui.interact(hover_rect, ui.id().with(("standings-team-strength", entry.car_idx)), egui::Sense::hover());
+    if !shows_team_strength(strength) {
+        response.on_hover_text(hover_text);
+        return;
+    }
+    let chevrons = strength_chevrons(strength.chevrons);
+    if chevrons.is_empty() {
+        paint_text(
+            ui,
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            RichText::new("=").monospace().size(metrics.px(TEAM_STRENGTH_ICON_SIZE)).color(text_tertiary()),
+        );
+    } else {
+        let glyph = if strength.chevrons > 0 { "▲" } else { "▼" };
+        let ink = if strength.chevrons > 0 { theme::signal() } else { theme::alert() };
+        let count = chevrons.len();
+        for (index, _) in chevrons.iter().enumerate() {
+            #[expect(clippy::cast_precision_loss, reason = "a chevron stack has at most three marks")]
+            let offset = (index as f32 - (count.saturating_sub(1) as f32) / 2.0) * metrics.px(TEAM_STRENGTH_ICON_STEP);
+            paint_text(
+                ui,
+                egui::pos2(rect.center().x, rect.center().y + offset),
+                egui::Align2::CENTER_CENTER,
+                RichText::new(glyph).monospace().size(metrics.px(TEAM_STRENGTH_ICON_SIZE)).strong().color(if dimmed {
+                    tint(ink, 120)
+                } else {
+                    ink
+                }),
+            );
+        }
+    }
+    response.on_hover_text(hover_text);
+}
+
+/// A solitary discovered driver cannot be comparatively strong or weak.
+fn shows_team_strength(strength: &TeamDriverStrength) -> bool {
+    strength.known_count >= 2
+}
+
+/// Even one discovered driver is useful roster evidence on hover; it simply
+/// cannot earn a comparative chevron yet.
+fn team_strength_hover_text(entry: &StandingsEntry) -> Option<String> {
+    entry.team_driver_strength.as_ref().map(|strength| team_strength_tooltip_text(strength, &entry.team_drivers))
+}
+
+/// Positive and negative grades use the same compact count. A zero grade is
+/// intentionally a neutral mark, leaving the iRating as the stable anchor.
+fn strength_chevrons(grade: i8) -> Vec<char> {
+    let count = usize::from(grade.unsigned_abs().min(3));
+    let glyph = if grade > 0 { '▲' } else { '▼' };
+    std::iter::repeat_n(glyph, count).collect()
+}
+
+fn team_strength_tooltip_text(strength: &TeamDriverStrength, drivers: &[KnownTeamDriver]) -> String {
+    let basis = match strength.basis {
+        StrengthBasis::Rating => "iRating",
+        StrengthBasis::CleanPace => "clean completed-stint pace",
+    };
+    let rank =
+        strength.rank.map_or_else(|| "unranked".to_owned(), |rank| format!("{rank}/{}", strength.compared_count));
+    let mut text = format!("team-driver strength: {rank} by {basis}");
+    if strength.provisional {
+        let _ = write!(text, " · {} drivers seen so far", strength.known_count);
+    }
+    for driver in drivers.iter().filter(|driver| driver.team_id == strength.team_id) {
+        let active = if driver.active { "active" } else { "seen" };
+        let rating = driver.irating.map_or_else(|| "iRating unavailable".to_owned(), format_irating);
+        let pace = driver
+            .clean_average_lap_secs
+            .map(|secs| format!(" · {} clean avg", format_lap_time(secs)))
+            .unwrap_or_default();
+        let stints = if driver.completed_clean_stints > 0 {
+            format!(
+                " ({} clean stint{})",
+                driver.completed_clean_stints,
+                if driver.completed_clean_stints == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
+        let _ = write!(text, "\n{active}: {} — {rating}{pace}{stints}", driver.driver_name);
+    }
+    text
 }
 
 /// How far the name moves right to make room for a flag: the flag's width
@@ -1202,6 +1813,10 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 }
 
 /// One row of the timing card.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one timing row needs its precomputed style, column order and snapshot-based gap context"
+)]
 fn draw_right_row(
     ui: &mut Ui,
     metrics: Metrics,
@@ -1210,6 +1825,8 @@ fn draw_right_row(
     style: RowStyle,
     show_tyres: bool,
     order: [crate::config::StandingsColumn; 3],
+    gap_mode: StandingsGapMode,
+    snapshot: &TelemetrySnapshot,
 ) {
     let Row::Driver(entry) = row else { return };
     let dimmed = is_dimmed(entry);
@@ -1230,9 +1847,8 @@ fn draw_right_row(
         text_primary()
     };
 
-    // A car on the hook has no meaningful gap, so the column shows how long
-    // it has been gone instead — ticking up, in the caution colour its
-    // gutter chip carries.
+    // A confirmed tow replaces the gap with the sim's remaining tow time,
+    // in the same caution colour as its gutter chip.
     if let Some(tow) = entry.tow_secs {
         paint_text(
             ui,
@@ -1249,7 +1865,10 @@ fn draw_right_row(
             ui,
             egui::pos2(columns[0].1, middle),
             egui::Align2::LEFT_CENTER,
-            RichText::new(gap_text(entry)).monospace().size(metrics.px(TIME_SIZE)).color(text_color),
+            RichText::new(gap_text(entry, gap_mode, snapshot))
+                .monospace()
+                .size(metrics.px(TIME_SIZE))
+                .color(text_color),
         );
     }
 
@@ -1318,6 +1937,38 @@ fn draw_strategy_top_bar(ui: &Ui, metrics: Metrics, rect: Rect) {
     }
 }
 
+/// The number beside a stint bar says how certain its boundary is. A tilde is
+/// deliberately part of the value rather than a separate badge: the reader
+/// should never be able to scan an inferred number as an observed lap count.
+fn stint_age_text(age: StintAge) -> String {
+    match age {
+        StintAge::Observed(laps) => laps.max(0).to_string(),
+        StintAge::Estimated { min, max, .. } if min == max => format!("~{}", min.max(0)),
+        StintAge::Estimated { min, max, .. } => format!("~{}–{}", min.max(0), max.max(min).max(0)),
+        StintAge::Unknown => "?".to_owned(),
+    }
+}
+
+/// A representative age for the filled portion of an uncertain stint. The
+/// upper bound shows the most advanced plausible fuel cycle, while the hatch
+/// says that the boundary itself was inferred rather than witnessed.
+fn stint_age_for_bar(age: StintAge) -> Option<i32> {
+    age.bounds().map(|(_, max)| max.max(0))
+}
+
+fn estimate_basis_text(basis: EstimateBasis) -> &'static str {
+    match basis {
+        EstimateBasis::LapTiming => "lap timing",
+        EstimateBasis::DriverChange => "a driver change (a service visit, not fuelling)",
+        EstimateBasis::StrategyPrior => "a strategy prior assuming typical refills",
+    }
+}
+
+fn stops_range_text(range: (i32, i32)) -> String {
+    let (min, max) = (range.0.max(0), range.1.max(range.0).max(0));
+    if min == max { format!("~{min}") } else { format!("~{min}–{max}") }
+}
+
 /// One row of the strategy band: how far into its stint this car is, how
 /// many stops it has completed, and where its strategy is projected to leave it.
 ///
@@ -1369,10 +2020,10 @@ fn draw_strategy_row(
         (None, Some(player)) => (false, Some(player)),
         (None, None) => (false, None),
     };
-    if let Some(average) = against.filter(|laps| *laps > 0) {
-        let fraction = stint_fraction(entry.current_stint_laps, average);
+    if let (Some(average), Some(laps)) = (against.filter(|laps| *laps > 0), stint_age_for_bar(entry.stint_age)) {
+        let fraction = stint_fraction(laps, average);
         let fill = Rect::from_min_max(bar.min, egui::pos2(bar.left() + bar.width() * fraction, bar.bottom()));
-        if measured {
+        if measured && !entry.stint_age.is_estimated() {
             ui.painter().rect_filled(fill, metrics.px(2.0), ink);
         } else {
             paint_hatch(ui, metrics, fill, ink);
@@ -1385,10 +2036,7 @@ fn draw_strategy_row(
             ui,
             egui::pos2(bar.right() + metrics.px(STINT_LAPS_GAP), middle),
             egui::Align2::LEFT_CENTER,
-            RichText::new(entry.current_stint_laps.to_string())
-                .monospace()
-                .size(metrics.px(STINT_LAPS_SIZE))
-                .color(ink),
+            RichText::new(stint_age_text(entry.stint_age)).monospace().size(metrics.px(STINT_LAPS_SIZE)).color(ink),
         );
     }
 
@@ -1403,10 +2051,12 @@ fn draw_strategy_row(
 
     // The projected finish as a delta from where the car is now: "does the
     // strategy gain or lose me places?", not "what number will I be?".
+    let provisional = if entry.net_gap_from_scoring || entry.net_uses_estimated_stint { "~" } else { "" };
     let (net, net_color) = match entry.projected_class_position.map(|p| entry.class_position - p) {
-        Some(delta) if delta > 0 => (format!("\u{25B2}{delta}"), theme::signal()),
-        Some(delta) if delta < 0 => (format!("\u{25BC}{}", -delta), theme::alert()),
-        Some(_) | None => ("\u{2014}".to_owned(), ink),
+        Some(delta) if delta > 0 => (format!("{provisional}\u{25B2}{delta}"), theme::signal()),
+        Some(delta) if delta < 0 => (format!("{provisional}\u{25BC}{}", -delta), theme::alert()),
+        Some(_) => (format!("{provisional}="), ink),
+        None => ("\u{2014}".to_owned(), ink),
     };
     paint_text(
         ui,
@@ -1433,7 +2083,7 @@ fn stint_fraction(laps: i32, average: i32) -> f32 {
 ///
 /// The largest type on the panel, because this is its verdict; the old band
 /// set it in the panel's smallest.
-fn draw_strategy_line(ui: &Ui, metrics: Metrics, rect: Rect, meta: EnduranceMeta) {
+fn draw_strategy_line(ui: &mut Ui, metrics: Metrics, rect: Rect, meta: EnduranceMeta) {
     let card = metrics.px(TABLE_CARD_ROUNDING);
     ui.painter().rect_filled(rect, Rounding { sw: card, se: card, ..Rounding::ZERO }, Color32::from_black_alpha(90));
     let middle = rect.center().y;
@@ -1456,13 +2106,20 @@ fn draw_strategy_line(ui: &Ui, metrics: Metrics, rect: Rect, meta: EnduranceMeta
 
     figure(ui, &mut x, meta.laps_remaining.map_or_else(dash, |n| n.to_string()), "LAPS LEFT");
     let stops = meta.stops_remaining;
+    let stops_text =
+        meta.stops_remaining_range.map_or_else(|| stops.map_or_else(dash, |n| n.to_string()), stops_range_text);
     figure(
         ui,
         &mut x,
-        stops.map_or_else(dash, |n| n.to_string()),
-        if stops == Some(1) { "STOP TO GO" } else { "STOPS TO GO" },
+        stops_text,
+        if meta.stops_remaining_range.is_none() && stops == Some(1) { "STOP TO GO" } else { "STOPS TO GO" },
     );
-    figure(ui, &mut x, meta.projected_class_position.map_or_else(dash, |p| format!("P{p}")), "NET");
+    figure(
+        ui,
+        &mut x,
+        meta.projected_class_position.map_or_else(dash, |p| format!("P{p}")),
+        if meta.net_gap_from_scoring || meta.net_uses_estimated_stint { "~NET" } else { "NET" },
+    );
 
     // A rival on fewer stops is the one thing worth shouting about, so it is
     // a tag rather than a caption: alert-red when it is so, signal-green
@@ -1485,6 +2142,27 @@ fn draw_strategy_line(ui: &Ui, metrics: Metrics, rect: Rect, meta: EnduranceMeta
         );
         ui.painter().rect_filled(tag, metrics.px(BLOCK_ROUNDING), fill);
         paint_text(ui, tag.center(), egui::Align2::CENTER_CENTER, label);
+    }
+
+    if meta.stops_remaining_range.is_some() || meta.net_uses_estimated_stint {
+        let response = ui.interact(rect, ui.id().with("standings-strategy-estimate"), egui::Sense::hover());
+        let mut tip = String::new();
+        if let Some(range) = meta.stops_remaining_range {
+            let _ = write!(tip, "estimated stops remaining: {}", stops_range_text(range));
+        }
+        if meta.net_uses_estimated_stint {
+            if !tip.is_empty() {
+                tip.push_str(" · ");
+            }
+            tip.push_str("NET uses an inferred stint boundary");
+        }
+        if meta.projected_class_position.is_none() {
+            if !tip.is_empty() {
+                tip.push_str(" · ");
+            }
+            tip.push_str("NET is withheld until the uncertain stop count resolves");
+        }
+        response.on_hover_text(tip);
     }
 }
 
@@ -1573,16 +2251,53 @@ fn row_text_color(entry: &StandingsEntry, dimmed: bool) -> Color32 {
     }
 }
 
-/// The gap column: a dash for a class leader, laps for a lapped car, seconds
-/// otherwise. A time gap to a car laps down says nothing useful, which is
-/// why the lap count replaces it rather than sitting beside it.
-fn gap_text(entry: &StandingsEntry) -> String {
-    if entry.laps_down > 0 {
-        format!("{}L", entry.laps_down)
-    } else if entry.class_position <= 1 {
-        "-".to_owned()
-    } else {
-        format!("{:.1}", entry.gap_to_leader_secs)
+/// The classmate immediately ahead in the official classification.
+///
+/// `ResultsPositions` can arrive with a missing row, so this deliberately
+/// chooses the nearest *present* lower position rather than assuming
+/// `class_position - 1` exists. A time interval across an incoherent order is
+/// withheld by [`gap_text`] rather than made positive with `abs()`.
+fn next_classified_car<'a>(snapshot: &'a TelemetrySnapshot, entry: &StandingsEntry) -> Option<&'a StandingsEntry> {
+    snapshot
+        .standings
+        .iter()
+        .filter(|candidate| {
+            candidate.car_class_id == entry.car_class_id
+                && candidate.class_position > 0
+                && candidate.class_position < entry.class_position
+        })
+        .max_by_key(|candidate| candidate.class_position)
+}
+
+/// The selected comparison: a leader deficit in the normal view, or the
+/// interval to the classified car immediately ahead. Two cars a lap down can
+/// still be seconds apart, so interval only uses a lap count when they are on
+/// different laps behind their class leader.
+fn gap_text(entry: &StandingsEntry, mode: StandingsGapMode, snapshot: &TelemetrySnapshot) -> String {
+    match mode {
+        StandingsGapMode::Leader => {
+            if entry.laps_down > 0 {
+                format!("{}L", entry.laps_down)
+            } else if entry.class_position <= 1 {
+                "-".to_owned()
+            } else {
+                format!("{:.1}", entry.gap_to_leader_secs)
+            }
+        }
+        StandingsGapMode::NextClassified => {
+            let Some(ahead) = next_classified_car(snapshot, entry) else {
+                return "-".to_owned();
+            };
+            let lap_delta = entry.laps_down - ahead.laps_down;
+            if lap_delta > 0 {
+                return format!("{lap_delta}L");
+            }
+            let interval = entry.gap_to_leader_secs - ahead.gap_to_leader_secs;
+            if interval.is_finite() && interval >= 0.0 { format!("{interval:.1}") } else { "-".to_owned() }
+        }
+        // Rendering resolves Auto once per frame before it reaches a row.
+        // This fallback keeps the helper truthful for direct callers too.
+        StandingsGapMode::Auto => gap_text(entry, StandingsGapMode::Leader, snapshot),
     }
 }
 
@@ -1592,9 +2307,15 @@ fn stint_tooltip(ui: &mut Ui, rect: Rect, entry: &StandingsEntry) {
     if !response.hovered() {
         return;
     }
+    let stint = match entry.stint_age {
+        StintAge::Observed(_) => format!("observed current stint: {}L", stint_age_text(entry.stint_age)),
+        StintAge::Estimated { basis, .. } => {
+            format!("estimated current stint: {}L ({})", stint_age_text(entry.stint_age), estimate_basis_text(basis))
+        }
+        StintAge::Unknown => "current stint: unknown (no reliable boundary)".to_owned(),
+    };
     let mut text = format!(
-        "current stint: {}L / {} \u{b7} {} pit stop(s)",
-        entry.current_stint_laps,
+        "{stint} / {} \u{b7} {} pit stop(s)",
         format_minutes_seconds(entry.current_stint_secs),
         entry.pit_stops
     );
@@ -1606,6 +2327,18 @@ fn stint_tooltip(ui: &mut Ui, rect: Rect, entry: &StandingsEntry) {
     }
     if let Some(last_pit) = entry.last_pit_secs {
         let _ = write!(text, " \u{b7} last stop {last_pit:.1}s");
+    }
+    if entry.net_gap_from_scoring {
+        let _ = write!(text, " \u{b7} provisional NET: official scoring gap (live track progress unavailable)");
+    }
+    if entry.net_uses_estimated_stint {
+        let _ = write!(text, " \u{b7} provisional NET: inferred stint boundary");
+    }
+    if let Some(range) = entry.stops_remaining_range {
+        let _ = write!(text, " \u{b7} estimated stops still owed: {}", stops_range_text(range));
+        if entry.projected_class_position.is_none() {
+            text.push_str(" \u{b7} NET withheld until the stop-count range resolves");
+        }
     }
     response.on_hover_text(text);
 }
@@ -1663,6 +2396,10 @@ impl TopBarMeta {
 mod tests {
     use super::*;
 
+    fn leader_gap_text(entry: &StandingsEntry) -> String {
+        gap_text(entry, StandingsGapMode::Leader, &crate::demo::snapshot())
+    }
+
     fn entry(class_position: i32, gap: f32, laps_down: i32) -> StandingsEntry {
         StandingsEntry {
             position: class_position,
@@ -1671,6 +2408,8 @@ mod tests {
             driver_name: Arc::from("Test Driver"),
             car_screen_name: Arc::from("Audi R8 LMS GT3"),
             irating: 2500,
+            team_driver_strength: None,
+            team_drivers: Arc::default(),
             flair_id: 0,
             car_class_id: 0,
             car_class_short_name: Arc::from("GT3"),
@@ -1678,8 +2417,12 @@ mod tests {
             best_lap_secs: 98.0,
             last_lap_secs: 99.0,
             gap_to_leader_secs: gap,
+            scoring_gap_to_leader_secs: None,
+            net_gap_from_scoring: false,
+            net_uses_estimated_stint: false,
             pit_stops: 0,
             current_stint_laps: 3,
+            stint_age: StintAge::Observed(3),
             current_stint_secs: 300.0,
             avg_stint_laps: None,
             avg_stint_secs: None,
@@ -1689,6 +2432,7 @@ mod tests {
             last_pit_secs: None,
             avg_pit_secs: None,
             stops_remaining: None,
+            stops_remaining_range: None,
             projected_class_position: None,
             is_focus: false,
             off_tracks: 0,
@@ -1697,6 +2441,481 @@ mod tests {
             tyre: None,
             race_position_change: None,
         }
+    }
+
+    fn team_strength(chevrons: i8, known_count: usize) -> TeamDriverStrength {
+        TeamDriverStrength {
+            car_idx: 4,
+            team_id: 71,
+            user_id: 501,
+            basis: StrengthBasis::Rating,
+            rank: Some(1),
+            compared_count: known_count,
+            chevrons,
+            known_count,
+            provisional: true,
+        }
+    }
+
+    #[test]
+    fn strength_mark_stays_inside_the_existing_rating_pill_at_small_scale() {
+        let metrics = Metrics::new(0.9);
+        let pill = Rect::from_min_size(egui::Pos2::ZERO, metrics.vec2(PILL_WIDTH, PILL_HALF_HEIGHT * 2.0));
+        let (rating, icon) = team_strength_layout(pill, metrics);
+        assert!(pill.contains_rect(rating));
+        assert!(pill.contains_rect(icon));
+        assert!(rating.right() <= icon.left());
+        assert!(icon.width() > 0.0);
+    }
+
+    #[test]
+    fn strength_hover_lists_every_known_team_driver_and_available_evidence() {
+        let strength = team_strength(3, 2);
+        let drivers = [
+            KnownTeamDriver {
+                team_id: 71,
+                user_id: 501,
+                driver_name: "Nora Patel".to_owned(),
+                irating: Some(6420),
+                clean_average_lap_secs: Some(101.842),
+                completed_clean_stints: 2,
+                active: true,
+                provisional: true,
+            },
+            KnownTeamDriver {
+                team_id: 71,
+                user_id: 502,
+                driver_name: "Jamie Reed".to_owned(),
+                irating: Some(4880),
+                clean_average_lap_secs: None,
+                completed_clean_stints: 0,
+                active: false,
+                provisional: true,
+            },
+        ];
+        let tip = team_strength_tooltip_text(&strength, &drivers);
+        assert!(tip.contains("1/2 by iRating"));
+        assert!(tip.contains("2 drivers seen so far"));
+        assert!(tip.contains("active: Nora Patel"), "{tip}");
+        assert!(tip.contains("6.4k"), "{tip}");
+        assert!(tip.contains("clean avg"), "{tip}");
+        assert!(tip.contains("2 clean stints"), "{tip}");
+        assert!(tip.contains("seen: Jamie Reed — 4.9k"));
+    }
+
+    #[test]
+    fn strength_chevrons_preserve_three_positive_negative_and_neutral_grades() {
+        assert_eq!(strength_chevrons(3), vec!['▲', '▲', '▲']);
+        assert_eq!(strength_chevrons(2), vec!['▲', '▲']);
+        assert_eq!(strength_chevrons(1), vec!['▲']);
+        assert_eq!(strength_chevrons(0), Vec::<char>::new());
+        assert_eq!(strength_chevrons(-1), vec!['▼']);
+        assert_eq!(strength_chevrons(-2), vec!['▼', '▼']);
+        assert_eq!(strength_chevrons(-3), vec!['▼', '▼', '▼']);
+    }
+
+    #[test]
+    fn strength_marks_draw_three_up_and_down_chevrons() {
+        let ctx = egui::Context::default();
+        crate::app::install_fonts(&ctx);
+        let mut high = entry(1, 0.0, 0);
+        high.team_driver_strength = Some(team_strength(3, 3));
+        let mut low = entry(2, 0.0, 0);
+        low.car_idx = 5;
+        low.team_driver_strength = Some(team_strength(-3, 3));
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mark = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(12.0, 24.0));
+                draw_team_strength(ui, Metrics::new(1.0), mark, mark, &high, false);
+                draw_team_strength(ui, Metrics::new(1.0), mark.translate(egui::vec2(20.0, 0.0)), mark, &low, false);
+            });
+        });
+        let text: Vec<&str> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text.iter().filter(|text| **text == "▲").count(), 3);
+        assert_eq!(text.iter().filter(|text| **text == "▼").count(), 3);
+    }
+
+    #[test]
+    fn strength_mark_never_invents_an_extreme_for_one_known_driver() {
+        assert!(!shows_team_strength(&team_strength(3, 1)));
+        assert!(shows_team_strength(&team_strength(-3, 2)));
+    }
+
+    #[test]
+    fn one_known_team_driver_keeps_a_hover_roster_without_a_chevron() {
+        let mut solo = entry(1, 0.0, 0);
+        solo.team_driver_strength = Some(team_strength(3, 1));
+        solo.team_drivers = Arc::from(vec![KnownTeamDriver {
+            team_id: 71,
+            user_id: 501,
+            driver_name: "Nora Patel".to_owned(),
+            irating: Some(6420),
+            clean_average_lap_secs: None,
+            completed_clean_stints: 0,
+            active: true,
+            provisional: true,
+        }]);
+        let text = team_strength_hover_text(&solo).expect("a known driver remains inspectable");
+        assert!(text.contains("1 drivers seen so far"));
+        assert!(text.contains("Nora Patel"));
+    }
+
+    #[test]
+    fn automatic_gap_phase_switches_only_at_whole_period_boundaries() {
+        assert_eq!(auto_gap_mode_at(0.0, 5), StandingsGapMode::Leader);
+        assert_eq!(auto_gap_mode_at(4.999, 5), StandingsGapMode::Leader);
+        assert_eq!(auto_gap_mode_at(5.0, 5), StandingsGapMode::NextClassified);
+        assert_eq!(auto_gap_mode_at(9.999, 5), StandingsGapMode::NextClassified);
+        assert_eq!(auto_gap_mode_at(10.0, 5), StandingsGapMode::Leader);
+        // The same point has the same answer regardless of how many frames
+        // were rendered beforehand.
+        assert_eq!(auto_gap_mode_at(37.25, 5), auto_gap_mode_at(37.25, 5));
+    }
+
+    #[test]
+    fn automatic_gap_period_is_clamped_before_it_can_change_a_frame() {
+        assert_eq!(auto_gap_mode_at(0.5, 0), StandingsGapMode::Leader);
+        assert_eq!(auto_gap_mode_at(1.0, 0), StandingsGapMode::NextClassified);
+        assert_eq!(auto_gap_mode_at(119.999, 999), StandingsGapMode::Leader);
+        assert_eq!(auto_gap_mode_at(120.0, 999), StandingsGapMode::NextClassified);
+    }
+
+    #[test]
+    fn automatic_gap_restarts_its_phase_when_the_period_changes() {
+        let ctx = egui::Context::default();
+        let mut config =
+            StandingsConfig { gap_mode: StandingsGapMode::Auto, gap_auto_seconds: 5, ..StandingsConfig::default() };
+        let mode_at = |time, config: &StandingsConfig| {
+            let mut result = StandingsGapMode::Auto;
+            let _ = ctx.run(egui::RawInput { time: Some(time), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| result = resolved_gap_mode(ui, config).mode);
+            });
+            result
+        };
+        assert_eq!(mode_at(40.0, &config), StandingsGapMode::Leader);
+        assert_eq!(mode_at(45.0, &config), StandingsGapMode::NextClassified);
+        config.gap_auto_seconds = 9;
+        assert_eq!(mode_at(45.0, &config), StandingsGapMode::Leader);
+    }
+
+    #[test]
+    fn team_strength_demo_state_contains_rating_and_clean_pace_examples() {
+        let mut snapshot = crate::demo::snapshot();
+        crate::demo::apply_state(&mut snapshot, "team-strength");
+        let strengths =
+            snapshot.standings.iter().filter_map(|entry| entry.team_driver_strength.as_ref()).collect::<Vec<_>>();
+        assert!(strengths.iter().any(|strength| strength.basis == StrengthBasis::Rating));
+        assert!(strengths.iter().any(|strength| strength.basis == StrengthBasis::CleanPace));
+        assert!(
+            snapshot
+                .standings
+                .iter()
+                .any(|entry| entry.team_drivers.iter().any(|driver| driver.clean_average_lap_secs.is_some()))
+        );
+    }
+
+    #[test]
+    fn an_unrendered_class_leader_keeps_its_standings_row() {
+        let mut snapshot = crate::demo::snapshot();
+        let focus = snapshot.standings.iter().find(|car| car.is_focus).expect("demo focus");
+        let (class_id, focus_position) = (focus.car_class_id, focus.class_position);
+        let leader = snapshot
+            .standings
+            .iter_mut()
+            .find(|car| car.car_class_id == class_id && car.class_position == 1)
+            .expect("demo class leader");
+        leader.track_location = TrackLocation::NotInWorld;
+        leader.tow_secs = None;
+        let leader_id = leader.car_idx;
+        for other_classes in [false, true] {
+            let rows = plan_rows(&snapshot, class_id, focus_position, other_classes, false);
+            assert!(rows.iter().any(|row| matches!(row, Row::Driver(car) if car.car_idx == leader_id)));
+        }
+    }
+
+    #[test]
+    fn full_spectator_rows_include_every_classified_car_in_selected_classes() {
+        let snapshot = crate::demo::snapshot();
+        let focus = snapshot.standings.iter().find(|car| car.is_focus).expect("demo focus");
+        let rows = plan_rows(&snapshot, focus.car_class_id, focus.class_position, true, true);
+        let rendered: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Driver(entry) => Some(entry.car_idx),
+                Row::ClassHeader(_) | Row::Skip => None,
+            })
+            .collect();
+        let classified: Vec<_> =
+            snapshot.standings.iter().filter(|entry| entry.class_position > 0).map(|entry| entry.car_idx).collect();
+        assert_eq!(rendered.len(), classified.len());
+        assert!(classified.iter().all(|car_idx| rendered.contains(car_idx)));
+        assert!(!rows.iter().any(|row| matches!(row, Row::Skip)));
+    }
+
+    #[test]
+    fn full_spectator_height_stops_after_the_requested_driver_rows() {
+        let rows = vec![Row::Skip, Row::Skip, Row::Skip];
+        // A rows-only list has no drivers, so its complete height is still
+        // bounded and deterministic rather than returning zero.
+        let ctx = egui::Context::default();
+        let mut height = 0.0;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                height = full_body_height(ui, Metrics::new(1.0), &rows, 8, false);
+            });
+        });
+        assert!((height - 3.0 * SKIP_HEIGHT).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn inferred_stint_labels_keep_their_bounds_and_unknowns_visible() {
+        assert_eq!(stint_age_text(StintAge::Observed(12)), "12");
+        assert_eq!(stint_age_text(StintAge::Estimated { min: 12, max: 12, basis: EstimateBasis::DriverChange }), "~12");
+        assert_eq!(
+            stint_age_text(StintAge::Estimated { min: 9, max: 15, basis: EstimateBasis::StrategyPrior }),
+            "~9–15"
+        );
+        assert_eq!(stint_age_text(StintAge::Unknown), "?");
+        assert_eq!(estimate_basis_text(EstimateBasis::DriverChange), "a driver change (a service visit, not fuelling)");
+        assert_eq!(estimate_basis_text(EstimateBasis::StrategyPrior), "a strategy prior assuming typical refills");
+    }
+
+    #[test]
+    fn widest_inferred_stint_label_stays_clear_of_the_stops_column_at_small_scale() {
+        let ctx = egui::Context::default();
+        crate::app::install_fonts(&ctx);
+        let metrics = Metrics::new(0.9);
+        let mut label_width = 0.0;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                label_width = text_width(ui, RichText::new("~9–15").monospace().size(metrics.px(STINT_LAPS_SIZE)));
+            });
+        });
+        let label_left = metrics.px(STINT_X + STINT_BAR_SHORT + STINT_LAPS_GAP);
+        assert!(label_left + label_width < metrics.px(STOPS_X));
+    }
+
+    #[test]
+    fn summary_marks_a_stop_range_and_inferred_net() {
+        let ctx = egui::Context::default();
+        crate::app::install_fonts(&ctx);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                draw_strategy_line(
+                    ui,
+                    Metrics::new(1.0),
+                    Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, SUMMARY_HEIGHT)),
+                    EnduranceMeta {
+                        stops_remaining: Some(1),
+                        stops_remaining_range: Some((1, 2)),
+                        net_uses_estimated_stint: true,
+                        ..EnduranceMeta::default()
+                    },
+                );
+            });
+        });
+        let text: Vec<&str> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains(&"~1–2"));
+        assert!(text.contains(&"~NET"));
+    }
+
+    #[test]
+    fn estimated_demo_state_draws_observed_ranged_and_unknown_stints() {
+        let ctx = egui::Context::default();
+        crate::app::install_fonts(&ctx);
+        let mut snapshot = crate::demo::snapshot();
+        crate::demo::apply_state(&mut snapshot, "spectating");
+        crate::demo::apply_state(&mut snapshot, "estimated");
+        let config = StandingsConfig {
+            spectator_full: true,
+            full_rows: 8,
+            show_other_classes: false,
+            ..StandingsConfig::default()
+        };
+        let danger = std::collections::BTreeMap::new();
+        let options =
+            super::super::RowOptions { show_off_tracks: true, show_flags: false, danger: &danger, fuel_target: None };
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1800.0, 1200.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    draw(ui, Some(&snapshot), &config, options);
+                });
+            },
+        );
+        let text: Vec<&str> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains(&"6"));
+        assert!(text.contains(&"~9–10"), "{text:?}");
+        assert!(text.contains(&"~9–15"));
+        assert!(text.contains(&"?"));
+        assert!(text.contains(&"~1–2"));
+        assert!(text.contains(&"~NET"));
+    }
+
+    #[test]
+    fn full_spectator_table_stays_on_screen_at_high_scale_and_a_low_position() {
+        let ctx = egui::Context::default();
+        crate::app::install_fonts(&ctx);
+        let mut snapshot = crate::demo::snapshot();
+        crate::demo::apply_state(&mut snapshot, "spectating");
+        let config = StandingsConfig {
+            spectator_full: true,
+            full_rows: 30,
+            scale: 2.0,
+            show_other_classes: true,
+            ..StandingsConfig::default()
+        };
+        let danger = std::collections::BTreeMap::new();
+        let options =
+            super::super::RowOptions { show_off_tracks: true, show_flags: false, danger: &danger, fuel_target: None };
+        let mut panel = Rect::NOTHING;
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1800.0, 1080.0));
+        let _ = ctx.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |_ui| {
+                egui::Area::new(egui::Id::new("low-full-standings")).fixed_pos(egui::pos2(20.0, 700.0)).show(
+                    ctx,
+                    |ui| {
+                        draw(ui, Some(&snapshot), &config, options);
+                        panel = ui.min_rect();
+                    },
+                );
+            });
+        });
+        assert!(
+            panel.bottom() <= screen.bottom(),
+            "expanded table ends at {} on a {}px screen",
+            panel.bottom(),
+            screen.bottom()
+        );
+    }
+
+    #[test]
+    fn spectator_full_table_scrolls_rows_below_its_fixed_header() {
+        let ctx = egui::Context::default();
+        crate::app::install_fonts(&ctx);
+        let mut snapshot = crate::demo::snapshot();
+        crate::demo::apply_state(&mut snapshot, "spectating");
+        let config = StandingsConfig {
+            spectator_full: true,
+            full_rows: 8,
+            show_other_classes: true,
+            ..StandingsConfig::default()
+        };
+        let danger = std::collections::BTreeMap::new();
+        let options =
+            super::super::RowOptions { show_off_tracks: true, show_flags: false, danger: &danger, fuel_target: None };
+        let frame = |events: Vec<egui::Event>| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1800.0, 1200.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| draw(ui, Some(&snapshot), &config, options));
+                },
+            )
+        };
+        let top = frame(vec![egui::Event::PointerMoved(egui::pos2(120.0, 150.0))]);
+        let _scrolled = frame(vec![
+            egui::Event::PointerMoved(egui::pos2(120.0, 150.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, -12.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let settled = frame(Vec::new());
+        let text_y = |output: &egui::FullOutput, needle: &str| {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == needle => Some(text.pos.y),
+                _ => None,
+            })
+        };
+        let header_top = text_y(&top, "COMPACT").expect("full-view heading is drawn");
+        let header_scrolled = text_y(&settled, "COMPACT").expect("fixed full-view heading remains drawn");
+        let driver_top = text_y(&top, "Driver 14").expect("bottom driver is part of the full table");
+        let driver_scrolled = text_y(&settled, "Driver 14").expect("bottom driver remains in the scrolled content");
+        assert!((header_top - header_scrolled).abs() < f32::EPSILON, "the full/compact control stays fixed");
+        assert!(
+            driver_scrolled < driver_top,
+            "wheel input moves full-table rows under the fixed heading ({driver_top} -> {driver_scrolled})"
+        );
+    }
+
+    #[test]
+    fn spectator_heading_toggle_returns_the_saved_compact_choice() {
+        let ctx = egui::Context::default();
+        crate::app::install_fonts(&ctx);
+        let mut snapshot = crate::demo::snapshot();
+        crate::demo::apply_state(&mut snapshot, "spectating");
+        let config = StandingsConfig { spectator_full: true, ..StandingsConfig::default() };
+        let danger = std::collections::BTreeMap::new();
+        let options =
+            super::super::RowOptions { show_off_tracks: true, show_flags: false, danger: &danger, fuel_target: None };
+        let frame = |events: Vec<egui::Event>| {
+            let mut action = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1800.0, 1200.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        action = draw(ui, Some(&snapshot), &config, options);
+                    });
+                },
+            );
+            action
+        };
+        let toggle = egui::pos2(344.0, 19.0);
+        assert_eq!(frame(vec![egui::Event::PointerMoved(toggle)]), None);
+        assert_eq!(
+            frame(vec![
+                egui::Event::PointerMoved(toggle),
+                egui::Event::PointerButton {
+                    pos: toggle,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            None
+        );
+        assert_eq!(
+            frame(vec![egui::Event::PointerButton {
+                pos: toggle,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }]),
+            Some(StandingsAction::SpectatorFull(false))
+        );
     }
 
     #[test]
@@ -1784,8 +3003,15 @@ mod tests {
         crate::app::install_fonts(&ctx);
         let config = StandingsConfig { endurance_mode: EnduranceMode::On, show_tyres: false, ..Default::default() };
         let danger = std::collections::BTreeMap::new();
-        let options = super::super::RowOptions { show_off_tracks: false, show_flags: false, danger: &danger, fuel_target: None };
-        for kind in [SessionKind::Race, SessionKind::Practice, SessionKind::Qualifying, SessionKind::Warmup, SessionKind::Unknown] {
+        let options =
+            super::super::RowOptions { show_off_tracks: false, show_flags: false, danger: &danger, fuel_target: None };
+        for kind in [
+            SessionKind::Race,
+            SessionKind::Practice,
+            SessionKind::Qualifying,
+            SessionKind::Warmup,
+            SessionKind::Unknown,
+        ] {
             let mut snapshot = crate::demo::snapshot();
             snapshot.relative_meta.session_kind = kind;
             // Deliberately retain a stale race forecast: the session kind
@@ -1798,10 +3024,14 @@ mod tests {
             let output = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| draw(ui, Some(&snapshot), &config, options));
             });
-            let text: Vec<&str> = output.shapes.iter().filter_map(|shape| match &shape.shape {
-                egui::Shape::Text(text) => Some(text.galley.text()),
-                _ => None,
-            }).collect();
+            let text: Vec<&str> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                })
+                .collect();
             assert_eq!(text.contains(&"STOPS TO GO"), kind.is_race(), "{kind:?}");
             assert!(text.contains(&"Stops"), "measured stops remain available in {kind:?}");
             if kind.is_race() {
@@ -1812,7 +3042,7 @@ mod tests {
 
     #[test]
     fn the_class_leader_has_no_gap_to_show() {
-        assert_eq!(gap_text(&entry(1, 0.0, 0)), "-");
+        assert_eq!(leader_gap_text(&entry(1, 0.0, 0)), "-");
     }
 
     /// A hand-edited band width outside the slider's range — or not a number
@@ -1829,15 +3059,42 @@ mod tests {
 
     #[test]
     fn a_gap_on_the_lead_lap_reads_in_seconds() {
-        assert_eq!(gap_text(&entry(2, 0.9, 0)), "0.9");
-        assert_eq!(gap_text(&entry(9, 32.0, 0)), "32.0");
+        assert_eq!(leader_gap_text(&entry(2, 0.9, 0)), "0.9");
+        assert_eq!(leader_gap_text(&entry(9, 32.0, 0)), "32.0");
     }
 
     /// A car eleven laps down has no meaningful time gap, so the lap count
     /// takes the column instead — the mockup's `11L`.
     #[test]
     fn a_lapped_car_reads_in_laps() {
-        assert_eq!(gap_text(&entry(15, 400.0, 11)), "11L");
+        assert_eq!(leader_gap_text(&entry(15, 400.0, 11)), "11L");
+    }
+
+    #[test]
+    fn interval_keeps_seconds_when_both_cars_are_one_lap_down() {
+        let leader = entry(1, 0.0, 0);
+        let ahead = entry(2, 102.2, 1);
+        let mut me = entry(3, 108.9, 1);
+        me.car_idx = 3;
+        let mut snapshot = crate::demo::snapshot();
+        snapshot.standings = vec![leader, ahead, me.clone()];
+
+        assert_eq!(gap_text(&me, StandingsGapMode::Leader, &snapshot), "1L");
+        assert_eq!(gap_text(&me, StandingsGapMode::NextClassified, &snapshot), "6.7");
+    }
+
+    #[test]
+    fn interval_uses_the_closest_present_classification_and_rejects_bad_order() {
+        let leader = entry(1, 0.0, 0);
+        let ahead = entry(3, 45.0, 0); // position two has not arrived yet
+        let mut me = entry(4, 49.2, 0);
+        me.car_idx = 4;
+        let mut snapshot = crate::demo::snapshot();
+        snapshot.standings = vec![leader, ahead, me.clone()];
+        assert_eq!(gap_text(&me, StandingsGapMode::NextClassified, &snapshot), "4.2");
+
+        snapshot.standings[1].gap_to_leader_secs = 51.0;
+        assert_eq!(gap_text(&me, StandingsGapMode::NextClassified, &snapshot), "-");
     }
 
     #[test]

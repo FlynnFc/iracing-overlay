@@ -240,5 +240,4 @@ mod tests {
         assert!((before - after).abs() < 0.02, "the ink colour survives the lift");
         apply(Theme::Panel);
     }
-
 }

@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::config::{BlackBoxConfig, OverlayConfig};
 use crate::focus::FocusTracker;
 use crate::input;
-use crate::telemetry::pit::PitRequest;
+use crate::telemetry::pit::{PitRequest, QueuedPitRequest};
 use crate::telemetry::snapshot::TelemetrySnapshot;
 use crate::tray::Tray;
 use crate::ui::{blackbox, faster_class, radar_bars, settings, standings};
@@ -196,12 +196,15 @@ const TYRE_WEAR_MAX_PCT: u8 = 95;
 /// Whether a black-box pit request should travel the sync wire to the seated
 /// driver's overlay, rather than go straight to the local sim.
 ///
-/// True only from a spectator seat — the crew chief adjusting the team car.
+/// Spectators and teammates watching their own car both route to its driver.
 /// From any other seat the request is the player's own and goes local. The
 /// sim only accepts pit commands from the seated client, so this keeps a
 /// spectator's intent a relay, never a direct command.
 fn pit_request_routes_over_wire(seat: Option<&crate::telemetry::snapshot::Seat>) -> bool {
-    matches!(seat, Some(crate::telemetry::snapshot::Seat::Spectating(_)))
+    matches!(
+        seat,
+        Some(crate::telemetry::snapshot::Seat::Spectating(_) | crate::telemetry::snapshot::Seat::TeamMate(_))
+    )
 }
 
 /// Whether a received team pit write may be applied on this side.
@@ -236,6 +239,12 @@ pub struct OverlayApp {
     /// Debounces the garage rule; see [`GarageHide`].
     garage_hide: GarageHide,
     config: OverlayConfig,
+    /// Last local version successfully saved, used to merge only this
+    /// process's edits over changes made by --bind or another overlay.
+    saved_config: std::cell::RefCell<OverlayConfig>,
+    save_error: std::cell::RefCell<Option<String>>,
+    /// Retrying a busy settings file must not block the UI on every frame.
+    next_save_retry: std::cell::Cell<Option<Instant>>,
     /// Whether the window has been sized to the monitor yet.
     sized: bool,
     /// Draw regardless of whether iRacing has focus, without touching the
@@ -254,7 +263,7 @@ pub struct OverlayApp {
     actions: input::Actions,
     /// Queued pit intents. Sent from the telemetry thread, which owns the
     /// `Session` — it is `!Send`, so it can't come here.
-    pit_requests: Sender<PitRequest>,
+    pit_requests: Sender<QueuedPitRequest>,
     /// Layout mode: draw every widget, on the mockup snapshot, wherever it
     /// sits — see [`OverlayApp::layout_mode`].
     layout_mode: bool,
@@ -347,7 +356,7 @@ impl OverlayApp {
     #[must_use]
     pub fn new(
         rx: Receiver<TelemetrySnapshot>,
-        pit_requests: Sender<PitRequest>,
+        pit_requests: Sender<QueuedPitRequest>,
         config: OverlayConfig,
         demo: DemoOptions,
         tray: Option<Tray>,
@@ -373,6 +382,9 @@ impl OverlayApp {
             latest: None,
             latest_at: None,
             garage_hide: GarageHide::default(),
+            saved_config: std::cell::RefCell::new(config.clone()),
+            save_error: std::cell::RefCell::default(),
+            next_save_retry: std::cell::Cell::default(),
             config,
             sized: false,
             demo,
@@ -418,11 +430,31 @@ impl OverlayApp {
     /// looking at panels rearranged the panels a driver had spent a race
     /// positioning — and the same is true of the black box's own settings.
     /// Demo mode reads the real file and changes nothing in it.
-    fn persist(&self) {
+    fn persist(&self) -> bool {
         if self.demo {
-            return;
+            return true;
         }
-        save_config(&self.config);
+        if self.next_save_retry.get().is_some_and(|retry| Instant::now() < retry) {
+            return false;
+        }
+        let mut baseline = self.saved_config.borrow_mut();
+        match self.config.save_changes(&baseline) {
+            Ok(()) => {
+                *baseline = self.config.clone();
+                *self.save_error.borrow_mut() = None;
+                self.next_save_retry.set(None);
+                true
+            }
+            Err(err) => {
+                let message = format!("Settings could not be saved: {err:#}");
+                if self.save_error.borrow().as_ref() != Some(&message) {
+                    println!("note: {message}");
+                }
+                *self.save_error.borrow_mut() = Some(message);
+                self.next_save_retry.set(Some(Instant::now() + Duration::from_secs(1)));
+                false
+            }
+        }
     }
 
     /// Re-reads the binds when the settings file changes underneath us.
@@ -444,9 +476,11 @@ impl OverlayApp {
         if modified.is_none() || modified == self.binds_read_at {
             return;
         }
-        self.binds_read_at = modified;
         match OverlayConfig::load() {
-            Ok(config) => self.config.binds = config.binds,
+            Ok(config) => {
+                reload_clean_binds(&mut self.config.binds, &mut self.saved_config.borrow_mut().binds, &config.binds);
+                self.binds_read_at = modified;
+            }
             Err(err) => println!("note: {err:#}; keeping the binds already loaded"),
         }
     }
@@ -469,8 +503,9 @@ impl OverlayApp {
         if now.duration_since(changed_at) < SETTINGS_WRITE_DELAY {
             return;
         }
-        self.blackbox_changed_at = None;
-        self.persist();
+        if self.persist() {
+            self.blackbox_changed_at = None;
+        }
     }
 
     /// Draws the settings window when it is open, and writes what it changed
@@ -548,12 +583,39 @@ impl OverlayApp {
         }
     }
 
-    fn draw_settings(&mut self, egui_context: &egui::Context, now: Instant) {
+    fn draw_settings(&mut self, egui_context: &egui::Context, now: Instant, glfw_backend: &GlfwBackend) {
+        egui_context.data_mut(|data| {
+            let id = egui::Id::new("settings_save_error");
+            if let Some(error) = self.save_error.borrow().as_ref() {
+                data.insert_temp(id, error.clone());
+            } else {
+                data.remove::<String>(id);
+            }
+        });
         let watching = self.active_layout == Layout::Watching;
         let host = self.host_status();
         let outcome =
             settings::draw(egui_context, &mut self.config, &mut self.settings, &self.actions, now, watching, &host);
-        if outcome.changed {
+        let mut pasted = false;
+        if let Some(target) = outcome.paste {
+            if let Some(text) = glfw_backend.window.get_clipboard_string().filter(|text| !text.trim().is_empty()) {
+                let field = match target {
+                    settings::SyncPaste::RelayUrl => &mut self.config.sync.relay_url,
+                    settings::SyncPaste::Invite => &mut self.config.sync.invite,
+                };
+                text.trim().clone_into(field);
+                pasted = true;
+                egui_context.data_mut(|data| data.remove::<String>(egui::Id::new("sync_clipboard_status")));
+            } else {
+                egui_context.data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("sync_clipboard_status"),
+                        "Clipboard has no text to paste.".to_owned(),
+                    );
+                });
+            }
+        }
+        if outcome.changed || pasted {
             self.settings_changed_at = Some(now);
         }
         // egui owns each panel's position once it has been seen, and only
@@ -566,11 +628,12 @@ impl OverlayApp {
         if let Some(changed_at) = self.settings_changed_at
             && now.duration_since(changed_at) >= SETTINGS_WRITE_DELAY
         {
-            self.settings_changed_at = None;
             // The launcher's list is its own file, and not the demo's
             // business either way, so it is written regardless.
             self.settings.launcher.save_if_dirty();
-            self.persist();
+            if self.persist() {
+                self.settings_changed_at = None;
+            }
         }
     }
 
@@ -633,14 +696,25 @@ impl OverlayApp {
         if writes.is_empty() {
             return;
         }
-        if !team_write_applies(self.config.sync.allow_team_pit_control, self.latest.as_ref().map(|snap| &snap.seat)) {
+        if !team_write_applies(
+            self.config.sync.allow_team_pit_control,
+            self.fresh_snapshot(Instant::now()).map(|snap| &snap.seat),
+        ) {
             return;
         }
         for (requester, request) in writes {
-            if self.pit_requests.send(request).is_ok() {
+            if self.send_local_pit_request(request) {
                 println!("note: team pit control — {request:?} set by {requester}");
             }
         }
+    }
+
+    /// Cached frames can remain on screen during a disconnect, but cannot
+    /// authorize fresh driver telemetry or pit commands.
+    fn fresh_snapshot(&self, now: Instant) -> Option<&TelemetrySnapshot> {
+        self.latest.as_ref().filter(|_| {
+            self.demo || self.latest_at.is_some_and(|at| now.saturating_duration_since(at) < SNAPSHOT_STALE)
+        })
     }
 
     /// The shared fuel-target readout for the Relative footer, if a spec has
@@ -766,10 +840,16 @@ impl OverlayApp {
     /// the Fuel page's availability and its contents can't disagree. Owned,
     /// so a caller can hold it across the `self.black_box` borrow.
     fn spectator_synced(&self) -> Option<crate::sync::store::SyncedCar> {
-        self.latest
-            .as_ref()
-            .filter(|snap| matches!(snap.seat, crate::telemetry::snapshot::Seat::Spectating(_)))
-            .and_then(|_| self.team_sync.synced_car())
+        let snapshot = self.fresh_snapshot(Instant::now())?;
+        if !matches!(
+            snapshot.seat,
+            crate::telemetry::snapshot::Seat::Spectating(_) | crate::telemetry::snapshot::Seat::TeamMate(_)
+        ) {
+            return None;
+        }
+        let synced = self.team_sync.synced_car()?;
+        let focus = snapshot.relative.iter().find(|car| car.is_focus)?;
+        (synced.car_idx == Some(focus.car_idx)).then_some(synced)
     }
 
     /// The snapshot the black box should read while spectating: a clone with
@@ -795,6 +875,7 @@ impl OverlayApp {
         });
         let service = &mut snapshot.pit_service;
         service.fuel_level_litres = synced.fuel_litres;
+        service.fuel_reading_valid = true;
         service.fuel_per_lap_litres = synced.burn_per_lap;
         service.fuel_amount_litres = synced.service_fuel_litres.map_or(0.0, f32::from);
         service.fuel_armed = synced.service_fuel_litres.is_some();
@@ -812,13 +893,17 @@ impl OverlayApp {
     /// instead, which applies it behind that driver's consent: the sim only
     /// takes commands from the seated client, so this is a relay of intent.
     fn dispatch_pit_request(&self, request: crate::telemetry::pit::PitRequest) {
-        if pit_request_routes_over_wire(self.latest.as_ref().map(|snap| &snap.seat)) {
+        let Some(snapshot) = self.fresh_snapshot(Instant::now()) else { return };
+        if pit_request_routes_over_wire(Some(&snapshot.seat)) {
             self.team_sync.send_pit_write(request);
         } else {
-            // A full queue means the telemetry thread has stopped; there is
-            // nothing useful to do about it here.
-            let _ = self.pit_requests.send(request);
+            self.send_local_pit_request(request);
         }
+    }
+
+    fn send_local_pit_request(&self, request: PitRequest) -> bool {
+        let Some(snapshot) = self.fresh_snapshot(Instant::now()) else { return false };
+        self.pit_requests.send(QueuedPitRequest::new(request, &snapshot.identity)).is_ok()
     }
 
     #[expect(clippy::too_many_lines, reason = "each overlay draws with its own config and saved position")]
@@ -932,9 +1017,10 @@ impl OverlayApp {
         }
 
         if panel_visible(selected_preview, crate::tray::Panel::Standings, layout_mode, self.config.standings.visible) {
+            let mut standings_action = None;
             let pos = active_pos(seat_layout, &mut self.config.standings.pos, &mut self.config.standings.watch_pos);
             let drag = draggable_panel(egui_context, "standings", pos, |ui| {
-                standings::draw(
+                standings_action = standings::draw(
                     ui,
                     latest,
                     &standings_config,
@@ -946,7 +1032,13 @@ impl OverlayApp {
                 );
             });
             held |= drag.held;
-            if drag.stopped {
+            if let Some(action) = standings_action {
+                match action {
+                    standings::StandingsAction::GapMode(mode) => self.config.standings.gap_mode = mode,
+                    standings::StandingsAction::SpectatorFull(full) => self.config.standings.spectator_full = full,
+                }
+            }
+            if drag.stopped || standings_action.is_some() {
                 self.persist();
             }
         }
@@ -987,6 +1079,15 @@ impl OverlayApp {
         }
 
         held
+    }
+}
+
+impl Drop for OverlayApp {
+    fn drop(&mut self) {
+        // Closing during the debounce interval must not discard a new bind,
+        // slider value, or column setting. Demo runs remain read-only.
+        self.next_save_retry.set(None);
+        self.persist();
     }
 }
 
@@ -1033,7 +1134,10 @@ impl EguiOverlay for OverlayApp {
         // fields is focused; everywhere else the keyboard stays the sim's.
         // `wants_keyboard_input` is last frame's answer, which is the freshest
         // one there is before this frame begins.
-        self.typed.poll(self.settings.open && egui_context.wants_keyboard_input(), &mut input.events);
+        let paste = self.typed.poll(self.settings.open && egui_context.wants_keyboard_input(), &mut input.events);
+        if paste && let Some(text) = glfw_backend.window.get_clipboard_string() {
+            input.events.push(egui::Event::Paste(text.trim().to_owned()));
+        }
         if self.screenshot.is_some() {
             // Hidden previews must not inherit the desktop pointer or a held
             // key: hover tooltips would obscure settings and make captures vary.
@@ -1114,7 +1218,10 @@ impl EguiOverlay for OverlayApp {
         // to join.
         self.ensure_relay();
         let sync_config = self.effective_sync_config();
-        self.team_sync.update(&sync_config, self.latest.as_ref(), now);
+        let telemetry_fresh =
+            self.demo || self.latest_at.is_some_and(|at| now.saturating_duration_since(at) < SNAPSHOT_STALE);
+        let sync_snapshot = self.latest.as_ref().filter(|_| telemetry_fresh);
+        self.team_sync.update(&sync_config, sync_snapshot, now);
         self.apply_team_writes();
         // Every mark drawn this frame is chosen by the logo config in
         // force; see `ui::logos::apply`.
@@ -1176,7 +1283,7 @@ impl EguiOverlay for OverlayApp {
         // foreground must not be handed back this frame — see
         // [`OverlayApp::report_window_state`].
         let panel_held = should_show && self.draw_panels(egui_context);
-        self.draw_settings(egui_context, now);
+        self.draw_settings(egui_context, now, glfw_backend);
         self.apply_stream_mode(glfw_backend);
 
         // Binds are polled every frame regardless of whether the panels are
@@ -1184,10 +1291,12 @@ impl EguiOverlay for OverlayApp {
         // the driver didn't choose.
         // Auto Fuel keeps the load topped up on its own, whether or not the
         // Fuel page is the one showing.
-        if let Some(request) =
-            self.black_box.auto_fuel_request(self.latest.as_ref(), &self.config.blackbox, Instant::now())
-        {
-            let _ = self.pit_requests.send(request);
+        if let Some(request) = self.black_box.auto_fuel_request(
+            self.latest.as_ref().filter(|_| telemetry_fresh),
+            &self.config.blackbox,
+            Instant::now(),
+        ) {
+            self.send_local_pit_request(request);
         }
 
         // Settled once a frame, before anything reads the page: the set of
@@ -1276,6 +1385,11 @@ impl EguiOverlay for OverlayApp {
             self.apply_danger_mark(cust_id, level);
         }
         self.save_blackbox_if_settled(Instant::now());
+        // Drag and tray actions save immediately, so they have no debounce
+        // timer to retry a failed write. This covers every caller of persist.
+        if self.next_save_retry.get().is_some() {
+            self.persist();
+        }
 
         // `is_anything_being_dragged` is checked explicitly (not just
         // `wants_pointer_input`) so passthrough can never re-engage
@@ -1408,26 +1522,24 @@ fn settings_modified_at() -> Option<SystemTime> {
     std::fs::metadata(crate::config::config_path()).and_then(|meta| meta.modified()).ok()
 }
 
-/// Writes the live settings to disk.
-///
-/// The binds are written back, even though `--bind` also owns them: the
-/// overlay re-reads them whenever the file changes underneath it, so what
-/// goes out here is what that run saved.
-///
-/// Written as "all of it" rather than as a list of fields to copy across,
-/// because the list was the bug. It was the list of settings that saved, and
-/// every setting added after it was written was quietly missing from it —
-/// stream mode, the focus and garage rules, the flag and off-track columns,
-/// team sync. Each one worked for the session it was ticked in and was gone
-/// by the next launch, because the file it was meant to be in was never told
-/// about it.
-fn save_config(config: &OverlayConfig) {
-    let mine = config.clone();
-    let saved = OverlayConfig::update(|on_disk| {
-        *on_disk = mine;
-    });
-    if let Err(err) = saved {
-        println!("note: could not save race-overlay.toml: {err:#}");
+/// Imports external bind changes without erasing a locally captured or
+/// cleared bind that is still waiting for the settings debounce to save.
+fn reload_clean_binds(
+    live: &mut crate::config::BindsConfig,
+    baseline: &mut crate::config::BindsConfig,
+    disk: &crate::config::BindsConfig,
+) {
+    for action in input::Action::ALL {
+        if live.get(action) != baseline.get(action) {
+            continue;
+        }
+        if let Some(bind) = disk.get(action) {
+            live.set(action, bind.clone());
+            baseline.set(action, bind.clone());
+        } else {
+            live.clear(action);
+            baseline.clear(action);
+        }
     }
 }
 
@@ -1844,8 +1956,8 @@ mod tests {
         assert!(pit_request_routes_over_wire(Some(&Seat::Spectating(Arc::from("Ben")))), "a spec adjusts the team car");
         assert!(!pit_request_routes_over_wire(Some(&Seat::Driving)), "a driver's own request goes local");
         assert!(
-            !pit_request_routes_over_wire(Some(&Seat::TeamMate(Arc::from("Ben")))),
-            "a team-mate's own car is local"
+            pit_request_routes_over_wire(Some(&Seat::TeamMate(Arc::from("Ben")))),
+            "a team spotter's request goes to the actual driver"
         );
         assert!(!pit_request_routes_over_wire(Some(&Seat::OutOfCar)), "the garage is local");
         assert!(!pit_request_routes_over_wire(None), "no session, no wire");
@@ -1983,5 +2095,24 @@ mod tests {
         relative = [410.0, 360.0];
         let edited = frame("relative", &mut relative, vec![]);
         assert!((edited - egui::pos2(410.0, 360.0)).length() < 1.0);
+    }
+    #[test]
+    fn external_bind_reload_preserves_pending_local_edits_and_clears() {
+        use crate::config::BindsConfig;
+        use crate::input::{Action, Bind};
+        let mut baseline = BindsConfig::default();
+        baseline.set(Action::PrevPage, Bind::Key { vk: 0x72 });
+        let mut live = baseline.clone();
+        live.set(Action::NextPage, Bind::Key { vk: 0x73 });
+        live.clear(Action::PrevPage);
+        let mut disk = baseline.clone();
+        disk.set(Action::NextPage, Bind::Key { vk: 0x74 });
+        disk.set(Action::Increment, Bind::Key { vk: 0x75 });
+        reload_clean_binds(&mut live, &mut baseline, &disk);
+        assert_eq!(live.get(Action::NextPage), Some(&Bind::Key { vk: 0x73 }));
+        assert!(live.get(Action::PrevPage).is_none());
+        assert_eq!(live.get(Action::Increment), Some(&Bind::Key { vk: 0x75 }));
+        assert_eq!(baseline.get(Action::Increment), live.get(Action::Increment));
+        assert!(baseline.get(Action::NextPage).is_none(), "a pending edit still differs from its baseline");
     }
 }

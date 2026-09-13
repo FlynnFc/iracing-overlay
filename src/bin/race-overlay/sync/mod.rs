@@ -63,14 +63,14 @@ mod tests {
         let url = format!("ws://{}", relay.local_addr());
         let subsession = 987_654;
 
-        let driver = SyncClient::start(url.clone(), subsession, invite.to_string(), member(11, "Driver"));
+        let driver = SyncClient::start(url.clone(), subsession, 0, invite.to_string(), member(11, "Driver"));
         wait_for(&driver, |frame| matches!(frame, FromRelay::Welcome { .. }).then_some(()));
         for n in 1..=3 {
             driver.publish.send(Outgoing { session_time: f64::from(n) * 90.0, event: lap(n) }).expect("thread alive");
         }
 
         // A spectator connected the whole time sees the laps live.
-        let spec = SyncClient::start(url.clone(), subsession, invite.to_string(), member(22, "Spec"));
+        let spec = SyncClient::start(url.clone(), subsession, 0, invite.to_string(), member(22, "Spec"));
         let mut live = Vec::new();
         wait_for(&spec, |frame| {
             match frame {
@@ -84,7 +84,7 @@ mod tests {
 
         // A crew chief joining only now gets the same three laps from the
         // ledger — the DC-recovery path is the same code as the late join.
-        let late = SyncClient::start(url.clone(), subsession, invite.to_string(), member(33, "Late"));
+        let late = SyncClient::start(url.clone(), subsession, 0, invite.to_string(), member(33, "Late"));
         let backlog = wait_for(&late, |frame| match frame {
             FromRelay::Backlog(envelopes) if !envelopes.is_empty() => {
                 Some(envelopes.iter().map(|held| (held.producer, held.seq)).collect::<Vec<_>>())
@@ -97,7 +97,7 @@ mod tests {
         // publishes again: the relay's tips must push its numbering past the
         // laps the first run published, not fork it back to seq 1.
         drop(driver);
-        let reborn = SyncClient::start(url, subsession, invite.to_string(), member(11, "Driver"));
+        let reborn = SyncClient::start(url, subsession, 0, invite.to_string(), member(11, "Driver"));
         wait_for(&reborn, |frame| matches!(frame, FromRelay::Welcome { .. }).then_some(()));
         reborn.publish.send(Outgoing { session_time: 400.0, event: lap(4) }).expect("thread alive");
         let seq = wait_for(&late, |frame| match frame {
@@ -114,12 +114,33 @@ mod tests {
         let relay = Relay::spawn(0, invite).expect("an ephemeral port must bind");
         let url = format!("ws://{}", relay.local_addr());
 
-        let intruder = SyncClient::start(url, 1, "WRONG-CODE".to_owned(), member(99, "Intruder"));
+        let intruder = SyncClient::start(url, 1, 0, "WRONG-CODE".to_owned(), member(99, "Intruder"));
         wait_for(&intruder, |frame| matches!(frame, FromRelay::Refused { .. }).then_some(()));
         assert!(
             intruder.incoming.recv_timeout(Duration::from_millis(300)).is_err(),
             "nothing follows a refusal; the thread has stopped"
         );
+    }
+
+    #[test]
+    fn session_phases_in_one_subsession_never_share_a_ledger() {
+        let invite = InviteCode::generate().expect("the OS has entropy");
+        let relay = Relay::spawn(0, invite.clone()).expect("an ephemeral port must bind");
+        let url = format!("ws://{}", relay.local_addr());
+
+        let practice = SyncClient::start(url.clone(), 987_654, 0, invite.to_string(), member(11, "Driver"));
+        wait_for(&practice, |frame| matches!(frame, FromRelay::Welcome { .. }).then_some(()));
+        practice.publish.send(Outgoing { session_time: 6000.0, event: lap(42) }).expect("practice client alive");
+
+        // The race clock starts over but uses the same iRacing subsession.
+        // Its room must be empty; otherwise t=6000 practice data would win
+        // the store's time ordering over the race's first seconds.
+        let race = SyncClient::start(url, 987_654, 1, invite.to_string(), member(22, "Spec"));
+        let race_backlog = wait_for(&race, |frame| match frame {
+            FromRelay::Backlog(envelopes) => Some(envelopes.clone()),
+            _ => None,
+        });
+        assert!(race_backlog.is_empty(), "practice data must not enter the race room");
     }
 
     /// The producer and the consumer meet: what [`feed::EventSource`] emits
@@ -148,6 +169,7 @@ mod tests {
         let base = DriverObservation {
             session_time: 0.0,
             lap: 10,
+            car_idx: Some(7),
             fuel_litres: 55.0,
             fuel_per_lap_litres: Some(2.4),
             service_fuel_litres: Some(30),
@@ -158,16 +180,22 @@ mod tests {
         };
 
         let start = Instant::now();
-        // The opening frame, then a lap closes with fresh fuel a heartbeat on.
+        // The opening frame, then an observed crossing seeds a complete lap;
+        // the following crossing is the first honest lap-close record.
         carry(&mut source, &mut store, base, start);
         let mut next_lap = base;
         next_lap.session_time = 90.0;
         next_lap.lap = 11;
         next_lap.fuel_litres = 52.6;
         carry(&mut source, &mut store, next_lap, start + Duration::from_secs(2));
+        let mut closed_lap = next_lap;
+        closed_lap.session_time = 180.0;
+        closed_lap.lap = 12;
+        closed_lap.fuel_litres = 50.2;
+        carry(&mut source, &mut store, closed_lap, start + Duration::from_secs(4));
 
         let car = store.synced_car().expect("the store rebuilt the car");
-        assert!((car.fuel_litres - 52.6).abs() < 0.01, "the latest tank");
+        assert!((car.fuel_litres - 50.2).abs() < 0.01, "the latest tank");
         assert!((car.burn_per_lap.expect("a lap closed") - 2.4).abs() < 0.01, "the measured burn");
         assert_eq!(car.service_fuel_litres, Some(30));
         assert_eq!(car.tyres_armed, [true, true, false, false]);
@@ -184,6 +212,7 @@ mod tests {
         let mut snapshot = crate::demo::snapshot();
         snapshot.identity = crate::telemetry::snapshot::SessionIdentity {
             subsession: Some(subsession),
+            session_num: Some(0),
             player_cust_id: Some(cust_id),
             player_name: Some(std::sync::Arc::from("Member")),
         };
@@ -218,7 +247,7 @@ mod tests {
 
         // The spec's directive goes up first; the driver joins after, so the
         // policy reaches them from the *backlog* — the driver-swap case.
-        let spec = SyncClient::start(url, subsession, invite.to_string(), member(22, "Spec"));
+        let spec = SyncClient::start(url, subsession, 0, invite.to_string(), member(22, "Spec"));
         wait_for(&spec, |frame| matches!(frame, FromRelay::Welcome { .. }).then_some(()));
         spec.publish
             .send(Outgoing {
@@ -285,7 +314,7 @@ mod tests {
         // The spectator connects first and watches the roster, so we can tell
         // exactly when the driver is on — the write must be sent *after* that,
         // or it would arrive as backlog and the "live" half proves nothing.
-        let spec = SyncClient::start(url.clone(), subsession, invite.to_string(), member(22, "Spec"));
+        let spec = SyncClient::start(url.clone(), subsession, 0, invite.to_string(), member(22, "Spec"));
         wait_for(&spec, |frame| matches!(frame, FromRelay::Welcome { .. }).then_some(()));
 
         // Drive the driver's TeamSync until the spectator sees it join.
@@ -339,5 +368,83 @@ mod tests {
         }
         assert!(late.synced_car().is_some(), "the late joiner did receive the ledger backlog");
         assert!(late.take_pit_writes().is_empty(), "and still nothing to apply from the replay");
+    }
+
+    #[test]
+    fn a_peer_restoring_an_old_pit_write_never_rearms_an_already_connected_driver() {
+        use super::runtime::TeamSync;
+        use crate::config::SyncConfig;
+        use crate::telemetry::pit::PitRequest;
+        use crate::telemetry::snapshot::Seat;
+        use tungstenite::Message;
+
+        let invite = InviteCode::generate().expect("entropy");
+        let relay = Relay::spawn(0, invite.clone()).expect("bind");
+        let url = format!("ws://{}", relay.local_addr());
+        let subsession = 888_123;
+        let config = SyncConfig {
+            enabled: true,
+            relay_url: url.clone(),
+            invite: invite.to_string(),
+            allow_team_pit_control: true,
+            ..SyncConfig::default()
+        };
+
+        // The observer lets this test prove the driver had registered before
+        // the recovering spectator joined, and that the relay labelled the
+        // delivered repair frame as history.
+        let observer = SyncClient::start(url.clone(), subsession, 0, invite.to_string(), member(33, "Observer"));
+        wait_for(&observer, |frame| matches!(frame, FromRelay::CaughtUp).then_some(()));
+        let mut driver = TeamSync::default();
+        let driver_snap = snapshot_for(subsession, 11, Seat::Driving);
+        let deadline = Instant::now() + WAIT;
+        let mut driver_seen = false;
+        while Instant::now() < deadline && !driver_seen {
+            driver.update(&config, Some(&driver_snap), Instant::now());
+            while let Ok(frame) = observer.incoming.try_recv() {
+                if let FromRelay::Roster(members) | FromRelay::Welcome { members, .. } = frame
+                    && members.iter().any(|member| member.cust_id == 11)
+                {
+                    driver_seen = true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(driver_seen, "driver must be connected before recovery");
+
+        // Mimic a spectator that retained an old crew command through a host
+        // restart. It uses Recover, never a normal live Publish.
+        let (mut recovering, _) = tungstenite::client::connect(&url).expect("connect recovering spectator");
+        recovering
+            .send(Message::Binary(
+                super::protocol::encode(&super::protocol::FromClient::Hello {
+                    subsession,
+                    session_num: 0,
+                    invite: invite.to_string(),
+                    member: member(22, "Spec"),
+                    have: vec![super::protocol::ProducerSeq { producer: 22, seq: 1 }],
+                })
+                .into(),
+            ))
+            .expect("hello");
+        recovering
+            .send(Message::Binary(
+                super::protocol::encode(&super::protocol::FromClient::Recover(super::protocol::Envelope {
+                    producer: 22,
+                    seq: 1,
+                    session_time: 20.0,
+                    event: Event::PitWrite { requester: "Spec".to_owned(), request: PitRequest::SetFuel(48) },
+                }))
+                .into(),
+            ))
+            .expect("recover old command");
+
+        wait_for(&observer, |frame| matches!(frame, FromRelay::Recovered(_)).then_some(()));
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            driver.update(&config, Some(&driver_snap), Instant::now());
+            assert!(driver.take_pit_writes().is_empty(), "a recovered command must never re-arm");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

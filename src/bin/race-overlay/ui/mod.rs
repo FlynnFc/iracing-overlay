@@ -433,17 +433,6 @@ pub fn table_card_rounding(metrics: Metrics) -> Rounding {
     Rounding::same(metrics.px(TABLE_CARD_ROUNDING))
 }
 
-/// A card rounded on one side only, for cards butted up against a neighbor.
-///
-/// Squaring the facing edges is what lets the Standings widget's two cards
-/// read as a single table split by a seam rather than as two separate boxes
-/// that happen to be adjacent.
-#[must_use]
-pub fn card_rounding_side(metrics: Metrics, left: bool) -> Rounding {
-    let r = metrics.px(card_radius_px());
-    if left { Rounding { nw: r, sw: r, ne: 0.0, se: 0.0 } } else { Rounding { nw: 0.0, sw: 0.0, ne: r, se: r } }
-}
-
 /// The alternating row tint that gives a long table a readable rhythm.
 ///
 /// Returned as a fill to paint under a row; `None` for rows that take no

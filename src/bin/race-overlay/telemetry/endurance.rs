@@ -399,6 +399,14 @@ mod tests {
         assert_eq!(stops_remaining(56, 5, 20), Some(3));
     }
 
+    #[test]
+    fn an_early_stop_still_counts_the_stops_needed_after_it() {
+        // With 35 laps left on a 17-lap range, a car that stopped after one
+        // lap still has two future stops to make. The fresh stint changes the
+        // schedule; it does not make the rival's future pit obligation zero.
+        assert_eq!(stops_remaining(35, 1, 17), Some(2));
+    }
+
     /// This is the number the whole feature turns on: being a stop up on a
     /// rival is worth more than any plausible pace difference.
     ///

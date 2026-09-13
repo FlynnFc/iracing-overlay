@@ -15,6 +15,29 @@
 use iracing_telem::flags::PitCommand;
 use serde::{Deserialize, Serialize};
 
+/// A local UI intent belongs to the live session in which it was made.
+/// Expire it during telemetry outages instead of arming an old fuel/tyre
+/// command when iRacing reconnects or starts a new race phase.
+#[derive(Debug)]
+pub struct QueuedPitRequest {
+    pub request: PitRequest,
+    created_at: std::time::Instant,
+    identity: super::snapshot::SessionIdentity,
+}
+
+impl QueuedPitRequest {
+    pub fn new(request: PitRequest, identity: &super::snapshot::SessionIdentity) -> Self {
+        Self { request, created_at: std::time::Instant::now(), identity: identity.clone() }
+    }
+
+    pub fn is_current(&self, now: std::time::Instant, identity: &super::snapshot::SessionIdentity) -> bool {
+        now.saturating_duration_since(self.created_at) < std::time::Duration::from_secs(2)
+            && self.identity.subsession == identity.subsession
+            && self.identity.session_num == identity.session_num
+            && self.identity.player_cust_id == identity.player_cust_id
+    }
+}
+
 /// The four corners, in the order the widget lays them out.
 ///
 /// A plain enum rather than four booleans threaded everywhere: the tyre
@@ -80,6 +103,10 @@ pub struct PitService {
     pub fuel_amount_litres: f32,
     /// Litres currently in the tank.
     pub fuel_level_litres: f32,
+    /// Whether this tick actually supplied a finite tank reading. The zero
+    /// display fallback for missing telemetry must never be published as a
+    /// measured empty tank to teammates.
+    pub fuel_reading_valid: bool,
     /// Tank size in litres, derived from level and level-percent — there is
     /// no capacity variable. `None` while the tank is near empty, where that
     /// division is too noisy to trust.
@@ -635,5 +662,22 @@ mod tests {
         assert_eq!(round_kpa(158.579), 159);
         assert_eq!(round_kpa(f32::INFINITY), 0);
         assert_eq!(round_kpa(f32::NAN), 0);
+    }
+    #[test]
+    fn queued_commands_expire_during_disconnects_and_never_cross_session_phases() {
+        use crate::telemetry::snapshot::SessionIdentity;
+        let identity = SessionIdentity {
+            subsession: Some(10),
+            session_num: Some(2),
+            player_cust_id: Some(20),
+            ..Default::default()
+        };
+        let queued = QueuedPitRequest::new(PitRequest::SetAllTyres(true), &identity);
+        assert!(queued.is_current(queued.created_at + std::time::Duration::from_millis(100), &identity));
+        assert!(!queued.is_current(queued.created_at + std::time::Duration::from_secs(30), &identity));
+        let next_phase = SessionIdentity { session_num: Some(3), ..identity.clone() };
+        assert!(!queued.is_current(queued.created_at, &next_phase));
+        let next_weekend = SessionIdentity { subsession: Some(11), ..identity };
+        assert!(!queued.is_current(queued.created_at, &next_weekend));
     }
 }

@@ -7,13 +7,20 @@
 //! Same type both places, because "what do I have" and "what does the other
 //! side lack" are the same question asked in both directions.
 //!
-//! Memory is deliberately unbounded: at the plan's rates a 24-hour race is a
-//! few hundred kilobytes, and an eviction policy would be code that decides
-//! which measurements stop being true. A ledger lives as long as its session.
+//! A ledger lives as long as its session. The relay limits each producer to
+//! 150,000 events, comfortably above a driver's normal 24-hour rate. History
+//! stays in memory; a surviving replica can repair a restarted relay, but a
+//! simultaneous shutdown of every holder loses it.
 
 use std::collections::BTreeMap;
 
 use super::protocol::{Envelope, ProducerSeq};
+
+/// A single producer's hard event budget for one race. At the driver's
+/// maximum normal rate (one scalar per second plus laps and stops), this is
+/// comfortably beyond 24 hours. It prevents a corrupt or misbehaving client
+/// from making a relay room grow forever.
+pub const MAX_EVENTS_PER_PRODUCER: usize = 150_000;
 
 /// Every event seen so far, per producer, in sequence order.
 #[derive(Debug, Default)]
@@ -38,6 +45,29 @@ impl Ledger {
             Err(at) => {
                 events.insert(at, envelope);
                 true
+            }
+        }
+    }
+
+    /// Whether a relay may accept this envelope without introducing a hole or
+    /// exceeding the per-race storage budget. Clients can retain an
+    /// out-of-order replica while reconnecting, but a relay sees one ordered
+    /// TCP stream per producer and should never create a hole itself: a hole
+    /// would make its contiguous catch-up tip permanently misleading.
+    #[must_use]
+    pub fn accepts_relayed(&self, envelope: &Envelope) -> bool {
+        if envelope.seq == 0 {
+            return false;
+        }
+        let Some(events) = self.by_producer.get(&envelope.producer) else {
+            return envelope.seq == 1;
+        };
+        match events.binary_search_by_key(&envelope.seq, |held| held.seq) {
+            // Re-offers and reconnect redelivery are harmless.
+            Ok(_) => true,
+            Err(_) => {
+                events.len() < MAX_EVENTS_PER_PRODUCER
+                    && events.last().is_some_and(|last| envelope.seq == last.seq.saturating_add(1))
             }
         }
     }
@@ -130,5 +160,17 @@ mod tests {
         ledger.insert(envelope(7, 1));
         ledger.insert(envelope(7, 2));
         assert_eq!(ledger.next_seq(7), 3);
+    }
+
+    #[test]
+    fn a_relay_accepts_only_contiguous_nonzero_history() {
+        let mut ledger = Ledger::default();
+        assert!(!ledger.accepts_relayed(&envelope(7, 0)));
+        assert!(!ledger.accepts_relayed(&envelope(7, 2)), "a relay must not create its first gap");
+        assert!(ledger.accepts_relayed(&envelope(7, 1)));
+        ledger.insert(envelope(7, 1));
+        assert!(ledger.accepts_relayed(&envelope(7, 1)), "a reconnect may redeliver");
+        assert!(!ledger.accepts_relayed(&envelope(7, 3)), "the missing seq 2 must be repaired first");
+        assert!(ledger.accepts_relayed(&envelope(7, 2)));
     }
 }

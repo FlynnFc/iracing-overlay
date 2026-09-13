@@ -25,7 +25,10 @@ use super::snapshot::{
     RelativeMeta, StandingsEntry, TelemetrySnapshot, TrackWetness, TyreInfo, TyreState, WeatherSnapshot,
     track_location_from_raw,
 };
-use super::{endurance, faster_class, irating, pit, pit_model, radar, relative, sof, standings, weather};
+use super::team_driver_pace as driver_pace;
+use super::{
+    endurance, faster_class, irating, pit, pit_model, radar, relative, sof, standings, stint_estimation, weather,
+};
 
 /// How long to wait for iRacing to appear before checking again.
 const SESSION_WAIT: Duration = Duration::from_secs(5);
@@ -107,7 +110,7 @@ pub struct SnapshotTuning {
 /// wake a paint loop (e.g. `egui::Context::request_repaint`).
 pub fn run(
     tx: &Sender<TelemetrySnapshot>,
-    requests: &std::sync::mpsc::Receiver<pit::PitRequest>,
+    requests: &std::sync::mpsc::Receiver<pit::QueuedPitRequest>,
     tuning: SnapshotTuning,
     on_update: impl Fn(),
 ) {
@@ -338,6 +341,18 @@ const CANDIDATE_VARS: &[(&str, &[&str])] = &[
     ),
     ("state", &["IsOnTrack", "IsInGarage", "PlayerCarInPitStall", "OnPitRoad", "PlayerTrackSurface", "SessionFlags"]),
     ("tyres", &["PlayerTireCompound"]),
+    (
+        "rival stop evidence",
+        &[
+            "CarIdxOnPitRoad",
+            "CarIdxTrackSurface",
+            "CarIdxLap",
+            "CarIdxLapCompleted",
+            "CarIdxLapDistPct",
+            "CarIdxLastLapTime",
+            "CarIdxTireCompound",
+        ],
+    ),
     // Which player scalars survive climbing out of the car in a team session.
     // Run from the spotter seat while a team-mate drives, then again from the
     // car; the two dumps decide every open question in
@@ -459,6 +474,9 @@ unsafe fn describe_value(session: &Session, var: &Var, player_idx: Option<usize>
             (VarType::Float, false) => {
                 session.value::<&[f32]>(var).map_or_else(|e| format!("<{e:?}>"), |v| sample(v, player_idx))
             }
+            (VarType::Bool, false) => {
+                session.value::<&[bool]>(var).map_or_else(|e| format!("<{e:?}>"), |v| sample(v, player_idx))
+            }
             (VarType::Int | VarType::Bitfield, false) => {
                 session.value::<&[i32]>(var).map_or_else(|e| format!("<{e:?}>"), |v| sample(v, player_idx))
             }
@@ -471,7 +489,7 @@ unsafe fn describe_value(session: &Session, var: &Var, player_idx: Option<usize>
 fn run_session(
     session: &mut Session,
     tx: &Sender<TelemetrySnapshot>,
-    requests: &std::sync::mpsc::Receiver<pit::PitRequest>,
+    requests: &std::sync::mpsc::Receiver<pit::QueuedPitRequest>,
     tuning: SnapshotTuning,
     on_update: &impl Fn(),
 ) {
@@ -493,6 +511,7 @@ fn run_session(
                 // SAFETY: `vars` were looked up against this exact `session`.
                 let snapshot = unsafe { build_snapshot(session, &vars, &info_cache, &mut trackers, tuning) };
                 let service = snapshot.pit_service;
+                let identity = snapshot.identity.clone();
                 if tx.send(snapshot).is_err() {
                     return; // UI thread is gone; stop polling
                 }
@@ -501,7 +520,7 @@ fn run_session(
                 // intents and they are carried out here, against the state
                 // this same tick just read.
                 // SAFETY: `session` is live and connected.
-                unsafe { send_pit_requests(session, requests, &service) };
+                unsafe { send_pit_requests(session, requests, &service, &identity) };
                 on_update();
             }
             DataUpdateResult::NoUpdate | DataUpdateResult::FailedToCopyRow => {}
@@ -521,11 +540,15 @@ fn run_session(
 /// `session` must be a live, currently connected `Session`.
 unsafe fn send_pit_requests(
     session: &Session,
-    requests: &std::sync::mpsc::Receiver<pit::PitRequest>,
+    requests: &std::sync::mpsc::Receiver<pit::QueuedPitRequest>,
     service: &pit::PitService,
+    identity: &super::snapshot::SessionIdentity,
 ) {
     while let Ok(request) = requests.try_recv() {
-        for command in pit::commands_for(request, service) {
+        if !request.is_current(std::time::Instant::now(), identity) {
+            continue;
+        }
+        for command in pit::commands_for(request.request, service) {
             // SAFETY: forwarding this function's contract; `broadcast_msg`
             // only posts a Windows message and touches no shared memory.
             if let Err(err) = unsafe { session.broadcast_msg(BroadcastMsg::PitCommand(command)) } {
@@ -545,6 +568,9 @@ struct SessionTrackers {
     /// dropped with the rest on a change of session.
     faster_class_rates: faster_class::ClosingRates,
     stint: StintTracker,
+    stint_estimator: stint_estimation::Estimator,
+    scoring_gaps: ScoringGapTracker,
+    team_drivers: TeamDriverTracking,
     /// The player's own stops, counted from their own car's telemetry rather
     /// than the field-wide inference — see [`PlayerStops`].
     player_stops: PlayerStops,
@@ -552,10 +578,6 @@ struct SessionTrackers {
     off_tracks: OffTrackCounter,
     /// Each car's last real lap number — see [`LapLatch`].
     laps: LapLatch,
-    /// The previous tick's distance-based running order — see [`RaceOrder`].
-    race_order: RaceOrder,
-    /// When each absent car left the world — see [`TowTracker`].
-    tow: TowTracker,
     /// Where each car's race — and current lap — began, for the
     /// position-change markers; see [`PositionChangeTracker`].
     position_change: PositionChangeTracker,
@@ -597,7 +619,7 @@ struct SessionTrackers {
     /// See `focus_car_idx`. `None` where the focus car has no driver entry and
     /// its class is therefore unknown.
     focus_class_id: Option<i32>,
-    /// Field strength per class, recomputed only when a class's ratings move.
+    /// Field strength per class, latched from the complete session roster.
     sof: SofCache,
     /// The field's iRating change estimates; see [`IratingCache`].
     irating: IratingCache,
@@ -606,46 +628,47 @@ struct SessionTrackers {
     session_num: Option<i32>,
 }
 
-/// Remembers each class's field strength so it is computed only when it moves.
+/// Remembers each class's field strength once its session roster is complete.
 ///
 /// [`sof::estimate_sof`] bisects forty times over the whole class, calling
 /// `exp` twice per driver per step — about 4,800 `exp` calls for a full class,
-/// and it is asked once for the focus car's class plus once per class in
-/// [`build_class_sections`]. Run on every telemetry tick that was over a
-/// million `exp` calls a second in a multi-class field.
+/// and it is called once per class when its roster first becomes complete.
 ///
-/// What it computes is a function of one thing: the list of iRatings in the
-/// class. Those come from the session-info YAML, which changes when a driver
-/// joins or leaves and not otherwise — a few times an hour against sixty times
-/// a second. So the inputs are kept alongside the answer and compared, which
-/// costs a slice comparison of a few dozen `i32`s and is exact: there is no
-/// staleness window, the answer is recomputed the moment its inputs differ.
+/// It reads the full session-info roster rather than a displayed or live
+/// subset. The answer remains fixed through later roster churn, including
+/// team-driver swaps, until the session changes.
 #[derive(Debug, Default)]
 struct SofCache {
-    /// One entry per class seen, as `(class id, the ratings it was computed
-    /// from, the answer)`. A `Vec` rather than a map because a session has a
-    /// handful of classes and scanning them beats hashing.
-    entries: Vec<(i32, Vec<i32>, Option<i32>)>,
+    /// One answer per class, as `(class id, answer)`. A `Vec` rather than a
+    /// map because a session has a handful of classes and scanning them beats
+    /// hashing.
+    entries: Vec<(i32, i32)>,
 }
 
 impl SofCache {
-    /// This class's field strength, recomputing only if `iratings` has changed.
-    fn sof(&mut self, class_id: i32, iratings: &[i32]) -> Option<i32> {
-        if let Some((_, known, answer)) = self.entries.iter().find(|(id, _, _)| *id == class_id)
-            && known == iratings
-        {
-            return *answer;
+    /// Captures SOF from the complete roster as soon as each competitor in a
+    /// class has an iRating. Answers deliberately do not move until the next
+    /// concrete session resets this cache.
+    fn observe_roster(&mut self, drivers: &HashMap<i32, DriverMeta>) {
+        let mut classes: HashMap<i32, Vec<i32>> = HashMap::new();
+        for driver in drivers.values().filter(|driver| driver.is_competitor) {
+            classes.entry(driver.car_class_id).or_default().push(driver.irating);
         }
-        let answer = sof::estimate_sof(iratings);
-        match self.entries.iter_mut().find(|(id, _, _)| *id == class_id) {
-            Some(entry) => {
-                entry.1.clear();
-                entry.1.extend_from_slice(iratings);
-                entry.2 = answer;
+        for (class_id, ratings) in classes {
+            if self.entries.iter().any(|(known_class, _)| *known_class == class_id)
+                || ratings.iter().any(|rating| *rating <= 0)
+            {
+                continue;
             }
-            None => self.entries.push((class_id, iratings.to_vec(), answer)),
+            if let Some(answer) = sof::estimate_sof(&ratings) {
+                self.entries.push((class_id, answer));
+            }
         }
-        answer
+    }
+
+    /// The SOF latched for this class, if its roster was complete.
+    fn sof(&self, class_id: i32) -> Option<i32> {
+        self.entries.iter().find_map(|(known_class, answer)| (*known_class == class_id).then_some(*answer))
     }
 }
 
@@ -916,6 +939,8 @@ struct TelemetryVars {
     car_idx_position: Var,
     car_idx_class_position: Var,
     car_idx_track_surface: Var,
+    /// Direct per-car pit-road state where the simulator supplies it.
+    car_idx_on_pit_road: Option<Var>,
     car_idx_est_time: Var,
     car_idx_lap: Var,
     lap_last_lap_time: Option<Var>,
@@ -986,6 +1011,12 @@ struct TelemetryVars {
     /// Ground speed in m/s, used to distinguish a stopped pit service from a
     /// drive-through.
     speed: Option<Var>,
+    /// The player's direct pit-road state. `CarIdxTrackSurface` is still the
+    /// field-wide fallback, but it can briefly be stale around a pit exit.
+    on_pit_road: Option<Var>,
+    /// iRacing's direct tow signal for the player's own car. A positive value
+    /// means a tow is active; no equivalent is published for rival cars.
+    player_car_tow_time: Option<Var>,
     /// Whether the car is sitting in the garage with the setup screen up, so
     /// the overlay can get out of the way of it.
     ///
@@ -1072,6 +1103,7 @@ struct FuelTracker {
     /// [`FUEL_WINDOW`] of them the slower pace is believed and the window
     /// reseeded — rain or deliberate saving, not an anomaly.
     slow_streak: u8,
+    last_sample_secs: Option<f64>,
 }
 
 /// One racing lap's fuel burn, tagged with the lap time that vouches for it.
@@ -1153,6 +1185,41 @@ const FUEL_WINDOW: usize = 5;
 const FUEL_LAP_OUTLIER_RATIO: f32 = 1.02;
 
 impl FuelTracker {
+    fn measured_burn(&self) -> Option<f32> {
+        self.recent.iter().map(|lap| lap.burn_litres).max_by(f32::total_cmp)
+    }
+
+    /// Preserve measured history through a driver/telemetry gap, but never
+    /// measure across it: an unseen refuel or partial lap has unknown burn.
+    fn interrupt(&mut self) {
+        self.last_lap = 0;
+        self.last_level = 0.0;
+        self.lap_touched_pits = true;
+        self.last_sample_secs = None;
+    }
+
+    fn observe(&mut self, lap: i32, level: Option<f32>, lap_secs: f32, on_pit_road: bool, at_secs: f64) -> Option<f32> {
+        let Some(level) = level.filter(|level| level.is_finite() && *level >= 0.0) else {
+            self.interrupt();
+            return None;
+        };
+        if !at_secs.is_finite() {
+            self.interrupt();
+            return None;
+        }
+        if self.last_sample_secs.is_some_and(|previous| !(0.0..=2.0).contains(&(at_secs - previous))) {
+            self.interrupt();
+        }
+        let partial_lap = self.last_sample_secs.is_none();
+        self.last_sample_secs = Some(at_secs);
+        let reading = self.update(lap, level, lap_secs, on_pit_road);
+        if partial_lap {
+            // Attaching/resuming halfway round has no start-of-lap tank.
+            self.lap_touched_pits = true;
+        }
+        reading
+    }
+
     /// Records `level_litres` at each lap change and returns the litres to
     /// plan a lap on, or `None` before a racing lap has completed.
     ///
@@ -1170,8 +1237,17 @@ impl FuelTracker {
     /// reads at the crossing — the same pairing [`LapPace::update`] relies on
     /// — and zero or negative when none has been published.
     fn update(&mut self, lap: i32, level_litres: f32, last_lap_secs: f32, on_pit_road: bool) -> Option<f32> {
+        if lap < 0 || !level_litres.is_finite() || level_litres < 0.0 {
+            self.interrupt();
+            return self.measured_burn();
+        }
         if lap != self.last_lap {
-            if self.last_lap > 0 && !self.lap_touched_pits && self.last_level > level_litres {
+            if self.last_lap > 0
+                && lap == self.last_lap.saturating_add(1)
+                && !self.lap_touched_pits
+                && !on_pit_road
+                && self.last_level > level_litres
+            {
                 self.record(self.last_level - level_litres, last_lap_secs);
             }
             self.last_lap = lap;
@@ -1183,7 +1259,7 @@ impl FuelTracker {
         } else if on_pit_road {
             self.lap_touched_pits = true;
         }
-        self.recent.iter().map(|l| l.burn_litres).max_by(f32::total_cmp)
+        self.measured_burn()
     }
 
     /// Admits one completed racing lap to the window, or rejects it as off-pace.
@@ -1331,6 +1407,7 @@ impl TelemetryVars {
             car_idx_position: find("CarIdxPosition")?,
             car_idx_class_position: find("CarIdxClassPosition")?,
             car_idx_track_surface: find("CarIdxTrackSurface")?,
+            car_idx_on_pit_road: find("CarIdxOnPitRoad"),
             car_idx_est_time: find("CarIdxEstTime")?,
             car_idx_lap: find("CarIdxLap")?,
             lap_last_lap_time: find("LapLastLapTime"),
@@ -1361,6 +1438,8 @@ impl TelemetryVars {
             track_wetness: find("TrackWetness"),
             yaw: find("Yaw"),
             speed: find("Speed"),
+            on_pit_road: find("OnPitRoad"),
+            player_car_tow_time: find("PlayerCarTowTime"),
             in_garage: find("IsInGarage"),
             player_tyre_compound: find("PlayerTireCompound"),
             // SAFETY: forwarding `find_all`'s own contract.
@@ -1386,6 +1465,7 @@ fn unnamed() -> Arc<str> {
 /// at the top of [`super::snapshot`].
 #[derive(Debug, Clone)]
 struct DriverMeta {
+    team_id: Option<i32>,
     user_name: Arc<str>,
     /// The customer id of whoever is in the car — in a team session, the
     /// current driver rather than the entry's owner. `None` where the YAML
@@ -1421,6 +1501,8 @@ struct DriverMeta {
 #[derive(Debug, Default)]
 struct SessionInfoCache {
     last_update: Option<i32>,
+    /// Only a successfully parsed revision may contribute new scoring evidence.
+    valid_update: Option<i32>,
     player_car_idx: Option<i32>,
     /// `WeekendInfo.TeamRacing`: whether this is a team session, where the
     /// car's driver entry can name somebody other than the player.
@@ -1484,6 +1566,7 @@ impl SessionInfoCache {
         let yaml = unsafe { session.session_info() };
         match SessionInfoYaml::parse(&yaml) {
             Ok(info) => {
+                self.valid_update = Some(update);
                 self.player_car_idx = Some(info.driver_info.driver_car_idx);
                 self.team_racing = info.weekend_info.team_racing != 0;
                 self.driver_user_id = info.driver_info.driver_user_id;
@@ -1496,6 +1579,7 @@ impl SessionInfoCache {
                         // The one place these strings are allocated: once per
                         // driver per YAML version, rather than per tick.
                         let meta = DriverMeta {
+                            team_id: driver.stable_team_id(),
                             user_name: Arc::from(driver.user_name.as_str()),
                             user_id: driver.user_id,
                             car_number: Arc::from(driver.car_number.as_str()),
@@ -1543,75 +1627,11 @@ impl SessionInfoCache {
                 self.track_length_m = parse_track_length(&info.weekend_info.track_length);
                 self.tank_capacity_litres = info.driver_info.tank_capacity_litres();
             }
-            Err(err) => println!("note: could not parse session info: {err:#}"),
+            Err(err) => {
+                self.valid_update = None;
+                println!("note: could not parse session info: {err:#}");
+            }
         }
-    }
-}
-
-/// How long a vanished car keeps its tow marker, in seconds.
-///
-/// An iRacing tow runs a minute or two. A car gone longer than this has
-/// retired, disconnected or is sitting in the garage between stints, and a
-/// tow clock still ticking under it would be a claim about something else.
-const TOW_SHOW_MAX_SECS: f64 = 180.0;
-
-/// When each car left the world, for the Standings tow marker.
-///
-/// iRacing publishes a tow timer for the player alone (`PlayerCarTowTime`);
-/// for everyone else the only visible fact is the car vanishing from
-/// `CarIdxTrackSurface` mid-session. The clock here is therefore *time since
-/// it vanished*, counted up locally — how long they have been gone, not how
-/// long the sim will hold them, which nothing published can say.
-#[derive(Debug, Default)]
-struct TowTracker {
-    /// Cars seen in the world at least once this session, so a grid slot
-    /// whose driver never gridded is not "towing".
-    seen: std::collections::HashSet<i32>,
-    /// `SessionTime` when each currently-absent car vanished.
-    vanished_at: HashMap<i32, f64>,
-}
-
-impl TowTracker {
-    /// Seconds this car has been gone from the world, or `None` where that
-    /// isn't a tow: still in the world, never seen in it, or gone longer
-    /// than [`TOW_SHOW_MAX_SECS`].
-    fn tow_secs(&mut self, car_idx: i32, in_world: bool, now: f64) -> Option<f64> {
-        if in_world {
-            self.seen.insert(car_idx);
-            self.vanished_at.remove(&car_idx);
-            return None;
-        }
-        if !self.seen.contains(&car_idx) {
-            return None;
-        }
-        let since = now - *self.vanished_at.entry(car_idx).or_insert(now);
-        (since <= TOW_SHOW_MAX_SECS).then_some(since)
-    }
-}
-
-#[cfg(test)]
-mod tow_tests {
-    use super::TowTracker;
-
-    #[test]
-    fn a_car_that_vanishes_mid_session_ticks_a_tow_clock() {
-        let mut tow = TowTracker::default();
-        assert_eq!(tow.tow_secs(4, true, 100.0), None, "in the world is not a tow");
-        assert_eq!(tow.tow_secs(4, false, 130.0), Some(0.0), "the clock starts when the car vanishes");
-        assert_eq!(tow.tow_secs(4, false, 172.5), Some(42.5));
-        assert_eq!(tow.tow_secs(4, true, 200.0), None, "back in the world ends the tow");
-        assert_eq!(tow.tow_secs(4, false, 210.0), Some(0.0), "a second tow starts a fresh clock");
-    }
-
-    /// A car that has never gridded is absent, not towing; and one gone past
-    /// the cap has retired or disconnected, which is not a tow either.
-    #[test]
-    fn absence_alone_is_not_a_tow() {
-        let mut tow = TowTracker::default();
-        assert_eq!(tow.tow_secs(9, false, 50.0), None, "never seen in the world");
-        tow.tow_secs(9, true, 60.0);
-        tow.tow_secs(9, false, 70.0);
-        assert_eq!(tow.tow_secs(9, false, 70.0 + super::TOW_SHOW_MAX_SECS + 1.0), None, "gone too long to be a tow");
     }
 }
 
@@ -1962,6 +1982,13 @@ unsafe fn build_snapshot(
             None => &[],
         }
     };
+    let bool_slice_of_opt = |var: &Option<Var>| -> &[bool] {
+        match var {
+            // SAFETY: forwarding build_snapshot's live-session contract.
+            Some(v) => unsafe { session.value::<&[bool]>(v) }.unwrap_or(&[]),
+            None => &[],
+        }
+    };
     let f64_of_opt = |var: &Option<Var>| -> Option<f64> {
         var.as_ref().and_then(|v| {
             // SAFETY: see above.
@@ -1980,6 +2007,7 @@ unsafe fn build_snapshot(
     let positions = i32_slice_of(&vars.car_idx_position);
     let class_positions = i32_slice_of(&vars.car_idx_class_position);
     let track_surfaces = i32_slice_of(&vars.car_idx_track_surface);
+    let pit_road = bool_slice_of_opt(&vars.car_idx_on_pit_road);
     let est_times = f32_slice_of(&vars.car_idx_est_time);
     let laps = i32_slice_of(&vars.car_idx_lap);
     let best_laps = f32_slice_of_opt(&vars.car_idx_best_lap_time);
@@ -2003,6 +2031,11 @@ unsafe fn build_snapshot(
     // history and the fuel average alike.
     let session_num = i32_of_opt(&vars.session_num);
     trackers.sync_to_session(session_num);
+    let session_num = session_num.or(trackers.session_num);
+    // The YAML roster has every registered competitor, including cars that
+    // have not reached the rendered field yet. Latch each class as soon as
+    // every one of those competitors has an iRating.
+    trackers.sof.observe_roster(&info.drivers);
 
     // Which car everything below is centred on: the player's own in every
     // session they drive, and the one the camera is watching when they are
@@ -2041,6 +2074,18 @@ unsafe fn build_snapshot(
         .and_then(|i| track_surfaces.get(i))
         .copied()
         .map_or(TrackLocation::NotInWorld, track_location_from_raw);
+    // The player has direct pit signals that are more reliable than the
+    // per-car surface around the stall and pit exit. Capture them before the
+    // shared standings/stint pass so their own current stint and OUT state
+    // use the same resilient evidence as their stop counter below.
+    let player_on_pit_road = vars.on_pit_road.as_ref().and_then(|var| {
+        // SAFETY: the optional handle was found against this live session.
+        unsafe { session.value::<bool>(var) }.ok()
+    });
+    let player_in_pit_stall = vars.black_box.player_in_pit_stall.as_ref().and_then(|var| {
+        // SAFETY: the optional handle was found against this live session.
+        unsafe { session.value::<bool>(var) }.ok()
+    });
     let seat = resolve_seat(SeatInputs {
         drivers: &info.drivers,
         player_car_idx,
@@ -2181,18 +2226,15 @@ unsafe fn build_snapshot(
     let session_kind = session_type.as_deref().map(SessionKind::from_name).unwrap_or_default();
     let is_race = session_kind.is_race();
     // Which order the field is ranked in — see [`StandingsOrder`]:
-    // - Between the green and the checkered, how far each car has driven.
-    //   `Racing` (which cautions stay inside) is exactly the stretch where a
-    //   mid-lap pass is a change of position; see [`apply_distance_order`].
+    // - In a race, iRacing's shared scored position. Local track-distance
+    //   telemetry can differ when teammates render different field subsets.
     // - While a race's field forms up, the grid qualifying set — iRacing's
     //   own slots fill in one by one as cars grid, so whoever grids first
     //   reads P1 until then.
     // - In practice and qualifying, quickest lap first.
     // - Otherwise — post-checkered, or a state the sim didn't publish — the
     //   scorer's order, which can never invent a position.
-    let order = if is_race && matches!(session_state, Some(SessionState::Racing)) {
-        StandingsOrder::Distance(&mut trackers.race_order)
-    } else if is_race
+    let order = if is_race
         && !info.qualify_grid.is_empty()
         && matches!(session_state, Some(SessionState::GetInCar | SessionState::Warmup | SessionState::ParadeLaps))
     {
@@ -2211,16 +2253,20 @@ unsafe fn build_snapshot(
             last_laps,
             f2_times,
             track_surfaces,
+            pit_road,
             laps,
             positions,
             lap_dist_pcts,
             session_flags: session_flags_per_car,
+            player_car_idx,
+            player_on_pit_road,
+            player_in_pit_stall,
         },
         &mut trackers.stint,
         &mut trackers.off_tracks,
         &mut trackers.laps,
         session_time_secs,
-        order,
+        &order,
     );
     // How the race has treated each car. Races only: in practice and
     // qualifying "places since the start" would measure the order lap times
@@ -2250,13 +2296,7 @@ unsafe fn build_snapshot(
     // `build_standings`.
     let class_positions_by_car: HashMap<i32, i32> =
         standings.iter().map(|entry| (entry.car_idx, entry.class_position)).collect();
-    // Reuses the same buffer both SOF calls below read from, so the focus
-    // car's class is not collected twice per tick.
-    let mut class_iratings: Vec<i32> = Vec::new();
-    let sof = my_car_class_id.and_then(|class_id| {
-        class_iratings.extend(standings.iter().filter(|e| e.car_class_id == class_id).map(|e| e.irating));
-        trackers.sof.sof(class_id, &class_iratings)
-    });
+    let sof = my_car_class_id.and_then(|class_id| trackers.sof.sof(class_id));
     // In a team event the limit is applied to the team's count, which is the
     // one that ends the race; the counters are equal everywhere else.
     let incidents = if info.team_racing {
@@ -2382,6 +2422,7 @@ unsafe fn build_snapshot(
             ),
             recent_laps: trackers.recent_laps.samples(car_idx),
             penalty: session_flags_per_car.get(i).copied().and_then(relative::penalty_from_flags),
+            is_out_lap: trackers.stint.is_out_lap(car_idx, laps[i].saturating_sub(1).max(0), track_location),
         });
     }
 
@@ -2409,11 +2450,16 @@ unsafe fn build_snapshot(
             lap_diff: 0,
             best_recent_lap_secs: trackers.recent_laps.update(
                 focus_car_idx,
-                me_lap,
+                me_lap.saturating_sub(1).max(0),
                 last_laps.get(i).copied().unwrap_or(0.0),
             ),
             recent_laps: trackers.recent_laps.samples(focus_car_idx),
             penalty: session_flags_per_car.get(i).copied().and_then(relative::penalty_from_flags),
+            is_out_lap: trackers.stint.is_out_lap(
+                focus_car_idx,
+                me_lap,
+                track_surfaces.get(i).copied().map_or(TrackLocation::NotInWorld, track_location_from_raw),
+            ),
         });
     }
     // Ordered after the focus car is added, so its own row takes its place in
@@ -2529,25 +2575,30 @@ unsafe fn build_snapshot(
     // estimate says so, or rain is measurably falling.
     let track_wet =
         track_wetness.is_some_and(TrackWetness::is_wet) || precip_now.is_some_and(|p| p > WET_TRACK_PRECIP_MIN);
-    // The per-row facts that need this tick-wide context: the tow marker
-    // (the tracker lives across ticks) and the tyre column (whose wet ring
-    // depends on the track's own wetness, read just above).
+    // The per-row facts that need this tick-wide context: the player's direct
+    // tow signal and the tyre column (whose wet ring depends on the track's
+    // own wetness, read just above). iRacing publishes no rival tow signal.
+    let player_tow_secs =
+        f32_of_opt(&vars.player_car_tow_time).filter(|seconds| seconds.is_finite() && *seconds > 0.0).map(f64::from);
     let tire_compounds = i32_slice_of_opt(&vars.car_idx_tire_compound);
     // The player's own stall flag, read here rather than with the rest of the
     // black box below because their stop count is settled before the per-row
     // pass — see [`PlayerStops`].
-    let player_in_pit_stall = bool_of(&vars.black_box.player_in_pit_stall);
     let player_stops = trackers.player_stops.update(PlayerStopTick {
         session_time_secs,
         // Pit road whole, not the box alone: a drive-through is a visit to it
         // too, and telling those apart is the whole job of the tracker.
-        on_pit_road: matches!(player_track_location, TrackLocation::InPitStall | TrackLocation::ApproachingPits),
-        in_box: vars.black_box.player_in_pit_stall.as_ref().map(|_| player_in_pit_stall),
+        // `OnPitRoad` is the player's direct signal. The per-car surface is
+        // retained for older sessions that do not publish it, but can lag a
+        // pit exit or briefly go absent while the car remains in its box.
+        on_pit_road: player_on_pit_road
+            .unwrap_or(matches!(player_track_location, TrackLocation::InPitStall | TrackLocation::ApproachingPits)),
+        in_box: player_in_pit_stall,
         speed_mps: f32_of_opt(&vars.speed),
-        in_world: player_track_location != TrackLocation::NotInWorld,
+        in_world: player_track_location != TrackLocation::NotInWorld || player_on_pit_road == Some(true),
         official_stops: this_session
             .and_then(|results| results.results_positions.iter().find(|row| row.car_idx == player_car_idx))
-            .map(|row| row.pit_stops),
+            .and_then(|row| row.pit_stops),
     });
     for entry in &mut standings {
         // Their own row takes the count measured from their own car; every
@@ -2555,8 +2606,7 @@ unsafe fn build_snapshot(
         if entry.car_idx == player_car_idx {
             entry.pit_stops = player_stops;
         }
-        entry.tow_secs =
-            trackers.tow.tow_secs(entry.car_idx, entry.track_location != TrackLocation::NotInWorld, session_time_secs);
+        entry.tow_secs = (entry.car_idx == player_car_idx).then_some(player_tow_secs).flatten();
         let compound = usize::try_from(entry.car_idx)
             .ok()
             .and_then(|i| tire_compounds.get(i))
@@ -2579,7 +2629,7 @@ unsafe fn build_snapshot(
         on_wet_tyres: on_wet_tyres(i32_of_opt(&vars.player_tyre_compound), &info.tyre_is_wet_by_index, track_wet),
         wind_dir_relative_to_car_rad: weather::wind_direction_relative_to_car(f32_of_opt(&vars.wind_dir), car_yaw_rad),
     };
-    let class_sections = build_class_sections(&standings, &mut trackers.sof);
+    let class_sections = build_class_sections(&standings, &trackers.sof);
     // Settle the lane measurement before NET consumes it on the exit tick.
     let phase = match me_track_location {
         TrackLocation::InPitStall => pit_model::LanePhase::Stall,
@@ -2591,6 +2641,35 @@ unsafe fn build_snapshot(
         println!("note: pit lane transit measured at {transit:.1}s");
     }
     let pit_model = trackers.pit_loss.model();
+    let under_caution = Flags::from_bits_truncate(i32_of_opt(&vars.session_flags).unwrap_or(0).cast_unsigned())
+        .intersects(Flags::YELLOW | Flags::YELLOW_WAVING | Flags::CAUTION | Flags::CAUTION_WAVING | Flags::RED);
+    trackers.scoring_gaps.update(session_time_secs, info, session_num);
+    for entry in &mut standings {
+        entry.scoring_gap_to_leader_secs = trackers.scoring_gaps.gap(entry.car_idx, session_time_secs);
+    }
+    estimate_stint_ages(
+        &mut standings,
+        info,
+        session_num,
+        &mut trackers.stint,
+        &trackers.laps,
+        &mut trackers.stint_estimator,
+        session_time_secs,
+        is_race && racing_under_way,
+        under_caution,
+        tuning.pit_loss_secs,
+        pit_model,
+    );
+    trackers.team_drivers.annotate(
+        &mut standings,
+        info,
+        session_num,
+        &trackers.stint,
+        &trackers.laps,
+        session_time_secs,
+        is_race && racing_under_way,
+        under_caution,
+    );
     let net_gaps = live_net_gaps(&standings, laps, lap_dist_pcts, &trackers.lap_curve, my_car_class_id);
     let mut endurance_meta = annotate_endurance(
         &mut standings,
@@ -2611,13 +2690,15 @@ unsafe fn build_snapshot(
     // failing the whole tick.
     let bb = &vars.black_box;
     let flag_of = |var: &Option<Var>| f32_of_opt(var).is_some_and(|v| v > 0.5);
-    let fuel_level_litres = f32_of_opt(&bb.fuel_level).unwrap_or(0.0);
+    let fuel_reading = f32_of_opt(&bb.fuel_level).filter(|level| level.is_finite() && *level >= 0.0);
+    let fuel_level_litres = fuel_reading.unwrap_or(0.0);
     let fuel_armed = flag_of(&bb.fuel_armed);
     let fuel_amount_litres = f32_of_opt(&bb.fuel_amount).unwrap_or(0.0);
     let pit_service = pit::PitService {
         fuel_armed,
         fuel_amount_litres,
         fuel_level_litres,
+        fuel_reading_valid: fuel_reading.is_some(),
         // The YAML's own figure first; the inference from level and percent
         // only stands in where a session publishes no tank, and is guarded
         // against a near-empty one, where dividing two small numbers swings
@@ -2630,11 +2711,12 @@ unsafe fn build_snapshot(
         // The lap time comes straight from `LapLastLapTime` rather than the
         // focus-aware `last_lap_secs` above, because the tank being measured
         // is the player's car whatever the camera is doing.
-        fuel_per_lap_litres: trackers.fuel.update(
+        fuel_per_lap_litres: trackers.fuel.observe(
             me_lap,
-            fuel_level_litres,
+            fuel_reading.filter(|_| driving && focus_is_player),
             f32_of_opt(&vars.lap_last_lap_time).unwrap_or(0.0),
             on_pit_road,
+            session_time_secs,
         ),
         tyres_armed: std::array::from_fn(|i| flag_of(&bb.tyre_change[i])),
         tyre_pressures_kpa: std::array::from_fn(|i| f32_of_opt(&bb.tyre_pressure[i]).unwrap_or(0.0)),
@@ -2681,6 +2763,10 @@ unsafe fn build_snapshot(
     // the seat, which is exactly who a "set by" note should read.
     let identity = crate::telemetry::snapshot::SessionIdentity {
         subsession: info.sub_session_id,
+        // `sync_to_session` retains the last concrete value through a brief
+        // missing telemetry sample, so team sync cannot mistake that blink
+        // for a different phase or an unknown one.
+        session_num: trackers.session_num,
         player_cust_id: info.driver_user_id.and_then(|id| u32::try_from(id).ok()),
         player_name: info.drivers.get(&player_car_idx).map(|meta| Arc::clone(&meta.user_name)),
     };
@@ -2738,11 +2824,12 @@ unsafe fn build_snapshot(
             // with time under power, so a distance-based comparison reads rich
             // down every straight and lean through every corner — the same error
             // that made track-position relative gaps breathe.
-            used_this_lap_litres: trackers.lap_fuel_use.update(
-                me_lap,
-                pit_service.fuel_level_litres,
-                pit_service.on_pit_road,
-            ),
+            used_this_lap_litres: if driving && focus_is_player && fuel_reading.is_some() {
+                trackers.lap_fuel_use.update(me_lap, pit_service.fuel_level_litres, pit_service.on_pit_road)
+            } else {
+                trackers.lap_fuel_use = LapFuelUse::default();
+                None
+            },
             lap_fraction: me_lap_fraction,
         },
         pit_model,
@@ -2825,6 +2912,290 @@ fn build_grid_status(
     Some(GridStatus { cars_gridded, car_count, countdown_secs })
 }
 
+#[derive(Debug, Default)]
+struct DriverStintEvidence {
+    boundary_lap: Option<i32>,
+    stops: Option<i32>,
+    scored_lap: Option<i32>,
+    lap_excluded: bool,
+}
+
+#[derive(Debug, Default)]
+struct TeamDriverTracking {
+    tracker: driver_pace::TeamDriverPaceTracker,
+    evidence: HashMap<i32, DriverStintEvidence>,
+    last_now: Option<f64>,
+}
+
+impl TeamDriverTracking {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "connects verified scoring and local boundaries to the driver pace tracker"
+    )]
+    fn annotate(
+        &mut self,
+        entries: &mut [StandingsEntry],
+        info: &SessionInfoCache,
+        session_num: Option<i32>,
+        stints: &StintTracker,
+        laps: &LapLatch,
+        now: f64,
+        racing: bool,
+        caution: bool,
+    ) {
+        for entry in entries.iter_mut() {
+            entry.team_driver_strength = None;
+            entry.team_drivers = Arc::from([]);
+        }
+        if !racing || !info.team_racing {
+            *self = Self::default();
+            return;
+        }
+        if self.last_now.is_some_and(|last| now < last) {
+            *self = Self::default();
+        }
+        let continuous = self.last_now.is_none_or(|last| now >= last && now - last <= 2.0);
+        self.last_now = Some(now);
+        let rows: HashMap<i32, &ResultsPosition> = info
+            .valid_update
+            .and(session_num)
+            .and_then(|num| info.sessions.iter().find(|s| s.session_num == num))
+            .into_iter()
+            .flat_map(|s| &s.results_positions)
+            .map(|r| (r.car_idx, r))
+            .collect();
+        let observations: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| {
+                let driver = info.drivers.get(&entry.car_idx)?;
+                let state = stints.cars.get(&entry.car_idx);
+                let evidence = self.evidence.entry(entry.car_idx).or_default();
+                let row = rows.get(&entry.car_idx);
+                let scored_lap = row.map(|r| r.laps_complete);
+                let boundary_lap = state.filter(|s| s.current_start_observed).and_then(|s| s.current_start_lap);
+                let increased = evidence.stops.is_some_and(|old| entry.pit_stops > old);
+                let boundary = if increased && boundary_lap.is_some() {
+                    driver_pace::StintBoundary::ConfirmedCompletion
+                } else if increased {
+                    driver_pace::StintBoundary::UnconfirmedBoundary
+                } else if boundary_lap.is_some() && boundary_lap != evidence.boundary_lap {
+                    driver_pace::StintBoundary::ObservedStart
+                } else {
+                    driver_pace::StintBoundary::None
+                };
+                evidence.boundary_lap = boundary_lap;
+                evidence.stops = Some(entry.pit_stops);
+                let local_lap = laps.0.get(&entry.car_idx).copied().unwrap_or(0);
+                evidence.lap_excluded |=
+                    caution || state.is_some_and(|s| s.was_in_pit_lane || s.out_lap_started_at == Some(local_lap));
+                let disposition = if evidence.lap_excluded {
+                    driver_pace::LapDisposition::Exclude
+                } else {
+                    driver_pace::LapDisposition::Clean
+                };
+                if scored_lap.is_some() && scored_lap != evidence.scored_lap {
+                    evidence.scored_lap = scored_lap;
+                    evidence.lap_excluded = caution || state.is_some_and(|s| s.was_in_pit_lane);
+                }
+                Some(driver_pace::TeamDriverObservation {
+                    car_idx: entry.car_idx,
+                    team_id: driver.team_id,
+                    user_id: driver.user_id,
+                    driver_name: &driver.user_name,
+                    irating: (driver.irating > 0).then_some(driver.irating),
+                    class_id: driver.car_class_id,
+                    scored_lap,
+                    last_lap_secs: row.map(|r| r.last_time),
+                    lap_disposition: disposition,
+                    continuously_observed: continuous && info.valid_update.is_some(),
+                    boundary,
+                })
+            })
+            .collect();
+        let frame = self.tracker.update(driver_pace::TeamDriverTick {
+            now_secs: now,
+            scoring_revision: info.valid_update.and_then(|revision| u64::try_from(revision).ok()),
+            active_cars: &observations,
+        });
+        let mut known: HashMap<i32, Vec<driver_pace::KnownTeamDriver>> = HashMap::new();
+        for driver in frame.known_drivers {
+            known.entry(driver.team_id).or_default().push(driver);
+        }
+        let known: HashMap<i32, Arc<[driver_pace::KnownTeamDriver]>> =
+            known.into_iter().map(|(team, drivers)| (team, Arc::from(drivers))).collect();
+        for strength in frame.strengths {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.car_idx == strength.car_idx) {
+                entry.team_drivers = known.get(&strength.team_id).cloned().unwrap_or_else(|| Arc::from([]));
+                entry.team_driver_strength = Some(strength);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ScoredGap {
+    lap: i32,
+    gap: Option<f32>,
+    updated_at: f64,
+    lifetime_secs: f64,
+}
+
+/// A crossed-line gap becomes useful only after this client sees that car's
+/// scorer lap advance. An unchanged session-info row cannot renew its age.
+#[derive(Debug, Default)]
+struct ScoringGapTracker {
+    revision: Option<i32>,
+    last_now: Option<f64>,
+    cars: HashMap<i32, ScoredGap>,
+}
+
+impl ScoringGapTracker {
+    fn update(&mut self, now: f64, info: &SessionInfoCache, session_num: Option<i32>) {
+        if !now.is_finite() {
+            self.cars.clear();
+            return;
+        }
+        if self.last_now.is_some_and(|previous| now < previous) {
+            *self = Self::default();
+        }
+        self.last_now = Some(now);
+        let Some(revision) = info.valid_update else { return };
+        if self.revision == Some(revision) {
+            return;
+        }
+        if self.revision.is_some_and(|previous| revision < previous) {
+            self.cars.clear();
+        }
+        self.revision = Some(revision);
+        let Some(results) = session_num.and_then(|num| info.sessions.iter().find(|s| s.session_num == num)) else {
+            return;
+        };
+        for row in &results.results_positions {
+            self.observe(row, now);
+        }
+    }
+
+    fn observe(&mut self, row: &ResultsPosition, now: f64) {
+        let state = self.cars.entry(row.car_idx).or_insert(ScoredGap {
+            lap: row.laps_complete,
+            gap: None,
+            updated_at: now,
+            lifetime_secs: 300.0,
+        });
+        if row.laps_complete < state.lap {
+            state.gap = None;
+            state.lap = row.laps_complete;
+            return;
+        }
+        if row.laps_complete == state.lap {
+            return;
+        }
+        state.lap = row.laps_complete;
+        state.gap = row.time.filter(|gap| gap.is_finite() && *gap >= 0.0);
+        state.updated_at = now;
+        let pace =
+            if row.fastest_time.is_finite() && row.fastest_time > 0.0 { row.fastest_time } else { row.last_time };
+        state.lifetime_secs =
+            if pace.is_finite() && pace > 0.0 { (f64::from(pace) * 2.0 + 30.0).max(120.0) } else { 300.0 };
+    }
+
+    fn gap(&self, car_idx: i32, now: f64) -> Option<f32> {
+        let state = self.cars.get(&car_idx)?;
+        (now >= state.updated_at && now - state.updated_at <= state.lifetime_secs).then_some(state.gap).flatten()
+    }
+}
+
+/// An empirical interval from completed, directly observed fuel stints. Never
+/// accepts the estimator's own output as evidence for another estimate.
+fn observed_fuel_range(samples: impl Iterator<Item = i32>) -> Option<(i32, i32)> {
+    let mut samples: Vec<i32> = samples.filter(|laps| *laps >= MIN_FUEL_STINT_LAPS).collect();
+    if samples.len() < 2 {
+        return None;
+    }
+    samples.sort_unstable();
+    let low = samples[samples.len() / 4].saturating_sub(1).max(MIN_FUEL_STINT_LAPS);
+    let high = samples[(samples.len() * 3 / 4).min(samples.len() - 1)].saturating_add(1);
+    Some((low, high))
+}
+
+/// Combines continuous local observations with slower, independently live
+/// scoring. A parsed revision is essential: stale cached rows never become
+/// fresh lap evidence merely because another telemetry tick arrived.
+#[expect(clippy::too_many_arguments, reason = "integration boundary between SDK observations and the pure estimator")]
+fn estimate_stint_ages(
+    standings: &mut [StandingsEntry],
+    info: &SessionInfoCache,
+    session_num: Option<i32>,
+    stints: &mut StintTracker,
+    laps: &LapLatch,
+    estimator: &mut stint_estimation::Estimator,
+    now_secs: f64,
+    race_running: bool,
+    caution: bool,
+    default_pit_loss_secs: f32,
+    pit_model: pit_model::PitModel,
+) {
+    let scored: HashMap<i32, &ResultsPosition> = info
+        .valid_update
+        .and(session_num)
+        .and_then(|num| info.sessions.iter().find(|s| s.session_num == num))
+        .into_iter()
+        .flat_map(|s| &s.results_positions)
+        .map(|row| (row.car_idx, row))
+        .collect();
+    let observations: Vec<stint_estimation::Observation> = standings
+        .iter()
+        .map(|entry| {
+            let state = stints.cars.get(&entry.car_idx);
+            let own_range =
+                observed_fuel_range(state.into_iter().flat_map(|s| s.completed.iter().map(|&(lap, _)| lap)));
+            let peer_range = || {
+                observed_fuel_range(
+                    standings
+                        .iter()
+                        .filter(|peer| peer.car_class_id == entry.car_class_id)
+                        .filter_map(|peer| stints.cars.get(&peer.car_idx))
+                        .flat_map(|s| s.completed.iter().map(|&(lap, _)| lap)),
+                )
+            };
+            let in_world = entry.track_location != TrackLocation::NotInWorld;
+            #[expect(clippy::cast_possible_truncation, reason = "a measured service duration fits f32")]
+            let pit_loss_secs = entry
+                .avg_pit_secs
+                .filter(|secs| secs.is_finite() && *secs > 0.0 && pit_model.transit_runs > 0)
+                .map_or(default_pit_loss_secs, |secs| pit_model.transit_loss_secs + secs as f32);
+            stint_estimation::Observation {
+                car_idx: entry.car_idx,
+                class_id: entry.car_class_id,
+                lap: laps.0.get(&entry.car_idx).copied().unwrap_or(0),
+                scored_lap: scored.get(&entry.car_idx).map(|row| (row.laps_complete, row.last_time)),
+                in_world,
+                in_pit_lane: in_world && state.is_some_and(|s| s.was_in_pit_lane),
+                driver_id: (info.team_racing && info.valid_update.is_some())
+                    .then(|| info.drivers.get(&entry.car_idx).and_then(|driver| driver.user_id).filter(|id| *id > 0))
+                    .flatten(),
+                observed_boundary_lap: state.filter(|s| s.current_start_observed).and_then(|s| s.current_start_lap),
+                completed_stops: entry.pit_stops,
+                range_hint: own_range.or_else(peer_range),
+                pit_loss_secs,
+            }
+        })
+        .collect();
+    let ages = estimator.update(now_secs, info.valid_update, &observations, race_running, caution);
+    for entry in standings {
+        entry.stint_age = ages.get(&entry.car_idx).copied().unwrap_or_default();
+        // Once a hidden visit is possible, the next witnessed stop cannot
+        // teach a "complete fuel stint" spanning this uncertainty. Keep the
+        // measured boundary/count intact and only remove its training status.
+        if race_running
+            && !matches!(entry.stint_age, stint_estimation::StintAge::Observed(_))
+            && let Some(state) = stints.cars.get_mut(&entry.car_idx)
+        {
+            state.current_start_observed = false;
+        }
+    }
+}
+
 /// NET needs current race distance, not the last scoring-line gap. A missing
 /// reading stays missing; zero would invent a car alongside its class leader.
 fn live_net_gaps(
@@ -2869,7 +3240,9 @@ fn live_net_gaps(
         // A different class may spend very different fractions of its lap in
         // each corner; do not apply the focus car's measured curve to it.
         let class_curve = if curve_class_id == Some(leader.car_class_id) { curve } else { &fallback_curve };
-        for entry in standings.iter().filter(|entry| entry.car_class_id == leader.car_class_id) {
+        for entry in standings.iter().filter(|entry| {
+            entry.car_class_id == leader.car_class_id && entry.track_location != TrackLocation::NotInWorld
+        }) {
             if let Some(gap) = progress(entry).and_then(|car| live_gap_secs(class_curve, leader_progress, car, pace)) {
                 gaps.insert(entry.car_idx, gap);
             }
@@ -2895,6 +3268,14 @@ fn race_laps_remaining(
     }
 }
 
+fn stops_for_stint_age(laps_left: i32, age: stint_estimation::StintAge, typical_stint: i32) -> Option<(i32, i32)> {
+    let (min_age, max_age) = age.bounds()?;
+    Some((
+        endurance::stops_remaining(laps_left, min_age, typical_stint)?,
+        endurance::stops_remaining(laps_left, max_age, typical_stint)?,
+    ))
+}
+
 /// Fills in every entry's endurance projection and returns the session-level
 /// summary for the player.
 ///
@@ -2904,6 +3285,10 @@ fn race_laps_remaining(
 /// still owes. Measured service time is added to lane transit, never used
 /// as a replacement for the total loss. Gaps include whole laps and update
 /// with track position, independently of the scorer's F2 timing updates.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pass owns per-class stop forecasts, source validation, ranking and the player summary"
+)]
 fn annotate_endurance(
     standings: &mut [StandingsEntry],
     laps_remaining: Option<i32>,
@@ -2915,16 +3300,14 @@ fn annotate_endurance(
 ) -> EnduranceMeta {
     for entry in standings.iter_mut() {
         entry.stops_remaining = None;
+        entry.stops_remaining_range = None;
         entry.projected_class_position = None;
+        entry.net_gap_from_scoring = false;
+        entry.net_uses_estimated_stint = false;
     }
     let Some(laps_left) = laps_remaining else {
         return EnduranceMeta { multi_stop_race: *multi_stop_race, ..EnduranceMeta::default() };
     };
-
-    for entry in standings.iter_mut() {
-        entry.stops_remaining =
-            entry.avg_stint_laps.and_then(|avg| endurance::stops_remaining(laps_left, entry.current_stint_laps, avg));
-    }
 
     // Projections are class-relative, matching the rest of the widget.
     let class_ids: Vec<i32> = {
@@ -2934,61 +3317,98 @@ fn annotate_endurance(
         ids
     };
     for class_id in class_ids {
-        // NET ranks the active field. An absent car has no forward strategy
-        // to project; leave its NET unknown without blanking every rival.
-        // If it rejoins, it participates again on the next valid reading.
-        let indices: Vec<usize> = standings
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.car_class_id == class_id && e.track_location != TrackLocation::NotInWorld)
-            .map(|(i, _)| i)
-            .collect();
-        // A class where nobody has a stint history yet has nothing to
-        // project; leaving the field `None` keeps the column blank rather
-        // than showing everyone their current position as a "projection".
-        if indices.iter().all(|&i| standings[i].stops_remaining.is_none()) {
-            continue;
-        }
+        // Every classified car remains part of its class's strategy. An
+        // unrendered car uses its official scorer gap below when that source
+        // is complete; it never disappears from NET merely because a local
+        // client does not simulate it this tick.
+        let indices: Vec<usize> =
+            standings.iter().enumerate().filter(|(_, e)| e.car_class_id == class_id).map(|(i, _)| i).collect();
         // A car without a stint history of its own — it hasn't pitted yet, or
         // its only stop was for damage — is projected on the class's typical
         // stint instead. Projecting it with zero stops ranked every unpitted
         // car as if it would never pit, which is the one answer known to be
         // wrong: everyone in a class runs broadly the same tank.
         let class_typical_stint = lower_median_i32(indices.iter().filter_map(|&i| standings[i].avg_stint_laps));
+        let class_uses_estimated_stint = indices.iter().any(|&i| standings[i].stint_age.is_estimated());
         for &i in &indices {
             let entry = &mut standings[i];
-            entry.stops_remaining = entry
+            entry.net_uses_estimated_stint = class_uses_estimated_stint;
+            entry.stops_remaining_range = entry
                 .avg_stint_laps
                 .or(class_typical_stint)
-                .and_then(|avg| endurance::stops_remaining(laps_left, entry.current_stint_laps, avg));
+                .and_then(|avg| stops_for_stint_age(laps_left, entry.stint_age, avg));
+            entry.stops_remaining = entry.stops_remaining_range.and_then(|(min, max)| (min == max).then_some(min));
+        }
+        // A range that crosses a stop threshold can change the final order.
+        // Retain that range for the UI, but publish no single NET for the
+        // class until every car's age hypotheses agree on remaining stops.
+        if indices.iter().any(|&i| standings[i].stops_remaining.is_none()) {
+            continue;
         }
         // An ongoing visit has already lost part of its time, but its stint
-        // has not settled yet. Publishing a rank would charge it twice.
-        // Resume as soon as every car in this class has a usable exit reading.
+        // has not settled yet. Publishing a rank would charge it twice. A car
+        // absent from this client's world is different: its scorer gap can
+        // keep the class comparable. Garage and pit-lane states cannot.
         if indices.iter().any(|&i| {
-            let entry = &standings[i];
-            !matches!(entry.track_location, TrackLocation::OnTrack | TrackLocation::OffTrack)
-                || !net_gaps.contains_key(&entry.car_idx)
+            !matches!(
+                standings[i].track_location,
+                TrackLocation::OnTrack | TrackLocation::OffTrack | TrackLocation::NotInWorld
+            )
         }) {
             continue;
         }
+        // A live origin is only meaningful if every member can be measured
+        // from it. When any car needs the scorer fallback, use scorer gaps
+        // for the *whole* class: mixing a visible car's live zero with an
+        // absent leader's scorer zero would silently move the visible car.
+        let class_has_full_live_progress = indices
+            .iter()
+            .all(|&i| net_gaps.get(&standings[i].car_idx).is_some_and(|gap| gap.is_finite() && *gap >= 0.0));
+        let resolved_gaps: Option<Vec<(f32, bool)>> = if class_has_full_live_progress {
+            indices.iter().map(|&i| net_gaps.get(&standings[i].car_idx).copied().map(|gap| (gap, false))).collect()
+        } else {
+            // YAML ResultsPositions.Time is the scorer's total global deficit,
+            // accepted only after this car has published a fresh lap.
+            // Never add `laps_down * pace`: that would double-charge it.
+            let scoring_leader_gap = indices
+                .iter()
+                .find(|&&i| standings[i].class_position == 1)
+                .and_then(|&i| standings[i].scoring_gap_to_leader_secs);
+            indices
+                .iter()
+                .map(|&i| {
+                    let entry = &standings[i];
+                    let raw_gap = entry.scoring_gap_to_leader_secs?;
+                    // A nonleader zero can be an unavailable classification
+                    // value. Never price a missing deficit as being level.
+                    if entry.class_position > 1 && raw_gap <= 0.0 {
+                        return None;
+                    }
+                    let class_gap = raw_gap - scoring_leader_gap?;
+                    if !class_gap.is_finite() || class_gap < 0.0 || (entry.laps_down > 0 && class_gap == 0.0) {
+                        return None;
+                    }
+                    Some((class_gap, true))
+                })
+                .collect()
+        };
+        let Some(resolved_gaps) = resolved_gaps else {
+            continue;
+        };
         let class_service = lower_median_f64(
             indices.iter().filter_map(|&i| standings[i].avg_pit_secs).filter(|secs| secs.is_finite() && *secs > 0.0),
         );
         let contenders: Vec<endurance::Contender> = indices
             .iter()
-            .map(|&i| {
+            .zip(&resolved_gaps)
+            .map(|(&i, &(gap_to_leader_secs, _from_scoring))| {
                 let entry = &standings[i];
                 endurance::Contender {
                     class_position: entry.class_position,
-                    gap_to_leader_secs: net_gaps[&entry.car_idx],
-                    stops_remaining: entry
-                        .stops_remaining
-                        .or_else(|| {
-                            class_typical_stint
-                                .and_then(|avg| endurance::stops_remaining(laps_left, entry.current_stint_laps, avg))
-                        })
-                        .unwrap_or(0),
+                    gap_to_leader_secs,
+                    // Every contender was checked above; unknown ages cannot
+                    // enter this projection as an assumed zero-stop strategy.
+                    stops_remaining: entry.stops_remaining.unwrap_or_default(),
                     #[expect(
                         clippy::cast_possible_truncation,
                         reason = "a pit stop's duration is a handful of seconds, far inside f32"
@@ -3010,16 +3430,23 @@ fn annotate_endurance(
                 }
             })
             .collect();
-        for (&index, position) in indices.iter().zip(endurance::projected_positions(&contenders)) {
+        for ((&index, &(_, from_scoring)), position) in
+            indices.iter().zip(&resolved_gaps).zip(endurance::projected_positions(&contenders))
+        {
             standings[index].projected_class_position = position;
+            standings[index].net_gap_from_scoring = from_scoring;
         }
     }
 
     // Latch the multi-stop flag off the whole class, not just the player:
     // early in a race nobody has a stint history yet, but as soon as any car
     // has pitted twice the shape of the race is known.
-    let class_stops =
-        |class_id: i32| standings.iter().filter(move |e| e.car_class_id == class_id).filter_map(|e| e.stops_remaining);
+    let class_stops = |class_id: i32| {
+        standings
+            .iter()
+            .filter(move |e| e.car_class_id == class_id)
+            .filter_map(|e| e.stops_remaining_range.map(|(_, max)| max))
+    };
     if my_car_class_id.is_some_and(|class_id| class_stops(class_id).any(|s| s >= MULTI_STOP_THRESHOLD)) {
         *multi_stop_race = true;
     }
@@ -3031,7 +3458,10 @@ fn annotate_endurance(
         // Filled in by the caller, which has the player's lap position.
         lap_driven_pct: None,
         stops_remaining: player.and_then(|e| e.stops_remaining),
+        stops_remaining_range: player.and_then(|e| e.stops_remaining_range),
         projected_class_position: player.and_then(|e| e.projected_class_position),
+        net_gap_from_scoring: player.is_some_and(|e| e.net_gap_from_scoring),
+        net_uses_estimated_stint: player.is_some_and(|e| e.net_uses_estimated_stint),
         best_stops_in_class: my_car_class_id.and_then(|class_id| {
             standings.iter().filter(|e| e.car_class_id == class_id).filter_map(|e| e.stops_remaining).min()
         }),
@@ -3043,15 +3473,12 @@ fn annotate_endurance(
 /// Ordered by each class's leading overall position, so the Standings widget
 /// draws the class that's actually winning first — which for a multi-class
 /// race is the order a driver expects to read them in.
-fn build_class_sections(standings: &[StandingsEntry], sof_cache: &mut SofCache) -> Vec<ClassSection> {
+fn build_class_sections(standings: &[StandingsEntry], sof_cache: &SofCache) -> Vec<ClassSection> {
     let mut by_class: HashMap<i32, Vec<&StandingsEntry>> = HashMap::new();
     for entry in standings {
         by_class.entry(entry.car_class_id).or_default().push(entry);
     }
 
-    // Reused across classes so the per-class rating list is one allocation for
-    // the whole function rather than one per class per tick.
-    let mut iratings: Vec<i32> = Vec::new();
     let mut sections: Vec<(i32, ClassSection)> = by_class
         .into_iter()
         .map(|(car_class_id, entries)| {
@@ -3059,15 +3486,13 @@ fn build_class_sections(standings: &[StandingsEntry], sof_cache: &mut SofCache) 
             // entry is unclassified, which sorts the class last rather than
             // panicking on an empty fold.
             let lead_position = entries.iter().map(|e| e.position).filter(|p| *p > 0).min().unwrap_or(i32::MAX);
-            iratings.clear();
-            iratings.extend(entries.iter().map(|e| e.irating));
             let first = entries.first();
             let section = ClassSection {
                 car_class_id,
                 short_name: first.map_or_else(unnamed, |e| Arc::clone(&e.car_class_short_name)),
                 color: first.map_or_else(unnamed, |e| Arc::clone(&e.car_class_color)),
                 car_count: i32::try_from(entries.len()).unwrap_or(i32::MAX),
-                sof: sof_cache.sof(car_class_id, &iratings),
+                sof: sof_cache.sof(car_class_id),
             };
             (lead_position, section)
         })
@@ -3334,6 +3759,7 @@ struct StandingsRawArrays<'a> {
     last_laps: &'a [f32],
     f2_times: &'a [f32],
     track_surfaces: &'a [i32],
+    pit_road: &'a [bool],
     laps: &'a [i32],
     /// Live overall position. Zero for a car iRacing hasn't scored yet, which
     /// is every car before the first start/finish crossing.
@@ -3343,6 +3769,18 @@ struct StandingsRawArrays<'a> {
     lap_dist_pcts: &'a [f32],
     /// Each car's `CarIdxSessionFlags` bits; empty where the sim has none.
     session_flags: &'a [i32],
+    /// Direct player-only evidence, used only for the player's row. Rival
+    /// rows still rely solely on the per-car arrays available to everyone.
+    player_car_idx: i32,
+    player_on_pit_road: Option<bool>,
+    player_in_pit_stall: Option<bool>,
+}
+
+/// Accept the per-car pit-road flag only while its car is observable.
+fn observed_pit_road(location: TrackLocation, direct: Option<bool>) -> Option<bool> {
+    // Off-world array slots can retain a stale true or reset to false. Neither
+    // value may invent an entry/exit while the car is outside our observation.
+    (location != TrackLocation::NotInWorld).then_some(direct).flatten()
 }
 
 /// One car's place in the running order, from either the session's official
@@ -3358,9 +3796,13 @@ struct ClassifiedCar {
     laps_complete: i32,
     fastest_time: f32,
     last_time: f32,
+    /// A display count only. A missing official count is retained below as
+    /// unknown rather than silently becoming a zero-stop baseline.
     pit_stops: i32,
-    /// Present only for a real scorer row. Live fallback rows use zero for
-    /// display but must not establish an official-stop baseline.
+    /// Whether this came from a real `ResultsPositions` classification row.
+    /// This cannot be inferred from its optional stop count.
+    is_official: bool,
+    /// The scorer's stop count only where the YAML actually published it.
     official_pit_stops: Option<i32>,
 }
 
@@ -3373,8 +3815,9 @@ impl From<&ResultsPosition> for ClassifiedCar {
             laps_complete: row.laps_complete,
             fastest_time: row.fastest_time,
             last_time: row.last_time,
-            pit_stops: row.pit_stops,
-            official_pit_stops: Some(row.pit_stops.max(0)),
+            pit_stops: row.pit_stops.unwrap_or(0).max(0),
+            is_official: true,
+            official_pit_stops: row.pit_stops.map(|stops| stops.max(0)),
         }
     }
 }
@@ -3430,13 +3873,14 @@ fn live_classification(info: &SessionInfoCache, arrays: StandingsRawArrays<'_>) 
                 car_idx,
                 position: i32::try_from(rank).unwrap_or(i32::MAX).saturating_add(1),
                 class_position: *class_rank,
-                laps_complete: lap_of(i),
+                laps_complete: lap_of(i).saturating_sub(1).max(0),
                 // Lap times and stop counts have live telemetry sources that
                 // `build_standings` prefers over these anyway; zero reads as
                 // "not set yet" everywhere they surface.
                 fastest_time: 0.0,
                 last_time: 0.0,
                 pit_stops: 0,
+                is_official: false,
                 official_pit_stops: None,
             }
         })
@@ -3463,9 +3907,9 @@ fn live_classification(info: &SessionInfoCache, arrays: StandingsRawArrays<'_>) 
 /// it has: a car with no position is placed by track order upstream, and
 /// nothing here knows better.
 /// How [`build_standings`] orders the field this tick.
-enum StandingsOrder<'a> {
-    /// The scorer's own order (`CarIdxPosition`): practice, qualifying, and
-    /// a race once the checkered flies.
+enum StandingsOrder {
+    /// iRacing's shared scored order (`CarIdxPosition`), including every race
+    /// outside the formation-grid state.
     Scored,
     /// The grid as qualifying set it, while a race's field forms up — see
     /// [`apply_grid_order`].
@@ -3473,10 +3917,6 @@ enum StandingsOrder<'a> {
     /// Each car's best lap, quickest first: practice and qualifying, where
     /// that is the only order anyone means — see [`apply_quickest_order`].
     Quickest,
-    /// The live distance order between the green and the checkered,
-    /// carrying the held ranks its hysteresis needs — see
-    /// [`apply_distance_order`].
-    Distance(&'a mut RaceOrder),
 }
 
 /// Orders practice and qualifying by each car's best lap, quickest first.
@@ -3522,17 +3962,22 @@ fn apply_grid_order(classified: &mut [ClassifiedCar], info: &SessionInfoCache) {
 }
 
 fn apply_live_order(classified: &mut [ClassifiedCar], info: &SessionInfoCache, arrays: StandingsRawArrays<'_>) {
-    let live_position = |car_idx: i32| {
-        usize::try_from(car_idx)
+    let live_position = |car: &ClassifiedCar| {
+        usize::try_from(car.car_idx)
             .ok()
             .and_then(|i| arrays.positions.get(i))
             .copied()
             .filter(|position| *position > 0)
+            // An official row remains classified when this client does not
+            // render that car, and its live position is consequently zero or
+            // missing. Preserve the scorer's last known position in that
+            // case instead of sending a genuine leader to the back.
+            .or_else(|| car.is_official.then_some(car.position).filter(|position| *position > 0))
             .unwrap_or(i32::MAX)
     };
     classified.sort_by(|a, b| {
-        live_position(a.car_idx)
-            .cmp(&live_position(b.car_idx))
+        live_position(a)
+            .cmp(&live_position(b))
             // The order they came in with breaks ties, so unscored cars keep
             // the track order they were placed in rather than shuffling.
             .then_with(|| a.position.cmp(&b.position))
@@ -3553,94 +3998,6 @@ fn renumber(classified: &mut [ClassifiedCar], info: &SessionInfoCache) {
         *slot = slot.saturating_add(1);
         car.class_position = *slot;
     }
-}
-
-/// How much further round the track a car must be than the one it is passing
-/// before the two swap positions, in laps of track position.
-///
-/// The Standings counterpart of `relative::ORDER_HYSTERESIS_SECS`, and there
-/// for the same reason: two cars genuinely side by side sit inside
-/// `CarIdxLapDistPct`'s tick-to-tick noise, and without a band their
-/// positions would trade every frame. Half a thousandth of a lap is two to
-/// three metres on a typical circuit — under a car length, so any pass a
-/// driver would call complete clears it at once, while two cars drag-racing
-/// down a straight hold their numbers until one is genuinely by.
-const ORDER_HYSTERESIS_LAPS: f32 = 0.000_5;
-
-/// The previous tick's distance-based running order, so side-by-side cars
-/// hold their positions rather than trading them every tick — see
-/// [`apply_distance_order`] and [`ORDER_HYSTERESIS_LAPS`].
-#[derive(Debug, Default)]
-struct RaceOrder {
-    /// Each car's place in the last order produced, by `CarIdx`.
-    ranks: HashMap<i32, usize>,
-}
-
-/// Re-orders the field by how far each car has actually driven: whole laps
-/// plus the fraction of the current one.
-///
-/// This is what makes a race position *live*. `CarIdxPosition` moves only
-/// when the scorer says so — at timing checkpoints, in practice the
-/// start/finish line — so a driver who passes the car ahead down the back
-/// straight watched the panel say the old number for the rest of the lap.
-/// Race position between the green and the checkered *is* track position,
-/// laps included, and that is published every tick.
-///
-/// Only between those flags, though: the caller keeps this to
-/// `SessionState::Racing`, because before the green the order is the grid's
-/// and after the checkered it is the result's, and neither is a fact about
-/// where the cars are. Distance also cannot see a penalty the scorer applies
-/// on paper, which stands until the scorer's own order returns at the flag.
-///
-/// Each car is handicapped by the place it already held, exactly as the
-/// Relative's `order_by_gap` does, so the comparison stays a total order and
-/// stationary neighbours don't swap on noise — see [`ORDER_HYSTERESIS_LAPS`].
-fn apply_distance_order(
-    classified: &mut [ClassifiedCar],
-    info: &SessionInfoCache,
-    arrays: StandingsRawArrays<'_>,
-    lap_latch: &mut LapLatch,
-    held: &mut RaceOrder,
-) {
-    #[expect(clippy::cast_precision_loss, reason = "lap counts are far inside f32's exact-integer range")]
-    let mut distance_of = |car: &ClassifiedCar| -> f32 {
-        let idx = usize::try_from(car.car_idx).ok();
-        // The latch, not the raw lap: a towed car reads `-1` and would fall
-        // to the back of the field mid-tow, then leap forward on rejoin.
-        let lap = lap_latch.resolve(car.car_idx, idx.and_then(|i| arrays.laps.get(i)).copied(), car.laps_complete);
-        let pct = idx
-            .and_then(|i| arrays.lap_dist_pcts.get(i))
-            .copied()
-            .filter(|pct| pct.is_finite() && *pct >= 0.0)
-            .map_or(0.0, |pct| pct.min(1.0));
-        lap as f32 + pct
-    };
-    let distances: HashMap<i32, f32> = classified.iter().map(|car| (car.car_idx, distance_of(car))).collect();
-    let distance = |car: &ClassifiedCar| distances.get(&car.car_idx).copied().unwrap_or(0.0);
-
-    // Where each car would sit on distance alone — the answer for a car the
-    // last tick knew nothing about, which has no held place of its own.
-    classified.sort_by(|a, b| distance(b).total_cmp(&distance(a)).then_with(|| a.car_idx.cmp(&b.car_idx)));
-    #[expect(clippy::cast_precision_loss, reason = "a field is tens of cars, exact in f32")]
-    let keys: Vec<f32> = classified
-        .iter()
-        .enumerate()
-        .map(|(rank, car)| {
-            let held_rank = held.ranks.get(&car.car_idx).copied().unwrap_or(rank);
-            distance(car) - held_rank as f32 * ORDER_HYSTERESIS_LAPS
-        })
-        .collect();
-    let mut places: Vec<usize> = (0..classified.len()).collect();
-    places
-        .sort_by(|&a, &b| keys[b].total_cmp(&keys[a]).then_with(|| classified[a].car_idx.cmp(&classified[b].car_idx)));
-
-    held.ranks = places.iter().enumerate().map(|(rank, &i)| (classified[i].car_idx, rank)).collect();
-    // Applies the permutation in place: `places[rank]` names the row that
-    // belongs at `rank`, so the rows are cloned out in that order and copied
-    // back. A `ClassifiedCar` is `Copy`-sized, so this is cheap.
-    let ordered: Vec<ClassifiedCar> = places.into_iter().map(|i| classified[i]).collect();
-    classified.copy_from_slice(&ordered);
-    renumber(classified, info);
 }
 
 /// Appends every competitor the official classification hasn't scored yet.
@@ -3692,14 +4049,10 @@ impl LapLatch {
     /// the sim publishes one, else the last it published, else `fallback` —
     /// the YAML's `LapsComplete`, which for a parked car is stale but true.
     fn resolve(&mut self, car_idx: i32, live: Option<i32>, fallback: i32) -> i32 {
-        match live.filter(|lap| *lap >= 0) {
-            Some(lap) => {
-                let latched = self.0.entry(car_idx).or_insert(lap);
-                *latched = (*latched).max(lap);
-                *latched
-            }
-            None => self.0.get(&car_idx).copied().unwrap_or(fallback),
-        }
+        let incoming = live.filter(|lap| *lap >= 0).unwrap_or(fallback).max(fallback).max(0);
+        let latched = self.0.entry(car_idx).or_insert(incoming);
+        *latched = (*latched).max(incoming);
+        *latched
     }
 }
 
@@ -3726,6 +4079,15 @@ mod lap_latch_tests {
         assert_eq!(latch.resolve(3, Some(-1), 4), 4);
         assert_eq!(latch.resolve(3, None, 4), 4, "no live array at all: same fallback");
     }
+
+    #[test]
+    fn fresh_scoring_advances_a_previously_seen_absent_car() {
+        let mut latch = LapLatch::default();
+        assert_eq!(latch.resolve(7, Some(5), 5), 5);
+        assert_eq!(latch.resolve(7, None, 6), 6);
+        assert_eq!(latch.resolve(7, Some(-1), 8), 8, "missed live laps do not freeze the scorer");
+        assert_eq!(latch.resolve(7, Some(7), 8), 8, "a delayed live sample cannot rewind it");
+    }
 }
 
 /// Builds the Standings list from the current session's `ResultsPositions`,
@@ -3735,7 +4097,11 @@ mod lap_latch_tests {
 ///
 /// `order` picks how the field is ranked this tick — see [`StandingsOrder`]
 /// for what each variant is right for.
-#[expect(clippy::too_many_arguments, reason = "called from one place; a struct would only rename the list")]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one pass hydrates the immutable standings rows from the same SDK observations"
+)]
 fn build_standings(
     info: &SessionInfoCache,
     session_num: Option<i32>,
@@ -3745,7 +4111,7 @@ fn build_standings(
     off_tracks: &mut OffTrackCounter,
     lap_latch: &mut LapLatch,
     session_time_secs: f64,
-    order: StandingsOrder<'_>,
+    order: &StandingsOrder,
 ) -> Vec<StandingsEntry> {
     let official: Vec<ClassifiedCar> = session_num
         .and_then(|num| info.sessions.iter().find(|s| s.session_num == num))
@@ -3771,12 +4137,10 @@ fn build_standings(
     } else {
         append_unscored(&mut classified, info, arrays);
     }
-    // Ordered and numbered from live telemetry, so this panel and the Relative
-    // are never a session-info update apart. Mid-race the order comes from
-    // how far each car has driven, so a pass changes the numbers the moment
-    // it happens rather than at the next timing checkpoint.
+    // Ordered and numbered from iRacing's shared scored position, so every
+    // team member receives the same standings even with different rendered
+    // telemetry subsets.
     match order {
-        StandingsOrder::Distance(held) => apply_distance_order(&mut classified, info, arrays, lap_latch, held),
         StandingsOrder::Grid => apply_grid_order(&mut classified, info),
         StandingsOrder::Quickest => apply_quickest_order(&mut classified, info, arrays),
         StandingsOrder::Scored => apply_live_order(&mut classified, info, arrays),
@@ -3791,7 +4155,19 @@ fn build_standings(
                 .and_then(|i| arrays.track_surfaces.get(i))
                 .copied()
                 .map_or(TrackLocation::NotInWorld, track_location_from_raw);
-            let lap = lap_latch.resolve(row.car_idx, idx.and_then(|i| arrays.laps.get(i)).copied(), row.laps_complete);
+            let is_player = row.car_idx == arrays.player_car_idx;
+            let direct_on_pit_road = is_player.then_some(arrays.player_on_pit_road).flatten();
+            let rival_on_pit_road =
+                observed_pit_road(track_location, idx.and_then(|i| arrays.pit_road.get(i)).copied());
+            let direct_in_pit_stall = is_player.then_some(arrays.player_in_pit_stall).flatten();
+            // CarIdxLap is the lap under way; YAML LapsComplete counts finished
+            // laps. Normalize before switching sources across an absence.
+            let completed_live = idx
+                .and_then(|i| arrays.laps.get(i))
+                .copied()
+                .filter(|lap| *lap >= 0 && track_location != TrackLocation::NotInWorld)
+                .map(|lap| lap.saturating_sub(1).max(0));
+            let lap = lap_latch.resolve(row.car_idx, completed_live, row.laps_complete);
             // The whole pit lane, not the stall alone: for a car other than the
             // player, `InPitStall` is the one value the sim can decline to
             // publish, and hanging the stint on it left rivals running stints
@@ -3803,12 +4179,19 @@ fn build_standings(
                 session_time_secs,
                 lap,
                 row.official_pit_stops,
-                track_location != TrackLocation::NotInWorld,
-                matches!(track_location, TrackLocation::InPitStall | TrackLocation::ApproachingPits),
-                track_location == TrackLocation::InPitStall,
+                track_location != TrackLocation::NotInWorld || direct_on_pit_road == Some(true),
+                direct_on_pit_road
+                    .or(rival_on_pit_road)
+                    .unwrap_or(matches!(track_location, TrackLocation::InPitStall | TrackLocation::ApproachingPits)),
+                direct_in_pit_stall.unwrap_or(track_location == TrackLocation::InPitStall),
                 idx.and_then(|i| arrays.lap_dist_pcts.get(i)).copied().filter(|pct| pct.is_finite() && *pct >= 0.0),
             );
             let penalty = idx.and_then(|i| arrays.session_flags.get(i)).copied().and_then(relative::penalty_from_flags);
+            // Zero is valid only when the scorer actually published it. Keep
+            // absence distinct so NET never mistakes an unrendered car for a
+            // car level with the leader.
+            let scoring_gap_to_leader_secs =
+                idx.and_then(|i| arrays.f2_times.get(i)).copied().filter(|gap| gap.is_finite() && *gap >= 0.0);
             StandingsEntry {
                 penalty,
                 position: row.position,
@@ -3817,6 +4200,8 @@ fn build_standings(
                 driver_name: driver.map_or_else(unnamed, |d| Arc::clone(&d.user_name)),
                 car_screen_name: driver.map_or_else(unnamed, |d| Arc::clone(&d.car_screen_name)),
                 irating: driver.map_or(0, |d| d.irating),
+                team_driver_strength: None,
+                team_drivers: Arc::from([]),
                 flair_id: driver.map_or(0, |d| d.flair_id),
                 car_class_id: driver.map_or(0, |d| d.car_class_id),
                 car_class_short_name: driver.map_or_else(unnamed, |d| Arc::clone(&d.car_class_short_name)),
@@ -3831,17 +4216,28 @@ fn build_standings(
                     .copied()
                     .filter(|&t| t > 0.0)
                     .unwrap_or(row.last_time),
-                gap_to_leader_secs: idx.and_then(|i| arrays.f2_times.get(i)).copied().unwrap_or(0.0),
-                // Whichever source has seen more stops. The measured count is
-                // the reliable one — it is what this widget watched happen —
-                // but it can only count stops made since the overlay was
-                // looking, so a car that pitted before it started is caught by
-                // the official figure instead.
+                gap_to_leader_secs: scoring_gap_to_leader_secs.unwrap_or(0.0),
+                // Validated independently from YAML lap advances before NET.
+                // Raw F2 can remain frozen for an unavailable car.
+                scoring_gap_to_leader_secs: None,
+                net_gap_from_scoring: false,
+                net_uses_estimated_stint: false,
+                // Observed visits since attachment, supplemented only if the
+                // results explicitly publish a stop count. Ordinary recorded
+                // SDK rows omit that field; they cannot recover unseen stops.
                 pit_stops: row.pit_stops.max(stint.completed_stops),
                 last_pit_secs: stint.last_pit_secs,
                 avg_pit_secs: stint.avg_pit_secs,
                 stops_remaining: None,
+                stops_remaining_range: None,
                 projected_class_position: None,
+                stint_age: stint_tracker.cars.get(&row.car_idx).map_or(stint_estimation::StintAge::Unknown, |state| {
+                    if state.current_start_observed {
+                        stint_estimation::StintAge::Observed(stint.current_laps)
+                    } else {
+                        stint_estimation::StintAge::Unknown
+                    }
+                }),
                 current_stint_laps: stint.current_laps,
                 current_stint_secs: stint.current_secs,
                 avg_stint_laps: stint.avg_laps,
@@ -3932,12 +4328,11 @@ const STINT_SAMPLES: usize = 8;
 /// How far a car must move along the lap for the pit lane to call it rolling.
 ///
 /// Set clear of `CarIdxLapDistPct`'s own noise, which is the whole difficulty:
-/// the figure wobbles a couple of metres tick to tick, enough that
-/// [`ORDER_HYSTERESIS_LAPS`] exists to stop side-by-side cars trading places
-/// on it. A threshold inside that band would read a parked car's jitter as
+/// the figure wobbles a couple of metres tick to tick. A threshold near that
+/// noise would read a parked car's jitter as
 /// movement, and a car that never reads as stopped never ends a stint — the
-/// very fault this detection is here to fix. Twice the hysteresis band, so
-/// noise cannot clear it.
+/// very fault this detection is here to fix. The threshold is deliberately
+/// above observed noise, so jitter cannot clear it.
 ///
 /// The cost of being this coarse is bounded because it is a distance to
 /// cover, not a speed, and it is measured against the last position the car
@@ -3973,6 +4368,12 @@ const MIN_STOP_SECS: f64 = 3.0;
 /// excluded because that may be a tow or garage stay rather than missing lane
 /// position.
 const POSITION_BLIND_TOLERANCE_SECS: f64 = 1.0;
+
+/// Keep a return from an unrendered/disconnected interval available long
+/// enough for iRacing's scorer to publish the associated stop. This covers
+/// the thirty-second gaps routine in endurance races without allowing an old
+/// disappearance to rewrite a much later, unrelated stint.
+const RETURNED_AFTER_GAP_GRACE_SECS: f64 = 45.0;
 
 /// Per-car pit-lane transition tracking, so Standings can show current and
 /// typical stint length without a direct SDK var for either.
@@ -4046,6 +4447,10 @@ struct StintState {
     official_unmatched: u32,
     /// Locally detected stops the scorer has not caught up with yet.
     local_unscored: u32,
+    /// A car returned on track after `NotInWorld` without a witnessed lane
+    /// exit. A scorer update often trails that return by a few ticks; retain
+    /// this approximate boundary until it arrives.
+    returned_after_gap: Option<(f64, i32)>,
     /// Latest exit whose evidence was insufficient to call either a stop or
     /// a drive-through. A later scorer increase may confirm its boundary.
     /// The flag records whether confirmation should still move the current
@@ -4055,6 +4460,9 @@ struct StintState {
     /// Fully observed nonstop visits awaiting any scorer count they may
     /// receive. Matching them changes the displayed total, never the stint.
     pending_drive_throughs: u32,
+    /// The completed-lap number on which a confirmed pit exit occurred. This
+    /// drives Relative's OUT badge and stays absent for the formation exit.
+    out_lap_started_at: Option<i32>,
 }
 
 /// One car's current and typical stint length, in both time and laps.
@@ -4118,18 +4526,14 @@ impl StintState {
         in_pit_stall: bool,
         lap_dist_pct: Option<f32>,
     ) -> StintReading {
-        self.update_with_official(
-            session_time_secs,
-            lap,
-            None,
-            in_world,
-            in_pit_lane,
-            in_pit_stall,
-            lap_dist_pct,
-        )
+        self.update_with_official(session_time_secs, lap, None, in_world, in_pit_lane, in_pit_stall, lap_dist_pct)
     }
 
-    #[expect(clippy::too_many_arguments, reason = "one normalized per-car telemetry sample plus its scorer count")]
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "one normalized per-car telemetry sample plus scorer reconciliation; splitting it would separate transitions that must be ordered together"
+    )]
     fn update_with_official(
         &mut self,
         session_time_secs: f64,
@@ -4164,6 +4568,15 @@ impl StintState {
             self.pending_drive_throughs = 0;
         }
         let resumed_after_gap = std::mem::take(&mut self.observation_interrupted);
+        if resumed_after_gap && !in_pit_lane {
+            self.returned_after_gap = Some((session_time_secs, lap));
+        }
+        if self
+            .returned_after_gap
+            .is_some_and(|(returned, _)| session_time_secs - returned > RETURNED_AFTER_GAP_GRACE_SECS)
+        {
+            self.returned_after_gap = None;
+        }
         // A delayed scorer update normally arrives after pit exit. Settle it
         // against an earlier local outcome before this tick can begin another
         // lane visit.
@@ -4288,9 +4701,8 @@ impl StintState {
                 self.official_stops_seen = Some(stops);
             }
             Some(previous) if stops > previous => {
-                self.official_unmatched = self
-                    .official_unmatched
-                    .saturating_add(u32::try_from(stops - previous).unwrap_or(u32::MAX));
+                self.official_unmatched =
+                    self.official_unmatched.saturating_add(u32::try_from(stops - previous).unwrap_or(u32::MAX));
                 self.official_stops_seen = Some(stops);
             }
             _ => {}
@@ -4357,15 +4769,20 @@ impl StintState {
         }
         let unmatched = std::mem::take(&mut self.official_unmatched);
         self.add_official_offset(unmatched);
-        if returned_after_gap && !current_boundary_just_reset {
-            self.reset_from_official(session_time_secs, lap, false);
+        if !current_boundary_just_reset {
+            // A car can return from a renderer/disconnect gap before its
+            // official stop count catches up. Anchor that unseen stop to its
+            // return instead of leaving the previous 32-lap stint running.
+            if let Some((returned_secs, returned_lap)) = self.returned_after_gap.take() {
+                self.reset_from_official(returned_secs, returned_lap, false);
+            } else if returned_after_gap {
+                self.reset_from_official(session_time_secs, lap, false);
+            }
         }
     }
 
     fn add_official_offset(&mut self, stops: u32) {
-        self.official_offset = self
-            .official_offset
-            .saturating_add(i32::try_from(stops).unwrap_or(i32::MAX));
+        self.official_offset = self.official_offset.saturating_add(i32::try_from(stops).unwrap_or(i32::MAX));
     }
 
     fn reset_from_official(&mut self, session_time_secs: f64, lap: i32, exit_observed: bool) {
@@ -4373,12 +4790,19 @@ impl StintState {
         self.current_start_lap = Some(lap);
         self.current_start_observed = exit_observed;
         self.last_pit_secs = None;
+        self.out_lap_started_at = exit_observed.then_some(lap);
+    }
+
+    /// Whether a car is running the lap on which it visibly left a confirmed
+    /// pit stop. A grid/formation departure and an entirely unseen official
+    /// correction deliberately have no OUT marker.
+    fn is_out_lap(&self, lap: i32, track_location: TrackLocation) -> bool {
+        self.out_lap_started_at == Some(lap)
+            && matches!(track_location, TrackLocation::OnTrack | TrackLocation::OffTrack)
     }
 
     fn completed_stop_count(&self) -> i32 {
-        let local = self
-            .official_offset
-            .saturating_add(i32::try_from(self.pit_count).unwrap_or(i32::MAX));
+        let local = self.official_offset.saturating_add(i32::try_from(self.pit_count).unwrap_or(i32::MAX));
         self.official_stops_seen.map_or(local, |official| official.max(local))
     }
 
@@ -4456,6 +4880,9 @@ impl StintState {
         self.current_start_secs = Some(session_time_secs);
         self.current_start_lap = Some(lap);
         self.current_start_observed = true;
+        // A real witnessed exit supersedes any older approximate return.
+        self.returned_after_gap = None;
+        self.out_lap_started_at = Some(lap);
         LaneVisitOutcome::Stop
     }
 }
@@ -4602,6 +5029,10 @@ impl StintTracker {
             lap_dist_pct,
         )
     }
+
+    fn is_out_lap(&self, car_idx: i32, lap: i32, track_location: TrackLocation) -> bool {
+        self.cars.get(&car_idx).is_some_and(|state| state.is_out_lap(lap, track_location))
+    }
 }
 
 /// Ground speed below which the player's car counts as standing still, in m/s.
@@ -4628,8 +5059,7 @@ struct PlayerStopTick {
     speed_mps: Option<f32>,
     /// Whether the sim is simulating the car at all this tick.
     in_world: bool,
-    /// This car's `ResultsPositions` stop count, where the session has scored
-    /// it yet.
+    /// This car's `ResultsPositions` stop count, only if explicitly published.
     official_stops: Option<i32>,
 }
 
@@ -4649,6 +5079,10 @@ struct PlayerStopTick {
 /// or a tow or a garage exit, stand as the count with no way to come back
 /// down.
 #[derive(Debug, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the baseline, road, racing, and stall latches are independent facts about a player pit visit"
+)]
 struct PlayerStops {
     /// Stops made before this started watching; see the type docs.
     baseline: i32,
@@ -4666,6 +5100,11 @@ struct PlayerStops {
     has_raced: bool,
     /// Seconds the car has spent stationary in its box this visit.
     stationary_secs: f64,
+    /// `PlayerCarInPitStall` has been true at least once in this visit. The
+    /// sim can clear it as the car is released while `Speed` remains zero for
+    /// a tick, so use a visit latch rather than losing already-confirmed box
+    /// evidence. A stationary queue in the lane never sets this.
+    saw_box_this_visit: bool,
     /// `SessionTime` at the previous tick, for the interval above.
     last_tick_secs: f64,
     /// Stops measured here since this session began.
@@ -4696,13 +5135,15 @@ impl PlayerStops {
                 // Time is only ever banked from the second tick of a visit
                 // onwards, which is what keeps the gap between joining a
                 // session and its first tick out of the total.
-                let at_rest =
-                    tick.in_box.unwrap_or(true) && tick.speed_mps.is_some_and(|mps| mps.abs() < PLAYER_STOPPED_MPS);
+                self.saw_box_this_visit |= tick.in_box.unwrap_or(false);
+                let at_rest = tick.speed_mps.is_some_and(|mps| mps.abs() < PLAYER_STOPPED_MPS)
+                    && (tick.in_box.is_none() || self.saw_box_this_visit);
                 if at_rest {
                     self.stationary_secs += elapsed;
                 }
             } else {
                 self.stationary_secs = 0.0;
+                self.saw_box_this_visit = tick.in_box.unwrap_or(false);
             }
             // The visit about to be measured here is the last one the official
             // figure is allowed to speak for.
@@ -4715,6 +5156,7 @@ impl PlayerStops {
                 self.measured = self.measured.saturating_add(1);
             }
             self.stationary_secs = 0.0;
+            self.saw_box_this_visit = false;
             self.has_raced = true;
         }
         self.was_on_pit_road = tick.on_pit_road;
@@ -5105,6 +5547,31 @@ mod tests {
         fuel.update(lap, level, 0.0, false)
     }
 
+    #[test]
+    fn fuel_burn_never_treats_a_multi_lap_gap_or_lap_regression_as_one_lap() {
+        let mut fuel = FuelTracker::default();
+        racing_lap(&mut fuel, 1, 100.0);
+        assert_eq!(racing_lap(&mut fuel, 2, 97.0), Some(3.0));
+        assert_eq!(racing_lap(&mut fuel, 5, 88.0), Some(3.0));
+        assert_eq!(racing_lap(&mut fuel, 3, 80.0), Some(3.0));
+        assert_eq!(fuel.recent.len(), 1, "only the fully observed lap supplies consumption");
+    }
+
+    #[test]
+    fn fuel_attachment_missing_scalars_and_thirty_second_disconnect_preserve_clean_history() {
+        let mut fuel = FuelTracker::default();
+        assert_eq!(fuel.observe(20, Some(50.0), 100.0, false, 1.0), None);
+        assert_eq!(fuel.observe(21, Some(49.0), 100.0, false, 2.0), None, "the attachment lap was partial");
+        assert_eq!(fuel.observe(22, Some(46.0), 100.0, false, 3.0), Some(3.0));
+        assert_eq!(fuel.observe(23, None, 100.0, false, 4.0), None, "absence is not an empty tank");
+        assert_eq!(fuel.observe(23, Some(44.0), 100.0, false, 5.0), Some(3.0));
+        assert_eq!(fuel.observe(24, Some(43.5), 100.0, false, 6.0), Some(3.0));
+        assert_eq!(fuel.observe(25, Some(40.5), 100.0, false, 7.0), Some(3.0));
+        assert_eq!(fuel.observe(26, Some(70.0), 100.0, false, 37.0), Some(3.0), "a hidden refuel cannot supply burn");
+        assert_eq!(fuel.observe(27, Some(69.5), 100.0, false, 38.0), Some(3.0));
+        assert_eq!(fuel.recent.len(), 2, "only the two complete racing laps were admitted");
+    }
+
     /// A lap run wholly on track; `secs` is the time of the lap just completed.
     fn timed_lap(fuel: &mut FuelTracker, lap: i32, level: f32, secs: f32) -> Option<f32> {
         fuel.update(lap, level, secs, false)
@@ -5486,6 +5953,7 @@ mod tests {
 
     fn test_driver(car_class_id: i32, is_competitor: bool) -> DriverMeta {
         DriverMeta {
+            team_id: None,
             user_name: Arc::from(""),
             user_id: None,
             car_number: Arc::from(""),
@@ -5502,6 +5970,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sof_waits_for_the_full_roster_then_ignores_a_driver_swap() {
+        let mut drivers = HashMap::from([
+            (0, DriverMeta { irating: 1800, ..test_driver(10, true) }),
+            // iRacing can publish a zero while its session-info entry is
+            // still arriving. Do not call the one known driver's rating SOF.
+            (1, DriverMeta { irating: 0, ..test_driver(10, true) }),
+            // The pace car is in the YAML but never belongs to the field.
+            (2, DriverMeta { irating: 9000, ..test_driver(10, false) }),
+        ]);
+        let mut cache = SofCache::default();
+        cache.observe_roster(&drivers);
+        assert_eq!(cache.sof(10), None);
+
+        drivers.get_mut(&1).expect("registered competitor").irating = 2200;
+        cache.observe_roster(&drivers);
+        let expected = sof::estimate_sof(&[1800, 2200]);
+        assert_eq!(cache.sof(10), expected);
+
+        // A team swap updates the entry's current driver and iRating. The
+        // session SOF remains the value captured when the roster completed.
+        drivers.get_mut(&1).expect("registered competitor").irating = 5000;
+        cache.observe_roster(&drivers);
+        assert_eq!(cache.sof(10), expected);
+    }
+
     /// Per-car arrays for a field where nothing but position, lap, track
     /// surface and lap fraction matters — everything [`live_classification`]
     /// reads.
@@ -5516,11 +6010,60 @@ mod tests {
             last_laps: &[],
             f2_times: &[],
             track_surfaces,
+            pit_road: &[],
             laps,
             positions,
             lap_dist_pcts,
             session_flags: &[],
+            player_car_idx: -1,
+            player_on_pit_road: None,
+            player_in_pit_stall: None,
         }
+    }
+
+    #[test]
+    fn rival_pit_road_flag_counts_service_despite_lagging_surface_but_never_exits_off_world() {
+        let mut info = racing_pair();
+        for row in &mut info.sessions[0].results_positions {
+            row.pit_stops = None;
+        }
+        let mut tracker = StintTracker::default();
+        let mut off_tracks = OffTrackCounter::default();
+        let mut laps = LapLatch::default();
+        let mut tick = |time, lap, surface, on_road, pct| {
+            let lap_values = [lap, lap];
+            let surfaces = [3, surface];
+            let road_values = [false, on_road];
+            let percentages = [0.5, pct];
+            let mut arrays = test_arrays(&[2, 1], &lap_values, &surfaces, &percentages);
+            arrays.pit_road = &road_values;
+            build_standings(
+                &info,
+                Some(0),
+                0,
+                arrays,
+                &mut tracker,
+                &mut off_tracks,
+                &mut laps,
+                time,
+                &StandingsOrder::Scored,
+            )
+            .into_iter()
+            .find(|row| row.car_idx == 1)
+            .expect("classified rival")
+        };
+        tick(0.0, 0, 3, false, 0.5);
+        tick(400.0, 10, 3, true, 0.9);
+        tick(402.0, 10, 3, true, 0.9);
+        tick(408.0, 10, 3, true, 0.9);
+        let absent = tick(430.0, 10, -1, false, -1.0);
+        assert_eq!(absent.pit_stops, 0, "a reset off-world flag cannot close the visit");
+        tick(431.0, 10, 3, true, 0.9);
+        let exited = tick(432.0, 10, 3, false, 0.95);
+        assert_eq!(exited.pit_stops, 1);
+        assert_eq!(exited.current_stint_laps, 0);
+        assert_eq!(exited.avg_pit_secs, None, "unseen seconds are never learned as service");
+        assert!(tracker.is_out_lap(1, 9, TrackLocation::OnTrack));
     }
 
     /// On the grid the estimate rates the whole entry list, not the cars that
@@ -5701,13 +6244,14 @@ mod tests {
             session_time: "2400.0000 sec".to_owned(),
             session_laps: "unlimited".to_owned(),
             results_positions: vec![ResultsPosition {
+                time: None,
                 position: 1,
                 class_position: 1,
                 car_idx: 1,
                 laps_complete: 3,
                 fastest_time: 90.0,
                 last_time: 91.0,
-                pit_stops: 0,
+                pit_stops: Some(0),
             }],
         });
         let arrays = test_arrays(&[0, 1], &[0, 3], &[3, 3], &[0.90, 0.10]);
@@ -5720,7 +6264,7 @@ mod tests {
             &mut OffTrackCounter::default(),
             &mut LapLatch::default(),
             0.0,
-            StandingsOrder::Scored,
+            &StandingsOrder::Scored,
         );
 
         // Car 1 is scored; car 0 is out there but has no lap yet. Taking the
@@ -5745,13 +6289,14 @@ mod tests {
         info.drivers.insert(0, test_driver(10, true));
         info.drivers.insert(1, test_driver(10, true));
         let scored = |car_idx: i32, position: i32, class_position: i32, laps_complete: i32| ResultsPosition {
+            time: None,
             position,
             class_position,
             car_idx,
             laps_complete,
             fastest_time: 90.0,
             last_time: 91.0,
-            pit_stops: 0,
+            pit_stops: Some(0),
         };
         info.sessions.push(SessionResults {
             session_num: 0,
@@ -5762,8 +6307,9 @@ mod tests {
         });
 
         // Car 0 is on the hook: not in world, live lap -1. The leader is on
-        // lap 9. Before the latch, car 0 read 9 - (-1) = ten laps down.
-        let towed = test_arrays(&[2, 1], &[-1, 9], &[-1, 3], &[0.50, 0.50]);
+        // lap 10 (nine completed). Both inputs use completed laps after
+        // normalization, so the absent car's seven laps remain two behind.
+        let towed = test_arrays(&[2, 1], &[-1, 10], &[-1, 3], &[0.50, 0.50]);
         let mut latch = LapLatch::default();
         let entries = build_standings(
             &info,
@@ -5774,13 +6320,13 @@ mod tests {
             &mut OffTrackCounter::default(),
             &mut latch,
             0.0,
-            StandingsOrder::Scored,
+            &StandingsOrder::Scored,
         );
         let aston = entries.iter().find(|entry| entry.car_idx == 0).expect("the towed car keeps its row");
         assert_eq!(aston.laps_down, 2, "the scored count stands in, not the raw -1");
 
-        // Seen in the world on lap 8, then towed again: the latch answers.
-        let racing = test_arrays(&[2, 1], &[8, 9], &[3, 3], &[0.50, 0.50]);
+        // Seen in the world with eight completed, then towed again.
+        let racing = test_arrays(&[2, 1], &[9, 10], &[3, 3], &[0.50, 0.50]);
         let entries = build_standings(
             &info,
             Some(0),
@@ -5790,10 +6336,10 @@ mod tests {
             &mut OffTrackCounter::default(),
             &mut latch,
             1.0,
-            StandingsOrder::Scored,
+            &StandingsOrder::Scored,
         );
         assert_eq!(entries.iter().find(|e| e.car_idx == 0).expect("still rowed").laps_down, 1);
-        let towed_again = test_arrays(&[2, 1], &[-1, 9], &[-1, 3], &[0.50, 0.50]);
+        let towed_again = test_arrays(&[2, 1], &[-1, 10], &[-1, 3], &[0.50, 0.50]);
         let entries = build_standings(
             &info,
             Some(0),
@@ -5803,7 +6349,7 @@ mod tests {
             &mut OffTrackCounter::default(),
             &mut latch,
             2.0,
-            StandingsOrder::Scored,
+            &StandingsOrder::Scored,
         );
         assert_eq!(
             entries.iter().find(|e| e.car_idx == 0).expect("still rowed").laps_down,
@@ -5822,13 +6368,14 @@ mod tests {
         info.drivers.insert(0, test_driver(10, true));
         info.drivers.insert(1, test_driver(10, true));
         let scored = |car_idx: i32, position: i32, class_position: i32| ResultsPosition {
+            time: None,
             position,
             class_position,
             car_idx,
             laps_complete: 3,
             fastest_time: 90.0,
             last_time: 91.0,
-            pit_stops: 0,
+            pit_stops: Some(0),
         };
         info.sessions.push(SessionResults {
             session_num: 0,
@@ -5848,7 +6395,7 @@ mod tests {
             &mut OffTrackCounter::default(),
             &mut LapLatch::default(),
             0.0,
-            StandingsOrder::Scored,
+            &StandingsOrder::Scored,
         );
 
         assert_eq!(entries.len(), 2);
@@ -5867,13 +6414,14 @@ mod tests {
         info.drivers.insert(0, test_driver(10, true));
         info.drivers.insert(1, test_driver(10, true));
         let scored = |car_idx: i32, position: i32| ResultsPosition {
+            time: None,
             position,
             class_position: position,
             car_idx,
             laps_complete: 3,
             fastest_time: 90.0,
             last_time: 91.0,
-            pit_stops: 0,
+            pit_stops: Some(0),
         };
         info.sessions.push(SessionResults {
             session_num: 0,
@@ -5893,7 +6441,7 @@ mod tests {
             &mut OffTrackCounter::default(),
             &mut LapLatch::default(),
             0.0,
-            StandingsOrder::Scored,
+            &StandingsOrder::Scored,
         );
 
         assert_eq!(entries[0].car_idx, 0, "the pass shows immediately");
@@ -5902,20 +6450,101 @@ mod tests {
         assert_eq!(entries[1].class_position, 2);
     }
 
-    /// A race field two cars big, scored with car 1 leading, for the
-    /// distance-order tests below.
+    /// A client may not render the leader, leaving all of that car's live
+    /// arrays at their absent sentinels. Its official scored position must
+    /// still keep it in the classification ahead of the rendered followers.
+    #[test]
+    fn official_order_survives_an_unrendered_leader() {
+        let info = racing_pair();
+        let entries = build_standings(
+            &info,
+            Some(0),
+            0,
+            test_arrays(&[0, 0], &[-1, -1], &[-1, -1], &[0.0, 0.0]),
+            &mut StintTracker::default(),
+            &mut OffTrackCounter::default(),
+            &mut LapLatch::default(),
+            0.0,
+            &StandingsOrder::Scored,
+        );
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].car_idx, 1, "the official P1 stays first");
+        assert_eq!(entries[0].position, 1);
+        assert_eq!(entries[1].car_idx, 0, "the official P2 stays classified");
+        assert_eq!(entries[1].position, 2);
+    }
+
+    /// A `ResultsPositions` row is still official when its optional stop
+    /// count is absent. Position fallback must not mistake that missing fact
+    /// for an unclassified car.
+    #[test]
+    fn an_official_row_without_pit_stops_keeps_its_classification() {
+        let mut info = racing_pair();
+        for row in &mut info.sessions[0].results_positions {
+            row.pit_stops = None;
+        }
+        let entries = build_standings(
+            &info,
+            Some(0),
+            0,
+            test_arrays(&[0, 0], &[-1, -1], &[-1, -1], &[0.0, 0.0]),
+            &mut StintTracker::default(),
+            &mut OffTrackCounter::default(),
+            &mut LapLatch::default(),
+            0.0,
+            &StandingsOrder::Scored,
+        );
+
+        assert_eq!(entries.iter().map(|entry| entry.car_idx).collect::<Vec<_>>(), vec![1, 0]);
+        assert!(entries.iter().all(|entry| entry.pit_stops == 0));
+    }
+
+    /// Teammates can receive different local `CarIdxLap` and
+    /// `CarIdxLapDistPct` samples when one has fewer cars rendered. Shared
+    /// scored positions must still produce the same standings on both
+    /// machines.
+    #[test]
+    fn scored_position_is_stable_when_local_distance_samples_differ() {
+        let info = racing_pair();
+        let standings_for = |arrays| {
+            build_standings(
+                &info,
+                Some(0),
+                0,
+                arrays,
+                &mut StintTracker::default(),
+                &mut OffTrackCounter::default(),
+                &mut LapLatch::default(),
+                0.0,
+                &StandingsOrder::Scored,
+            )
+            .into_iter()
+            .map(|entry| (entry.car_idx, entry.position, entry.class_position))
+            .collect::<Vec<_>>()
+        };
+
+        let complete = standings_for(test_arrays(&[2, 1], &[30, 31], &[3, 3], &[0.95, 0.05]));
+        let partial = standings_for(test_arrays(&[2, 1], &[28, 31], &[3, 3], &[0.10, 0.80]));
+
+        assert_eq!(complete, partial);
+        assert_eq!(complete, vec![(1, 1, 1), (0, 2, 2)]);
+    }
+
+    /// A two-car scored race field for the standings-order tests below.
     fn racing_pair() -> SessionInfoCache {
         let mut info = SessionInfoCache::default();
         info.drivers.insert(0, test_driver(10, true));
         info.drivers.insert(1, test_driver(10, true));
         let scored = |car_idx: i32, position: i32| ResultsPosition {
+            time: None,
             position,
             class_position: position,
             car_idx,
             laps_complete: 3,
             fastest_time: 90.0,
             last_time: 91.0,
-            pit_stops: 0,
+            pit_stops: Some(0),
         };
         info.sessions.push(SessionResults {
             session_num: 0,
@@ -5925,67 +6554,6 @@ mod tests {
             results_positions: vec![scored(1, 1), scored(0, 2)],
         });
         info
-    }
-
-    /// The order the distance-based standings produce, by `CarIdx`.
-    fn distance_order_of(info: &SessionInfoCache, arrays: StandingsRawArrays<'_>, held: &mut RaceOrder) -> Vec<i32> {
-        let entries = build_standings(
-            info,
-            Some(0),
-            0,
-            arrays,
-            &mut StintTracker::default(),
-            &mut OffTrackCounter::default(),
-            &mut LapLatch::default(),
-            0.0,
-            StandingsOrder::Distance(held),
-        );
-        entries.iter().map(|e| e.car_idx).collect()
-    }
-
-    /// The complaint this exists to fix: pass the car ahead down the back
-    /// straight and the panel says the old position until the line, because
-    /// `CarIdxPosition` moves only at timing checkpoints. Distance order
-    /// changes the number the moment the car is by.
-    #[test]
-    fn a_mid_lap_pass_changes_the_position_before_the_line() {
-        let info = racing_pair();
-        // The scorer still says car 1 leads (`CarIdxPosition` [2, 1]), but
-        // car 0 has driven past: same lap, further round it.
-        let arrays = test_arrays(&[2, 1], &[3, 3], &[3, 3], &[0.60, 0.55]);
-        let order = distance_order_of(&info, arrays, &mut RaceOrder::default());
-        assert_eq!(order, vec![0, 1], "the pass counts at the moment it happens, not at the checkpoint");
-    }
-
-    /// A lap in hand outranks being behind on the current lap's fraction:
-    /// distance is laps plus the fraction, not the fraction alone.
-    #[test]
-    fn a_car_a_lap_up_stays_ahead_of_one_further_round_the_lap() {
-        let info = racing_pair();
-        let arrays = test_arrays(&[2, 1], &[3, 4], &[3, 3], &[0.90, 0.10]);
-        let order = distance_order_of(&info, arrays, &mut RaceOrder::default());
-        assert_eq!(order, vec![1, 0]);
-    }
-
-    /// Two cars genuinely side by side sit inside `CarIdxLapDistPct`'s noise;
-    /// without the hysteresis band their positions would trade every tick.
-    #[test]
-    fn side_by_side_cars_hold_their_positions_through_the_noise() {
-        let info = racing_pair();
-        let mut held = RaceOrder::default();
-        let first = distance_order_of(&info, test_arrays(&[2, 1], &[3, 3], &[3, 3], &[0.500_1, 0.500_0]), &mut held);
-        assert_eq!(first, vec![0, 1]);
-        // The difference between them flips sign by less than the band, as it
-        // does every few ticks while they run wheel to wheel.
-        for wobble in [-0.000_1_f32, 0.000_2, -0.000_05] {
-            let pcts = [0.500_0 + wobble, 0.500_0];
-            let arrays = test_arrays(&[2, 1], &[3, 3], &[3, 3], &pcts);
-            let now = distance_order_of(&info, arrays, &mut held);
-            assert_eq!(now, vec![0, 1], "positions traded on a {wobble} wobble");
-        }
-        // A genuine pass clears the band and moves at once.
-        let passed = distance_order_of(&info, test_arrays(&[2, 1], &[3, 3], &[3, 3], &[0.499_0, 0.502_0]), &mut held);
-        assert_eq!(passed, vec![1, 0]);
     }
 
     /// The forming grid is ordered by qualifying, not by who gridded first:
@@ -6008,7 +6576,7 @@ mod tests {
             &mut OffTrackCounter::default(),
             &mut LapLatch::default(),
             0.0,
-            StandingsOrder::Grid,
+            &StandingsOrder::Grid,
         );
         assert_eq!(entries[0].car_idx, 0, "pole is pole from the moment the session loads");
         assert_eq!(entries[1].car_idx, 1);
@@ -6025,10 +6593,14 @@ mod tests {
             last_laps: &[],
             f2_times: &[],
             track_surfaces: &[3, 3],
+            pit_road: &[],
             laps: &[3, 3],
             positions: &[1, 2],
             lap_dist_pcts: &[0.5, 0.5],
             session_flags: &[],
+            player_car_idx: -1,
+            player_on_pit_road: None,
+            player_in_pit_stall: None,
         };
         let entries = build_standings(
             &info,
@@ -6039,7 +6611,7 @@ mod tests {
             &mut OffTrackCounter::default(),
             &mut LapLatch::default(),
             0.0,
-            StandingsOrder::Quickest,
+            &StandingsOrder::Quickest,
         );
         assert_eq!(entries[0].car_idx, 1, "the quicker lap leads regardless of the scored order");
         assert_eq!(entries[0].class_position, 1);
@@ -6053,17 +6625,22 @@ mod tests {
     fn gaps_rebase_to_each_class_leader() {
         let mut lmp2_leader = test_entry(1, 0, 90.0);
         lmp2_leader.gap_to_leader_secs = 0.0;
+        lmp2_leader.scoring_gap_to_leader_secs = Some(0.0);
         let mut gt3_leader = test_entry(2, 0, 100.0);
         gt3_leader.car_idx = 1;
         gt3_leader.gap_to_leader_secs = 25.0;
+        gt3_leader.scoring_gap_to_leader_secs = Some(25.0);
         let mut gt3_second = test_entry(2, 0, 101.0);
         gt3_second.car_idx = 2;
         gt3_second.class_position = 2;
         gt3_second.gap_to_leader_secs = 31.5;
+        gt3_second.scoring_gap_to_leader_secs = Some(31.5);
         let mut entries = vec![lmp2_leader, gt3_leader, gt3_second];
         annotate_classes(&mut entries);
         assert!(entries[1].gap_to_leader_secs.abs() < f32::EPSILON, "a class leader has no gap to themselves");
         assert!((entries[2].gap_to_leader_secs - 6.5).abs() < 1e-4, "the class-mate's gap is to their own leader");
+        assert_eq!(entries[1].scoring_gap_to_leader_secs, Some(25.0));
+        assert_eq!(entries[2].scoring_gap_to_leader_secs, Some(31.5));
     }
 
     #[test]
@@ -6088,7 +6665,7 @@ mod tests {
             &mut OffTrackCounter::default(),
             &mut LapLatch::default(),
             0.0,
-            StandingsOrder::Scored,
+            &StandingsOrder::Scored,
         );
 
         assert_eq!(entries.len(), 2);
@@ -6104,6 +6681,8 @@ mod tests {
             driver_name: Arc::from(""),
             car_screen_name: Arc::from(""),
             irating: 0,
+            team_driver_strength: None,
+            team_drivers: Arc::from([]),
             flair_id: 0,
             car_class_id,
             car_class_short_name: Arc::from(""),
@@ -6111,7 +6690,11 @@ mod tests {
             best_lap_secs,
             last_lap_secs: 0.0,
             gap_to_leader_secs: 0.0,
+            scoring_gap_to_leader_secs: None,
+            net_gap_from_scoring: false,
+            net_uses_estimated_stint: false,
             pit_stops: 0,
+            stint_age: stint_estimation::StintAge::Observed(0),
             current_stint_laps: 0,
             current_stint_secs: 0.0,
             avg_stint_laps: None,
@@ -6124,6 +6707,7 @@ mod tests {
             last_pit_secs: None,
             avg_pit_secs: None,
             stops_remaining: None,
+            stops_remaining_range: None,
             projected_class_position: None,
             is_focus: false,
             off_tracks: 0,
@@ -6280,6 +6864,26 @@ mod tests {
         let count = stops.update(tick(490.0, false, false, 30.0, true));
 
         assert_eq!(count, 1, "one visit to the pit lane is one stop, whatever the sim stopped publishing during it");
+    }
+
+    /// `PlayerCarInPitStall` can clear as the crew releases the car while its
+    /// speed is still zero. A visit-latched box observation must keep the
+    /// stop count from being lost on that release tick.
+    #[test]
+    fn a_flickering_player_stall_flag_does_not_lose_a_real_stop() {
+        let mut stops = PlayerStops::default();
+        let count = run_player(
+            &mut stops,
+            &[
+                (0.0, false, false, 60.0),
+                (400.0, true, false, 14.0),
+                (405.0, true, true, 0.0),
+                (430.0, true, false, 0.0), // released flag, still stationary
+                (435.0, false, false, 30.0),
+            ],
+        );
+
+        assert_eq!(count, 1);
     }
 
     /// Joining a race already under way: the sim's own count stands in for
@@ -6537,6 +7141,40 @@ mod tests {
         assert_eq!(next_exit.avg_laps, None, "an approximate post-offline start cannot become a fuel-range sample");
     }
 
+    /// The failure reported after Suzuka: the car is rendered again before
+    /// the results row catches up, so the scorer increment arrives after the
+    /// `NotInWorld` transition has already been consumed. That must still
+    /// retire the old 32-lap stint.
+    #[test]
+    fn a_scorer_increment_after_a_car_returns_from_a_gap_resets_the_stale_stint() {
+        let mut stint = StintState::default();
+        stint.update_with_official(0.0, 0, Some(0), true, false, false, Some(0.1));
+        stint.update_with_official(3000.0, 32, Some(0), true, false, false, Some(0.8));
+        stint.update_with_official(3005.0, 32, Some(0), false, false, false, None);
+        let returned = stint.update_with_official(3035.0, 33, Some(0), true, false, false, Some(0.05));
+        assert_eq!(returned.current_laps, 33, "no count increase means a blink alone cannot invent a stop");
+
+        let scored = stint.update_with_official(3037.0, 33, Some(1), true, false, false, Some(0.07));
+        assert_eq!(scored.completed_stops, 1);
+        assert_eq!(scored.current_laps, 0, "the delayed scorer row resets at the return boundary");
+        assert_eq!(scored.avg_laps, None, "an unseen visit cannot teach a fuel range");
+
+        let next_lap = stint.update_with_official(3125.0, 34, Some(1), true, false, false, Some(0.6));
+        assert_eq!(next_lap.current_laps, 1);
+    }
+
+    #[test]
+    fn out_lap_is_only_the_lap_of_a_confirmed_pit_exit() {
+        let mut stint = StintState::default();
+        stint.update_with_presence(0.0, 0, true, false, false, Some(0.1));
+        assert!(!stint.is_out_lap(0, TrackLocation::OnTrack), "the grid departure is not an out-lap");
+        stint.update_with_presence(700.0, 8, true, true, true, Some(0.99));
+        stint.update_with_presence(730.0, 8, true, false, false, Some(0.01));
+        assert!(stint.is_out_lap(8, TrackLocation::OnTrack));
+        assert!(!stint.is_out_lap(8, TrackLocation::ApproachingPits));
+        assert!(!stint.is_out_lap(9, TrackLocation::OnTrack));
+    }
+
     #[test]
     fn a_first_official_count_below_the_local_count_does_not_erase_the_stop() {
         let mut stint = StintState::default();
@@ -6581,7 +7219,10 @@ mod tests {
         stint.update_with_official(1525.0, 17, Some(1), true, true, true, Some(0.99));
         let exit = stint.update_with_official(1530.0, 17, Some(1), true, false, false, Some(0.01));
 
-        assert_eq!(exit.completed_stops, 1, "one scored real stop must not become drive-through offset plus local stop");
+        assert_eq!(
+            exit.completed_stops, 1,
+            "one scored real stop must not become drive-through offset plus local stop"
+        );
         assert_eq!(exit.current_laps, 0);
         assert_eq!(exit.avg_laps, Some(17));
     }
@@ -6813,11 +7454,13 @@ mod tests {
         pitted.is_focus = true;
         pitted.pit_stops = reading.completed_stops;
         pitted.current_stint_laps = reading.current_laps;
+        pitted.stint_age = stint_estimation::StintAge::Observed(reading.current_laps);
         pitted.avg_stint_laps = reading.avg_laps;
         let mut rival = test_entry(10, 0, 100.0);
         rival.car_idx = 1;
         rival.class_position = 2;
         rival.current_stint_laps = 7;
+        rival.stint_age = stint_estimation::StintAge::Observed(7);
         [pitted, rival]
     }
 
@@ -6836,7 +7479,10 @@ mod tests {
                 pit_model::PitModel::default(),
                 &HashMap::from([(0, 0.0), (1, 10.0)]),
             );
-            assert!(standings.iter().all(|entry| entry.stops_remaining.is_none()), "{kind:?}: no stops to a race finish");
+            assert!(
+                standings.iter().all(|entry| entry.stops_remaining.is_none()),
+                "{kind:?}: no stops to a race finish"
+            );
             assert!(standings.iter().all(|entry| entry.projected_class_position.is_none()));
             assert!(meta.laps_remaining.is_none());
             assert!(!multi_stop);
@@ -6886,12 +7532,14 @@ mod tests {
         unpitted.class_position = 1;
         unpitted.gap_to_leader_secs = 0.0;
         unpitted.current_stint_laps = 18; // deep into a long first stint
+        unpitted.stint_age = stint_estimation::StintAge::Observed(18);
 
         let mut pitted = test_entry(10, 0, 100.0);
         pitted.car_idx = 1;
         pitted.class_position = 2;
         pitted.gap_to_leader_secs = 10.0;
         pitted.current_stint_laps = 1; // fresh out of the box
+        pitted.stint_age = stint_estimation::StintAge::Observed(1);
         pitted.avg_stint_laps = Some(17);
 
         let mut standings = [unpitted, pitted];
@@ -6918,13 +7566,16 @@ mod tests {
         let mut leader = test_entry(10, 0, 100.0);
         leader.avg_stint_laps = Some(17);
         leader.current_stint_laps = 17;
+        leader.stint_age = stint_estimation::StintAge::Observed(17);
         leader.avg_pit_secs = Some(20.0);
         let mut pitted = leader.clone();
         pitted.car_idx = 1;
         pitted.class_position = 2;
         pitted.current_stint_laps = 0;
+        pitted.stint_age = stint_estimation::StintAge::Observed(0);
         // F2 still has the old gap. Live track position says forty seconds.
         pitted.gap_to_leader_secs = 0.0;
+        pitted.scoring_gap_to_leader_secs = Some(0.0);
         let mut standings = [leader, pitted];
         let curve = relative::LapCurve::default();
         let gaps = live_net_gaps(&standings, &[20, 20], &[0.7, 0.3], &curve, Some(10));
@@ -6933,6 +7584,7 @@ mod tests {
         assert_eq!(standings[0].stops_remaining, Some(1));
         assert_eq!(standings[1].stops_remaining, Some(0));
         assert_eq!(standings[1].projected_class_position, Some(1), "40 seconds paid beats 50 seconds owed");
+        assert!(!standings[1].net_gap_from_scoring, "fresh live progress must beat the stale F2 gap");
         // At sixty seconds behind, the same car really has lost NET P1.
         let gaps = live_net_gaps(&standings, &[20, 20], &[0.9, 0.3], &curve, Some(10));
         annotate_endurance(&mut standings, Some(10), 30.0, Some(10), &mut false, model, &gaps);
@@ -6969,11 +7621,13 @@ mod tests {
         let mut leader = test_entry(10, 0, 100.0);
         leader.avg_stint_laps = Some(17);
         leader.current_stint_laps = 17;
+        leader.stint_age = stint_estimation::StintAge::Observed(17);
         leader.avg_pit_secs = Some(20.0);
         let mut rival = leader.clone();
         rival.car_idx = 1;
         rival.class_position = 2;
         rival.current_stint_laps = 0;
+        rival.stint_age = stint_estimation::StintAge::Observed(0);
         let mut standings = [leader, rival];
         annotate_endurance(
             &mut standings,
@@ -6988,19 +7642,122 @@ mod tests {
     }
 
     #[test]
-    fn net_ranks_active_cars_when_a_competitor_leaves_the_world() {
-        let mut absent = test_entry(10, 0, 100.0);
-        absent.avg_stint_laps = Some(17);
+    fn net_matches_across_clients_when_one_client_does_not_render_a_classified_rival() {
+        let mut leader = test_entry(10, 0, 100.0);
+        leader.avg_stint_laps = Some(17);
+        leader.scoring_gap_to_leader_secs = Some(0.0);
+        let mut rival = leader.clone();
+        rival.car_idx = 1;
+        rival.class_position = 2;
+        rival.scoring_gap_to_leader_secs = Some(20.0);
+
+        // Client A has live progress for the complete class.
+        let mut fully_rendered = [leader.clone(), rival.clone()];
+        annotate_endurance(
+            &mut fully_rendered,
+            Some(10),
+            30.0,
+            Some(10),
+            &mut false,
+            pit_model::PitModel::default(),
+            &HashMap::from([(0, 0.0), (1, 20.0)]),
+        );
+
+        // Client B sees the same scorer state, but the rival is not rendered.
+        // The class switches together to scorer gaps, so every row shares one
+        // origin rather than mixing its live zero with the absent rival.
+        rival.track_location = TrackLocation::NotInWorld;
+        let mut partially_rendered = [leader, rival];
+        annotate_endurance(
+            &mut partially_rendered,
+            Some(10),
+            30.0,
+            Some(10),
+            &mut false,
+            pit_model::PitModel::default(),
+            &HashMap::from([(0, 0.0)]),
+        );
+
+        assert_eq!(
+            partially_rendered.iter().map(|entry| entry.projected_class_position).collect::<Vec<_>>(),
+            fully_rendered.iter().map(|entry| entry.projected_class_position).collect::<Vec<_>>(),
+            "render count cannot change a class NET order when scorer inputs agree"
+        );
+        assert!(partially_rendered.iter().all(|entry| entry.net_gap_from_scoring));
+    }
+
+    #[test]
+    fn an_absent_class_leader_does_not_rebase_visible_rivals_to_live_zero() {
+        let mut leader = test_entry(10, 0, 100.0);
+        leader.avg_stint_laps = Some(17);
+        leader.current_stint_laps = 17;
+        leader.stint_age = stint_estimation::StintAge::Observed(17);
+        leader.track_location = TrackLocation::NotInWorld;
+        leader.scoring_gap_to_leader_secs = Some(0.0);
+
+        let mut player = leader.clone();
+        player.car_idx = 1;
+        player.class_position = 2;
+        player.is_focus = true;
+        player.current_stint_laps = 0;
+        player.stint_age = stint_estimation::StintAge::Observed(0);
+        player.track_location = TrackLocation::OnTrack;
+        player.scoring_gap_to_leader_secs = Some(40.0);
+        let mut standings = [leader, player];
+
+        // Only the visible player has local progress, so it reads zero when
+        // measured against itself. Scorer gaps must become the common origin:
+        // leader owes one stop (30s) and the player is 40s behind, so P2.
+        let gaps = live_net_gaps(&standings, &[-1, 20], &[0.8, 0.3], &relative::LapCurve::default(), Some(10));
+        assert_eq!(gaps, HashMap::from([(1, 0.0)]));
+        let meta = annotate_endurance(
+            &mut standings,
+            Some(10),
+            30.0,
+            Some(10),
+            &mut false,
+            pit_model::PitModel::default(),
+            &gaps,
+        );
+        assert_eq!(standings[0].projected_class_position, Some(1));
+        assert_eq!(standings[1].projected_class_position, Some(2));
+        assert!(standings.iter().all(|entry| entry.net_gap_from_scoring));
+        assert!(meta.net_gap_from_scoring, "the footer must disclose the class-wide scorer origin");
+    }
+
+    #[test]
+    fn live_net_gaps_reject_stale_progress_from_a_car_outside_the_world() {
+        let leader = test_entry(10, 0, 100.0);
+        let mut stale = leader.clone();
+        stale.car_idx = 1;
+        stale.class_position = 2;
+        stale.track_location = TrackLocation::NotInWorld;
+        let gaps = live_net_gaps(&[leader, stale], &[20, 19], &[0.5, 0.9], &relative::LapCurve::default(), Some(10));
+        assert_eq!(gaps, HashMap::from([(0, 0.0)]));
+    }
+
+    #[test]
+    fn net_withholds_a_class_when_an_absent_nonleader_has_the_f2_zero_sentinel() {
+        let mut leader = test_entry(10, 0, 100.0);
+        leader.avg_stint_laps = Some(17);
+        leader.scoring_gap_to_leader_secs = Some(0.0);
+        let mut absent = leader.clone();
+        absent.car_idx = 1;
+        absent.class_position = 2;
         absent.track_location = TrackLocation::NotInWorld;
-        let mut active = absent.clone();
-        active.car_idx = 1;
-        active.class_position = 2;
-        active.track_location = TrackLocation::OnTrack;
-        let mut standings = [absent, active];
-        let gaps = live_net_gaps(&standings, &[-1, 20], &[-1.0, 0.3], &relative::LapCurve::default(), Some(10));
-        annotate_endurance(&mut standings, Some(10), 30.0, Some(10), &mut false, pit_model::PitModel::default(), &gaps);
-        assert_eq!(standings[0].projected_class_position, None);
-        assert_eq!(standings[1].projected_class_position, Some(1));
+        // A nonleader zero is the telemetry sentinel, not a level gap.
+        absent.scoring_gap_to_leader_secs = Some(0.0);
+        let mut standings = [leader, absent];
+        annotate_endurance(
+            &mut standings,
+            Some(10),
+            30.0,
+            Some(10),
+            &mut false,
+            pit_model::PitModel::default(),
+            &HashMap::from([(0, 0.0)]),
+        );
+        assert!(standings.iter().all(|entry| entry.projected_class_position.is_none()));
     }
 
     #[test]
@@ -7014,6 +7771,120 @@ mod tests {
         assert_eq!(gaps.len(), 2);
         assert!((gaps[&0] - 0.1).abs() < 0.001);
         assert!(gaps[&1].abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn uncertain_age_withholds_net_when_the_stop_count_changes() {
+        use stint_estimation::{EstimateBasis, StintAge};
+        let mut leader = test_entry(10, 0, 100.0);
+        leader.avg_stint_laps = Some(28);
+        leader.is_focus = true;
+        let mut rival = leader.clone();
+        rival.car_idx = 1;
+        rival.class_position = 2;
+        rival.is_focus = false;
+        rival.stint_age = StintAge::Estimated { min: 7, max: 11, basis: EstimateBasis::StrategyPrior };
+        let mut entries = [leader, rival];
+        let gaps = HashMap::from([(0, 0.0), (1, 5.0)]);
+        let meta = annotate_endurance(
+            &mut entries,
+            Some(20),
+            60.0,
+            Some(10),
+            &mut false,
+            pit_model::PitModel::default(),
+            &gaps,
+        );
+        assert_eq!(entries[1].stops_remaining_range, Some((0, 1)));
+        assert_eq!(entries[1].stops_remaining, None);
+        assert!(entries.iter().all(|entry| entry.projected_class_position.is_none()));
+        assert!(meta.net_uses_estimated_stint);
+        assert_eq!(entries[1].pit_stops, 0, "an estimated visit is not a measured count");
+
+        // Every age can finish these ten laps: a provisional NET is now
+        // useful and still discloses that one stint boundary was estimated.
+        let meta = annotate_endurance(
+            &mut entries,
+            Some(10),
+            60.0,
+            Some(10),
+            &mut false,
+            pit_model::PitModel::default(),
+            &gaps,
+        );
+        assert_eq!(entries[1].stops_remaining_range, Some((0, 0)));
+        assert_eq!(entries[1].projected_class_position, Some(2));
+        assert!(meta.net_uses_estimated_stint);
+
+        entries[1].stint_age = StintAge::Unknown;
+        annotate_endurance(&mut entries, Some(10), 60.0, Some(10), &mut false, pit_model::PitModel::default(), &gaps);
+        assert!(entries.iter().all(|entry| entry.projected_class_position.is_none()));
+        assert_eq!(entries[1].stops_remaining_range, None);
+    }
+
+    #[test]
+    fn a_fuel_range_requires_multiple_observed_complete_stints() {
+        assert_eq!(observed_fuel_range([28].into_iter()), None);
+        assert_eq!(observed_fuel_range([28, 28, 28].into_iter()), Some((27, 29)));
+        assert_eq!(observed_fuel_range([1, 28].into_iter()), None, "a splash is not a normal range sample");
+    }
+
+    #[test]
+    fn scorer_gap_freshness_belongs_to_the_car_lap_not_yaml_republication() {
+        let mut tracker = ScoringGapTracker::default();
+        let mut row = ResultsPosition {
+            car_idx: 5,
+            position: 2,
+            class_position: 1,
+            laps_complete: 2,
+            last_time: 140.0,
+            fastest_time: 139.0,
+            time: Some(23.0),
+            pit_stops: None,
+        };
+        tracker.observe(&row, 0.0);
+        assert_eq!(tracker.gap(5, 0.0), None, "an attachment snapshot has unknown age");
+        row.laps_complete = 3;
+        tracker.observe(&row, 140.0);
+        assert_eq!(tracker.gap(5, 140.0), Some(23.0));
+        tracker.observe(&row, 460.0);
+        assert_eq!(tracker.gap(5, 460.0), None, "unchanged row cannot renew a stale gap");
+        row.laps_complete = 4;
+        row.time = Some(25.0);
+        tracker.observe(&row, 470.0);
+        assert_eq!(tracker.gap(5, 470.0), Some(25.0));
+        row.laps_complete = 1;
+        tracker.observe(&row, 471.0);
+        assert_eq!(tracker.gap(5, 471.0), None, "a rewind is not a new lap");
+    }
+
+    #[test]
+    fn standings_discovers_team_ratings_across_driver_swaps() {
+        let mut info = SessionInfoCache { team_racing: true, valid_update: Some(1), ..SessionInfoCache::default() };
+        info.drivers
+            .insert(0, DriverMeta { team_id: Some(77), user_id: Some(11), irating: 1800, ..test_driver(10, true) });
+        let mut stints = StintTracker::default();
+        stints.update(0, 0.0, 0, None, true, false, false, Some(0.1));
+        let mut tracking = TeamDriverTracking::default();
+        let mut entries = [test_entry(10, 0, 100.0)];
+        tracking.annotate(&mut entries, &info, Some(0), &stints, &LapLatch::default(), 0.0, true, false);
+        assert_eq!(entries[0].team_driver_strength.as_ref().expect("team row").chevrons, 0);
+
+        let driver = info.drivers.get_mut(&0).expect("active team entry");
+        driver.user_id = Some(22);
+        driver.irating = 4200;
+        info.valid_update = Some(2);
+        tracking.annotate(&mut entries, &info, Some(0), &stints, &LapLatch::default(), 1.0, true, false);
+        let strength = entries[0].team_driver_strength.as_ref().expect("team comparison");
+        assert_eq!(strength.chevrons, 3);
+        assert_eq!(strength.known_count, 2);
+        assert_eq!(strength.basis, driver_pace::StrengthBasis::Rating);
+        assert_eq!(entries[0].team_drivers.len(), 2);
+        assert!(entries[0].team_drivers.iter().any(|driver| driver.user_id == 11 && driver.irating == Some(1800)));
+
+        tracking.annotate(&mut entries, &info, Some(0), &stints, &LapLatch::default(), 2.0, false, false);
+        assert!(entries[0].team_driver_strength.is_none());
+        assert!(entries[0].team_drivers.is_empty());
     }
 
     #[test]
@@ -7147,5 +8018,167 @@ mod tests {
             pace.update(i32::try_from(lap).expect("small"), 80.0, false);
         }
         assert_eq!(pace.laps.len(), PACE_WINDOW);
+    }
+
+    /// A race-long mix of ordinary fuel stops, delayed scoring, brief
+    /// renderer gaps, and short penalty visits. The two stop trackers use
+    /// different evidence, so exercising both here guards their agreement
+    /// without pretending that either can infer a driver swap as a session.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "a chronological endurance scenario is clearest as one linear script; helpers would obscure the exact delayed-score and gap ordering"
+    )]
+    fn a_24_hour_stint_simulation_keeps_counts_ranges_and_out_laps_bounded() {
+        let mut trackers = SessionTrackers::default();
+        trackers.sync_to_session(Some(9));
+        let mut player = PlayerStops::default();
+        let mut now = 0.0;
+        let mut lap = 0;
+        let mut official = 0;
+        let mut expected_stops = 0;
+
+        trackers.stint.update(0, now, lap, Some(official), true, false, false, Some(0.1));
+        player.update(PlayerStopTick {
+            session_time_secs: now,
+            on_pit_road: false,
+            in_box: Some(false),
+            speed_mps: Some(60.0),
+            in_world: true,
+            official_stops: Some(official),
+        });
+
+        // Twenty-eight 30-32-lap stints take us past twenty-four hours at a
+        // 100-second lap. Every results update arrives after a <=30s gap.
+        for stint_number in 0..28 {
+            let fuel_stint_laps = 30 + stint_number % 3;
+            lap += fuel_stint_laps;
+            now += f64::from(fuel_stint_laps) * 100.0;
+
+            // A normal stationary service. The official count is still the
+            // previous one when the car leaves its box.
+            trackers.stint.update(0, now, lap, Some(official), true, true, true, Some(0.95));
+            player.update(PlayerStopTick {
+                session_time_secs: now,
+                on_pit_road: true,
+                in_box: Some(true),
+                speed_mps: Some(0.0),
+                in_world: true,
+                official_stops: Some(official),
+            });
+            trackers.stint.update(0, now + 15.0, lap, Some(official), true, true, true, Some(0.95));
+            player.update(PlayerStopTick {
+                session_time_secs: now + 15.0,
+                on_pit_road: true,
+                in_box: Some(false), // release-tick stall flag flicker
+                speed_mps: Some(0.0),
+                in_world: true,
+                official_stops: Some(official),
+            });
+            now += 25.0;
+            expected_stops += 1;
+            let exited = trackers.stint.update(0, now, lap, Some(official), true, false, false, Some(0.02));
+            let player_count = player.update(PlayerStopTick {
+                session_time_secs: now,
+                on_pit_road: false,
+                in_box: Some(false),
+                speed_mps: Some(45.0),
+                in_world: true,
+                official_stops: Some(official),
+            });
+            assert_eq!(exited.completed_stops, expected_stops);
+            assert_eq!(player_count, expected_stops);
+            assert!(trackers.stint.cars[&0].is_out_lap(lap, TrackLocation::OnTrack));
+
+            // A renderer blink must not close a stop twice or make a new one.
+            trackers.stint.update(0, now + 5.0, lap, Some(official), false, false, false, None);
+            let returned = trackers.stint.update(0, now + 25.0, lap, Some(official), true, false, false, Some(0.15));
+            let player_count = player.update(PlayerStopTick {
+                session_time_secs: now + 25.0,
+                on_pit_road: false,
+                in_box: Some(false),
+                speed_mps: Some(50.0),
+                in_world: true,
+                official_stops: Some(official),
+            });
+            assert_eq!(returned.completed_stops, expected_stops);
+            assert_eq!(player_count, expected_stops);
+
+            // The scorer catches up only after the car was rendered again.
+            official = expected_stops;
+            let scored = trackers.stint.update(0, now + 30.0, lap, Some(official), true, false, false, Some(0.20));
+            assert_eq!(scored.completed_stops, expected_stops, "the delayed score acknowledges, never duplicates");
+            assert!(trackers.stint.cars[&0].is_out_lap(lap, TrackLocation::OnTrack));
+            now += 30.0;
+
+            // A short penalty stop on the very next lap is counted but must
+            // never become a fuel-range sample.
+            if stint_number % 7 == 6 {
+                lap += 1;
+                now += 100.0;
+                trackers.stint.update(0, now, lap, Some(official), true, true, true, Some(0.94));
+                trackers.stint.update(0, now + 10.0, lap, Some(official), true, true, true, Some(0.94));
+                player.update(PlayerStopTick {
+                    session_time_secs: now,
+                    on_pit_road: true,
+                    in_box: Some(true),
+                    speed_mps: Some(0.0),
+                    in_world: true,
+                    official_stops: Some(official),
+                });
+                player.update(PlayerStopTick {
+                    session_time_secs: now + 10.0,
+                    on_pit_road: true,
+                    in_box: Some(true),
+                    speed_mps: Some(0.0),
+                    in_world: true,
+                    official_stops: Some(official),
+                });
+                now += 20.0;
+                expected_stops += 1;
+                let penalty_exit = trackers.stint.update(0, now, lap, Some(official), true, false, false, Some(0.03));
+                let player_count = player.update(PlayerStopTick {
+                    session_time_secs: now,
+                    on_pit_road: false,
+                    in_box: Some(false),
+                    speed_mps: Some(45.0),
+                    in_world: true,
+                    official_stops: Some(official),
+                });
+                assert_eq!(penalty_exit.completed_stops, expected_stops);
+                assert_eq!(player_count, expected_stops);
+                assert!(trackers.stint.cars[&0].is_out_lap(lap, TrackLocation::OnTrack));
+                official = expected_stops;
+                now += 30.0;
+                trackers.stint.update(0, now, lap, Some(official), true, false, false, Some(0.25));
+            }
+
+            // A driver swap leaves `SessionNum` unchanged. A missing sample
+            // followed by that same number must preserve all history.
+            if stint_number == 14 {
+                let before_swap = trackers.stint.cars[&0].completed_stop_count();
+                trackers.sync_to_session(None);
+                trackers.sync_to_session(Some(9));
+                assert_eq!(trackers.stint.cars[&0].completed_stop_count(), before_swap);
+            }
+        }
+
+        // One final blink occurs away from a pit event, proving absence alone
+        // cannot manufacture a stop.
+        lap += 2;
+        now += 200.0;
+        let before_blink = trackers.stint.cars[&0].completed_stop_count();
+        trackers.stint.update(0, now, lap, Some(official), false, false, false, None);
+        let after_blink = trackers.stint.update(0, now + 20.0, lap, Some(official), true, false, false, Some(0.4));
+        assert_eq!(after_blink.completed_stops, before_blink);
+        assert!(!trackers.stint.cars[&0].is_out_lap(lap, TrackLocation::OnTrack));
+
+        let state = &trackers.stint.cars[&0];
+        assert!(now >= 86_400.0, "the scenario covers at least twenty-four hours");
+        assert_eq!(state.completed_stop_count(), expected_stops);
+        assert_eq!(state.completed.len(), STINT_SAMPLES, "fuel history cannot grow with race duration");
+        assert_eq!(state.pit_secs.len(), STINT_SAMPLES, "pit-time history cannot grow with race duration");
+        assert!(state.completed.iter().all(|(laps, _)| (30..=32).contains(laps)));
+        assert!(state.reading(now, lap).avg_laps.is_some_and(|average| (30..=32).contains(&average)));
     }
 }

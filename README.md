@@ -8,6 +8,8 @@ exactly what the code draws.
 
 **Install, configure and build:** see [the manual](docs/manual.md).
 
+**Endurance reliability audit:** see [the findings, fixes and live rehearsal checklist](docs/endurance-audit.md).
+
 **Contents** — [Relative](#relative) · [Black box](#black-box) · [Standings](#standings) ·
 [Radar bars](#radar-bars) · [Faster class](#faster-class) ·
 [Status border](#status-border) · [Strategy](#strategy--fuel) ·
@@ -52,7 +54,8 @@ out whole. The class reads from the wash behind the name.
 
 The **status gutter** sits outside the card, one slot per row, so an annotation about a car never competes
 with the driver's name for space. In priority order: a black-flag marker, the session's fastest-lap
-stopwatch, a `PIT` block while that car is in its stall or approaching, or its off-track tally. Rows with
+stopwatch, a `PIT` block while that car is in its stall or approaching, an `OUT` block on a confirmed out-lap,
+or its off-track tally. Rows with
 nothing to report draw nothing.
 
 <details>
@@ -111,10 +114,33 @@ Your own class in full on the left, other classes' leaders on the right, with th
 across the top. Rows tumble to their new slot when positions change, so a change is seen to happen rather
 than the table silently being different.
 
+**GAP / INT.** Choose the class leader, the next classified car, or **Auto** in Settings → Standings →
+Content. Auto alternates the two readings every five seconds by default (configurable from 1 to 120 seconds)
+and marks the active heading `AUTO`. Clicking the heading also cycles modes while the overlay is interactive.
+Intervals remain useful when both cars are laps behind the leader. Position numbers use shared scoring instead
+of the locally rendered subset. SOF is a fixed estimate from the session roster.
+
+**Watching a race.** Settings → Standings → Content can keep a full classified table for a spectator or
+team-mate seat. Click **FULL** in the standings heading to expand it immediately; the fixed headings remain
+visible while every selected class scrolls below. **Visible rows** sets the panel's bounded height, and the
+compact/full choice is saved for the next time you watch.
+
+**Unseen stints.** A solid stint number and bar are observed. `~12` is an inferred single age, while
+`~9–15` is its plausible range; inferred bars are hatched and `?` means no trustworthy boundary. A `~NET`
+uses an inferred stint or scorer fallback, and the summary shows a stop range instead of a made-up count.
+
+**Team-driver strength.** In team races, the iRating badge carries up to three green or red chevrons when
+the current driver can be ranked among drivers seen for that entry's team. Hover it for the rank, whether it
+uses iRating or clean completed-stint pace, and the provisional known-driver list.
+
+An unrendered car keeps its scored standings row. `TOW` requires the player's positive iRacing tow timer;
+rival absence alone never claims a tow. The countdown shows time remaining, not time since a car vanished.
+
 | | |
 |---|---|
 | <img src="docs/features/img/standings-endurance.png" alt="Endurance columns" width="400"> | **Endurance columns** — stint length, completed pit stops, and projected finishing position. The race summary below separately shows estimated stops still to go. |
 | <img src="docs/features/img/standings-tyres.png" alt="Compound column" width="400"> | **Compound column and stint laps.** The compound letter appears only when the session publishes compounds; wets are ringed blue. |
+| <img src="docs/features/img/standings-estimated.png" alt="Standings showing observed, inferred and unknown stint ages" width="400"> | **Unseen-stop confidence.** Tildes and hatch marks preserve an inferred range; `?` withholds a boundary the overlay cannot establish. |
 
 ---
 
@@ -147,9 +173,8 @@ without reading a single row.
 
 <img src="docs/features/img/relative-box.png" alt="The BOX BOX status border" width="820">
 
-The border sits flush on the widget's own edge and its left limb widens into a filled band across the whole
-status gutter — the gutter's own markers draw on top of it, so the border passes under them rather than
-detouring around them. The plate straddles the top edge.
+The border wraps the card, leaving the status gutter outside it. The status label sits entirely above the
+border. While watching another driver, their name shares the Relative's SOF/weather line.
 
 | | | |
 |---|---|---|
@@ -187,25 +212,34 @@ projection all leave it unsaid rather than guessed.
 stationary — rather than a single shared guess, so a car taking tyres every stop is projected with its real
 loss. Rivals' stop lengths are what the tyre inference is drawn from.
 
+**NET means the finish.** It ranks the class after every car completes its expected remaining race stops.
+It includes lane transit and service cost; a stop already paid is not charged again. `~NET` marks a
+projection that depends on scoring data for cars without current local progress. It remains an estimate
+of rival strategy; see [the calculation and its limits](docs/net-position.md).
+
 ---
 
 ## Team sync
 
-In a team session every member's sim publishes the same world, but only the seated driver's sim publishes the
-car. Team sync shares the measurements, so a spectating crew chief sees the fuel, tyres and strategy of the
-car they are not sitting in — and a member who disconnects gets everything they missed.
+Team sync shares the seated driver's private measurements, so a spectating crew chief sees fuel, tyres and
+strategy for that car. Public telemetry is collected locally and can differ with each client's rendered
+car limit. Reconnecting clients recover the shared event history while a relay or replica still holds it.
 
 **How it works**
 
-- **An event ledger, not state streaming.** A closed lap is ~32 bytes every couple of minutes; a live scalars
-  tick runs at 1 Hz and *only while somebody is listening*. A five-member team costs 1–2 KB/s in total.
+- **An event ledger.** The driver publishes completed laps and changed tyre readings. Current fuel and pit
+  settings run at up to 1 Hz while somebody is listening, with a two-second heartbeat when unchanged.
 - **iRacing's own session clock stamps every event**, so members merge them deterministically whatever the
   network delays. Accuracy comes from the timestamp, not from sending fast.
-- **Recovery is the ledger read back.** A member who joins late or reconnects asks for what they are missing
-  and replays it through the same handlers as live events — so a rebuilt overlay is identical to one that
-  never dropped.
-- **Rooms are keyed by iRacing's SubSessionID**, so members find each other with no configuration, and an
-  invite code keeps strangers in the same subsession out.
+- **Recovery only transfers missing history.** Surviving clients can also restore a restarted relay.
+  Historical pit commands rebuild history without issuing controls.
+- **Rooms include SubSessionID and SessionNum**, separating practice, qualifying and race history. An
+  invite code limits access. All members need the same protocol version; this build uses version 8.
+
+**With only spectators connected**, each overlay keeps collecting public telemetry locally. Spectators
+do not broadcast fuel or tyre measurements; they send explicit crew decisions and requested recovery
+data. Without a connected driver, private readings expire after five seconds. Public rival stop/stint
+histories are not currently replicated, and history is lost if every holder exits.
 
 **Hosting.** One member ticks *Host the relay from this PC* in Settings → Team Sync. The relay runs inside the
 overlay — no terminal, no second program — and binds to that machine only. Teammates reach it through the
@@ -218,6 +252,9 @@ tailscale funnel 41230
 The address that prints goes in every teammate's **Relay URL** as `wss://…`, with the same invite code. A host
 who leaves the invite field empty gets one generated and saved the moment hosting starts; while hosting, that
 overlay connects to its own relay automatically and the URL field is greyed out.
+
+Relay URL and invite fields have **Copy** and **Paste** buttons, plus Ctrl+A/C/V/X shortcuts. Pasting trims
+surrounding whitespace; correcting either field reconnects automatically.
 
 **What a crew chief sees**
 
@@ -334,7 +371,7 @@ panel behind the window is the preview — and are saved once they settle.
 |---|---|
 | General | Theme, hide-while-unfocused, hide-in-garage, off-track tally, driver flags, stream mode, which seat layout is in force, and **Reset all positions**. |
 | Relative | Visibility, scale, card width, cars ahead/behind, and every optional column. |
-| Standings | Visibility, scale, name-column width, other classes, stint laps, compound column, position change, endurance mode, pit-loss and tyre-change thresholds. |
+| Standings | Visibility, scale, name-column width, compact/full spectator view and its visible rows, other classes, stint laps, compound column, position change, endurance mode, pit-loss and tyre-change thresholds. |
 | Logos | Manufacturer mark style and colour, with every known brand drawn as it will appear and a per-brand override. |
 | Radar Bars | Car length, range in car lengths and in time, bar size, the gap between the capsules, gaps in metres. |
 | Faster Class | Visibility, scale, warn/alert gaps and flash. |
@@ -366,6 +403,7 @@ answer. Binds can also be set from a terminal with `race-overlay.exe --bind <act
 | Flag | What it does |
 |---|---|
 | `--demo` | Render the fixed demo snapshot; iRacing is not needed. |
+| `--check-config` | Print the settings path, Relative layout and bind count without opening the overlay or printing sync credentials. |
 | `--demo-page=<page>` | Open the black box on `relative`, `strategy`, `fuel`, `tires`, `in-car` or `weather`. |
 | `--demo-settings=<page>` | Open a settings page for a preview, e.g. `general`, `standings`, `black-box` or `binds`. Requires `--demo`; works with `--screenshot`. |
 | `--demo-state=<a,b>` | Put the demo snapshot into a named state — a caution, a box call, a spectator's seat — for a screenshot. |

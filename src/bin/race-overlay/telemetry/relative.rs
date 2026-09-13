@@ -1079,6 +1079,7 @@ mod tests {
             best_recent_lap_secs: None,
             recent_laps: [None; 3],
             penalty: None,
+            is_out_lap: false,
         }
     }
 

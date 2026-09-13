@@ -207,8 +207,17 @@ pub struct ResultsPosition {
     pub fastest_time: f32,
     #[serde(rename = "LastTime", default)]
     pub last_time: f32,
+    /// Official deficit to the overall leader at this car's most recent
+    /// start/finish crossing. It is a gap, not elapsed race time; `None`
+    /// where the YAML omits it. Callers must reject the SDK's negative
+    /// sentinel and establish per-car freshness from `LapsComplete`.
+    #[serde(rename = "Time", default)]
+    pub time: Option<f32>,
+    /// Optional because recorded iRacing session-info YAML can omit this
+    /// field even from an official classification. Absence is unknown, never
+    /// an official zero-stop count.
     #[serde(rename = "PitStops", default)]
-    pub pit_stops: i32,
+    pub pit_stops: Option<i32>,
 }
 
 /// The `DriverInfo` section: the player's own car plus the full driver list.
@@ -284,6 +293,20 @@ pub struct Driver {
     /// [`DriverInfo::driver_user_id`]. `None` where a YAML omits it.
     #[serde(rename = "UserID", default)]
     pub user_id: Option<i32>,
+    /// iRacing's entry-team identifier. A zero is present for ordinary
+    /// single-driver entries in the recorded YAML, so consumers grouping a
+    /// driver team must require a positive id rather than treating zero as a
+    /// shared team.
+    #[serde(rename = "TeamID", default)]
+    pub team_id: Option<i32>,
+    /// The entry's team name. In a solo entry this is commonly the current
+    /// driver's name; it is display metadata, never a team-membership key.
+    #[allow(
+        dead_code,
+        reason = "the tracker groups by TeamID; the parsed display label is retained for future team presentation"
+    )]
+    #[serde(rename = "TeamName", default)]
+    pub team_name: String,
     /// The number on the car, as iRacing writes it — a string, because a
     /// number like `007` keeps its zeros.
     #[serde(rename = "CarNumber", default)]
@@ -335,6 +358,18 @@ pub struct Driver {
     /// the pace car reports `2`; both mean "no flag".
     #[serde(rename = "FlairID", default)]
     pub flair_id: i32,
+}
+
+impl Driver {
+    /// A team-membership key suitable for grouping current entry rows.
+    ///
+    /// `TeamID: 0` is emitted for unrelated solo entries, so it deliberately
+    /// becomes unknown here. The session YAML exposes only the current driver
+    /// in each car, not an entry's complete driver roster.
+    #[must_use]
+    pub fn stable_team_id(&self) -> Option<i32> {
+        self.team_id.filter(|team_id| *team_id > 0)
+    }
 }
 
 /// Accepts a color as either a YAML string (e.g. `"0xFF3333"`) or a bare
@@ -413,12 +448,17 @@ DriverInfo:
   - CarIdx: 5
     UserName: Istvan Fodor
     UserID: 222
+    TeamID: 456
+    TeamName: Night Shift
 ";
         let info = SessionInfoYaml::parse(yaml).expect("valid session info must parse");
         assert_eq!(info.weekend_info.team_racing, 1);
         assert_eq!(info.driver_info.driver_user_id, Some(111));
         let car = &info.driver_info.drivers[0];
         assert_eq!(car.user_id, Some(222));
+        assert_eq!(car.team_id, Some(456));
+        assert_eq!(car.team_name, "Night Shift");
+        assert_eq!(car.stable_team_id(), Some(456));
 
         let solo = SessionInfoYaml::parse(
             "DriverInfo:
@@ -431,6 +471,7 @@ DriverInfo:
         assert_eq!(solo.weekend_info.team_racing, 0);
         assert_eq!(solo.driver_info.driver_user_id, None);
         assert_eq!(solo.driver_info.drivers[0].user_id, None);
+        assert_eq!(solo.driver_info.drivers[0].stable_team_id(), None);
     }
 
     #[test]
@@ -603,6 +644,7 @@ SessionInfo:
     - Position: 1
       CarIdx: 5
       LapsComplete: 3
+      Time: 12.3
       FastestTime: 91.5
       LastTime: 92.1
       PitStops: 1
@@ -614,8 +656,23 @@ SessionInfo:
         let row = &session0.results_positions[0];
         assert_eq!(row.car_idx, 5);
         assert_eq!(row.laps_complete, 3);
+        assert_eq!(row.time, Some(12.3));
         assert!((row.fastest_time - 91.5).abs() < f32::EPSILON);
-        assert_eq!(row.pit_stops, 1);
+        assert_eq!(row.pit_stops, Some(1));
+    }
+
+    #[test]
+    fn results_position_distinguishes_a_missing_stop_count_from_zero() {
+        let without = SessionInfoYaml::parse(
+            "DriverInfo:\n  DriverCarIdx: 0\nSessionInfo:\n  Sessions:\n  - SessionNum: 0\n    ResultsPositions:\n    - Position: 1\n      CarIdx: 0\n",
+        )
+        .expect("a classification may omit PitStops");
+        let with_zero = SessionInfoYaml::parse(
+            "DriverInfo:\n  DriverCarIdx: 0\nSessionInfo:\n  Sessions:\n  - SessionNum: 0\n    ResultsPositions:\n    - Position: 1\n      CarIdx: 0\n      PitStops: 0\n",
+        )
+        .expect("a zero count is still valid");
+        assert_eq!(without.session_info.sessions[0].results_positions[0].pit_stops, None);
+        assert_eq!(with_zero.session_info.sessions[0].results_positions[0].pit_stops, Some(0));
     }
 
     /// The tank is the published litres scaled by the session's fuel limit.

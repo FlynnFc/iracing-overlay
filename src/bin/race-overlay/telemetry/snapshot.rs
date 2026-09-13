@@ -103,6 +103,10 @@ pub struct CarSnapshot {
     pub recent_laps: [Option<f32>; 3],
     /// A black flag held against this car, if any — see [`Penalty`].
     pub penalty: Option<Penalty>,
+    /// The car has just left a confirmed pit stop and has not yet completed
+    /// the lap it rejoined on.  The Relative uses this for its `OUT` badge;
+    /// the opening formation/grid lap deliberately does not set it.
+    pub is_out_lap: bool,
 }
 
 /// A black flag against one car, from its `CarIdxSessionFlags` bits.
@@ -139,6 +143,10 @@ pub struct TyreCompound {
 /// One driver's row in the Standings widget, from the session's official
 /// `ResultsPositions` classification plus a few live telemetry values.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent row facts and projection sources, not alternative states"
+)]
 pub struct StandingsEntry {
     pub position: i32,
     /// Position within this car's own class — the number actually shown,
@@ -147,6 +155,8 @@ pub struct StandingsEntry {
     pub car_idx: i32,
     pub driver_name: Arc<str>,
     pub irating: i32,
+    pub team_driver_strength: Option<super::team_driver_pace::TeamDriverStrength>,
+    pub team_drivers: Arc<[super::team_driver_pace::KnownTeamDriver]>,
     /// The driver's profile flag, as iRacing's `FlairID`; `ui::flags` maps it
     /// to a country. Zero means no flag.
     pub flair_id: i32,
@@ -161,7 +171,19 @@ pub struct StandingsEntry {
     pub last_lap_secs: f32,
     /// Gap to the session leader, in seconds.
     pub gap_to_leader_secs: f32,
+    /// Global YAML ResultsPositions.Time deficit, validated by this car's
+    /// completed-lap advance and bounded in age. NET can use it provisionally
+    /// when a classified car lacks local live track progress. Raw F2 values
+    /// are not a freshness signal for unavailable cars.
+    pub scoring_gap_to_leader_secs: Option<f32>,
+    /// This row's NET used [`scoring_gap_to_leader_secs`] rather than live
+    /// progress on the latest projection.
+    pub net_gap_from_scoring: bool,
+    /// At least one car in this class has an inferred stint age used by NET.
+    pub net_uses_estimated_stint: bool,
     pub pit_stops: i32,
+    /// Observed or inferred age; unknown boundaries must not look like a fresh stop.
+    pub stint_age: super::stint_estimation::StintAge,
     /// Laps completed since this car last left the pits.
     pub current_stint_laps: i32,
     /// Seconds since this car last left the pits.
@@ -198,6 +220,9 @@ pub struct StandingsEntry {
     /// How many more stops this car needs to reach the end of the session —
     /// see `telemetry::endurance`. `None` before it has completed a stint.
     pub stops_remaining: Option<i32>,
+    /// Stop counts at both ends of the age interval. A single forecast exists
+    /// only when both ends agree.
+    pub stops_remaining_range: Option<(i32, i32)>,
     /// Where this car is projected to finish in its class once every
     /// remaining stop has been taken. `None` when the projection has no
     /// basis yet.
@@ -209,11 +234,8 @@ pub struct StandingsEntry {
     /// How many times this car has gone off the track so far — see
     /// `telemetry::session::OffTrackCounter`.
     pub off_tracks: i32,
-    /// How long this car has been mid-tow: gone from the world after being
-    /// seen in it. iRacing publishes a tow clock for the player alone, so
-    /// this is measured by the overlay from the moment the car vanished —
-    /// time gone, not time left. `None` when the car isn't towing; see
-    /// `telemetry::session::TowTracker`.
+    /// The player's direct iRacing tow value while it is positive. Rival tow
+    /// state is not published, so their rows always leave this empty.
     pub tow_secs: Option<f64>,
     /// The compound this car is running, where the sim says
     /// (`CarIdxTireCompound`, with the player's own `PlayerTireCompound`
@@ -540,9 +562,14 @@ pub struct EnduranceMeta {
     pub lap_driven_pct: Option<f32>,
     /// Stops the player still owes.
     pub stops_remaining: Option<i32>,
+    pub stops_remaining_range: Option<(i32, i32)>,
     /// The player's projected class position once the field has completed
     /// its remaining stops.
     pub projected_class_position: Option<i32>,
+    /// Whether the player's current NET uses the official scoring gap because
+    /// their local live track progress is unavailable.
+    pub net_gap_from_scoring: bool,
+    pub net_uses_estimated_stint: bool,
     /// Whether this session has been seen to need more than one stop.
     ///
     /// Latched: once true it stays true for the rest of the session. A
@@ -928,6 +955,10 @@ pub enum CourseFlag {
 pub struct SessionIdentity {
     /// `WeekendInfo.SubSessionID` — the room key.
     pub subsession: Option<u64>,
+    /// The concrete iRacing session number this snapshot belongs to. Kept
+    /// separate from `subsession`: practice, qualifying and race can share a
+    /// weekend while team-sync facts must never cross their boundary.
+    pub session_num: Option<i32>,
     /// The player's own iRacing customer id — their producer id on the wire.
     pub player_cust_id: Option<u32>,
     /// The player's display name, for "set by <name>" notes.

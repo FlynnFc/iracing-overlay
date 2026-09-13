@@ -4,11 +4,22 @@ NET estimates class order after the remaining pit stops. It ranks each car on:
 
 `live time deficit + remaining stops × total stop loss`
 
-The live deficit includes whole laps. It comes from current lap numbers and
-track fractions, using the focus class's measured lap curve when available.
-Other classes, or a class without a measured curve, use distance fraction and
-class best pace as an approximation. The displayed F2 gap is a separate input
-and is not used to price a newly completed stop.
+The preferred deficit comes from current lap numbers and track fractions,
+using the focus class's measured lap curve when available. Other classes, or a
+class without a measured curve, use distance fraction and class best pace as an
+approximation. If a classified car has no local live progress because it is not
+rendered, the whole class instead uses finite, non-negative YAML
+`ResultsPositions.Time` gaps,
+rebased from the class leader's same scorer reading. This keeps every contender
+on one reference point; a visible car behind an absent leader cannot become a
+false zero-gap leader. A gap is accepted only after that car's completed-lap
+count advances, and expires if it no longer advances. Repeated YAML revisions
+do not refresh an unchanged car row. Raw `CarIdxF2Time` can freeze while an
+unavailable car keeps racing, so it cannot supply this fallback. That official
+gap is already a
+total scored deficit, so NET never adds a lap-time estimate to it. A nonleader
+zero or an inconsistent scorer relation is unknown, not a zero gap. The
+separate displayed F2 input is never used to price a newly completed stop.
 
 Total stop loss includes lane transit and stationary service. Once measured,
 the lane model supplies transit. Service uses the car's median, or its class
@@ -21,14 +32,23 @@ inside the lane does not subtract one lap from every learned tank range.
 An inferred stop without an observed stationary duration resets its stint but
 does not inject a zero-second service sample.
 
-NET ranks cars currently in the world; an absent car's NET is unknown and it
-re-enters the projection when it returns. These ranks assume absent cars do not
-resume racing. NET is withheld for a class during an ongoing pit visit or when an active contender has
-no usable live progress. This avoids charging an unfinished stop twice or
-presenting a missing car as zero seconds behind. It resumes when the inputs are
-usable. Borrowed stint history may supply a remaining-stop forecast for NET and
-the **STOPS TO GO** footer. The per-car **Stops** column always shows completed
-stops observed in the session.
+NET keeps every classified car in its class projection. A complete set of live
+progress uses live gaps. Otherwise every contender uses the same scorer source,
+and a `~NET` label and row tooltip mark the entire class projection as provisional.
+Scorer updates can lag a newly completed stop, so this estimate may temporarily
+differ from a client with full live progress. Off-world cars never supply stale
+lap positions as live measurements.
+NET is still withheld for a class during an ongoing pit visit or when neither
+source can produce a consistent gap. Borrowed stint history may supply a
+remaining-stop forecast for NET and the **STOPS TO GO** footer. The per-car
+**Stops** column always shows completed stops observed in the session.
+
+An inferred stint age also marks the class projection as `~NET`. Remaining stops
+are evaluated at both ends of the age interval. If those forecasts differ for
+any contender, the class has no single NET position until the ambiguity is
+resolved; the footer can show a remaining-stop range. An unknown age never
+becomes an assumed zero-stop strategy. Estimated visits neither increment the
+observed Stops column nor enter measured stint-range or service-time history.
 
 ## Limits and validation
 

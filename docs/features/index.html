@@ -264,17 +264,16 @@
 
   <figure>
     <img src="img/standings-default.png" alt="The Standings panel">
-    <figcaption><b>Two cards and a gutter.</b> Your own class in full on the left, other classes' leaders on the
-      right, with the session badge and clock across the top. Rows tumble to their new slot when positions
+    <figcaption><b>Classification, timing and strategy.</b> A compact selection around your car, with optional
+      other-class leaders and the session clock across the top. Rows tumble to their new slot when positions
       change, so a change is seen to happen rather than the table silently being different.</figcaption>
   </figure>
 
   <div class="grid">
     <figure>
       <img src="img/standings-endurance.png" alt="Standings with endurance columns">
-      <figcaption><b>Endurance columns</b> — stint length, stops still owed, and the position each car is
-        projected to finish in once everyone has taken theirs. Being a stop up on a rival is worth more than
-        any plausible pace difference, and this is the column that says so. Auto by default: they appear when
+      <figcaption><b>Endurance columns</b> — stint length, completed stops, and each car's projected position
+        after accounting for the expected remaining stops through the finish. Auto by default: they appear when
         the race is long enough to need them.</figcaption>
     </figure>
     <figure>
@@ -285,6 +284,29 @@
     <figure>
       <img src="img/standings-oneclass.png" alt="Standings with other classes hidden">
       <figcaption><b>Other classes can be dropped</b> entirely, leaving one card.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/standings-full.png" alt="Expanded spectator standings with fixed headings and scrollable rows">
+      <figcaption><b>Full spectator standings.</b> Click FULL while watching to scroll every classified car
+        in the selected classes. Headings stay fixed and all columns scroll together. COMPACT returns to
+        the shorter view; Standings Content settings control the visible row count.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/standings-estimated.png" alt="Standings showing inferred and unknown stint ages">
+      <figcaption><b>Unseen stint confidence.</b> A solid age is observed; <code>~12</code> or
+        <code>~9–15</code> is inferred and its bar is hatched. <code>?</code> preserves an unknown boundary.
+        A stop range and <code>~NET</code> make the same uncertainty visible in the race summary.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/standings-team-strength.png" alt="Team driver strength chevrons beside iRating">
+      <figcaption><b>Team-driver strength.</b> Green and red chevrons rank the active driver among drivers
+        seen for that team. Hover the iRating for its iRating or clean-stint-pace basis and the provisional
+        known-driver list.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/standings-auto.png" alt="Standings GAP heading marked AUTO">
+      <figcaption><b>Alternating gap view.</b> Auto keeps GAP and INT on the same measured column, swapping
+        the reading on its chosen timer without moving the rest of the table.</figcaption>
     </figure>
   </div>
 </section>
@@ -323,9 +345,8 @@
 
   <figure>
     <img src="img/relative-box.png" alt="The BOX BOX status border">
-    <figcaption><b>BOX BOX.</b> The border sits flush on the widget's own edge and its left limb widens into a
-      filled band across the whole status gutter — the gutter's own markers draw on top of it, so the border
-      passes under them rather than detouring around them. The plate straddles the top edge.</figcaption>
+    <figcaption><b>BOX BOX.</b> The border wraps the card, leaving the status gutter outside it. The label
+      sits entirely above the border. A watched driver's name shares the SOF/weather line.</figcaption>
   </figure>
 
   <div class="grid">
@@ -385,23 +406,24 @@
 
 <section id="sync">
   <h2>Team sync<span class="tag tag-new">new</span></h2>
-  <p class="lede">In a team session every member's sim publishes the same world, but only the seated driver's
-    sim publishes the car. Team sync shares the measurements, so a spectating crew chief sees the fuel, tyres
-    and strategy of the car they are not sitting in — and a member who disconnects gets everything they missed.</p>
+  <p class="lede">Team sync shares the seated driver's private measurements so a spectating crew chief sees
+    fuel, tyres and strategy for that car. Public telemetry is collected locally and depends on each
+    client's rendered car limit. Rejoining clients recover shared history from the relay or a surviving replica.</p>
 
   <h3>How it works</h3>
   <ul>
-    <li><b>An event ledger, not state streaming.</b> A closed lap is ~32 bytes every couple of minutes; a live
-      scalars tick runs at 1 Hz and <i>only while somebody is listening</i>. A five-member team costs 1–2 KB/s
-      in total.</li>
+    <li><b>An event ledger.</b> The driver publishes completed laps and changed tyre readings. Current fuel
+      and pit settings run at up to 1 Hz while somebody is listening, with a two-second unchanged heartbeat.</li>
     <li><b>iRacing's own session clock stamps every event</b>, so members merge them deterministically whatever
       the network delays. Accuracy comes from the timestamp, not from sending fast.</li>
-    <li><b>Recovery is the ledger read back.</b> A member who joins late or reconnects asks for what they are
-      missing and replays it through the same handlers as live events — so a rebuilt overlay is identical to
-      one that never dropped.</li>
-    <li><b>Rooms are keyed by iRacing's SubSessionID</b>, so members find each other with no configuration, and
-      an invite code keeps strangers in the same subsession out.</li>
+    <li><b>Recovery transfers missing history.</b> Surviving clients can restore a restarted relay. Historical
+      pit commands rebuild history without issuing controls.</li>
+    <li><b>Rooms include SubSessionID and SessionNum</b>, separating practice, qualifying and race history.
+      An invite code limits access. Every member needs the same protocol version; this build uses version 8.</li>
   </ul>
+  <p>With only spectators connected, each overlay keeps collecting public telemetry locally and sends only
+    explicit crew decisions or requested recovery data. Private readings expire after five seconds without
+    the driver. Rival public stop/stint history is not replicated; all shared history is lost if every holder exits.</p>
 
   <h3>Hosting<span class="tag tag-new">new</span></h3>
   <p>One member ticks <b>Host the relay from this PC</b> in Settings → Team Sync. The relay runs inside the
@@ -412,7 +434,8 @@
     invite code. A host who leaves the invite field empty gets one generated and saved the moment hosting
     starts; while hosting, that overlay connects to its own relay automatically and the URL field is greyed
     out. Failures (a port already taken, an unreadable invite) are reported on the page rather than retried
-    silently.</p>
+    silently. Relay URL and invite fields support Copy/Paste buttons and Ctrl+A/C/V/X; correcting either
+    reconnects automatically.</p>
 
   <h3>What a crew chief sees</h3>
   <div class="grid">

@@ -40,15 +40,6 @@ const SIDE_PADDING: f32 = 16.0;
 const GUTTER_WIDTH: f32 = 40.0;
 const GUTTER_GAP: f32 = 8.0;
 
-/// The gutter's full run — its width plus the gap to the card — in unscaled
-/// pixels. The black box's status frame widens its left limb into a band
-/// across exactly this, so the gutter's markers sit *on* the border rather
-/// than the border detouring around them.
-#[must_use]
-pub fn gutter_span() -> f32 {
-    GUTTER_WIDTH + GUTTER_GAP
-}
-
 /// The configured card width, defended against a hand-edited file the same
 /// way `Metrics::new` defends the scale: a NaN width is a panel that
 /// silently fails to lay out, with no clue as to why.
@@ -226,11 +217,11 @@ pub fn draw(
     rail: super::blackbox::Rail,
     clicks: &mut Vec<super::blackbox::Click>,
     options: super::RowOptions,
-) {
+) -> Option<Rect> {
     let metrics = Metrics::new(config.scale);
     let Some(snapshot) = snapshot else {
         placeholder(ui, metrics, "waiting for iRacing\u{2026}");
-        return;
+        return None;
     };
 
     let visible = crate::telemetry::relative::window(
@@ -245,73 +236,79 @@ pub fn draw(
     // take a stand-in accent instead; see `ui::class_accent`.
     let class_count = snapshot.class_sections.len();
 
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        // The gutter is allocated first but painted last: its markers have
-        // to line up with rows whose positions aren't known until the card
-        // beside it has been laid out.
-        let (gutter_rect, _response) = ui.allocate_exact_size(metrics.vec2(GUTTER_WIDTH, 1.0), egui::Sense::hover());
-        ui.add_space(metrics.px(GUTTER_GAP));
+    let card_rect = ui
+        .horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            // The gutter is allocated first but painted last: its markers have
+            // to line up with rows whose positions aren't known until the card
+            // beside it has been laid out.
+            let (gutter_rect, _response) =
+                ui.allocate_exact_size(metrics.vec2(GUTTER_WIDTH, 1.0), egui::Sense::hover());
+            ui.add_space(metrics.px(GUTTER_GAP));
 
-        // The rail runs the card's full width, so the card's own padding is
-        // applied inside it, around the header, rows and footer, rather than
-        // by the frame.
-        let card = super::card_frame(metrics, CARD_BG, margin(metrics, 0.0, 0.0), super::table_card_rounding(metrics))
-            .show(ui, |ui| {
-                // `Frame::show` inherits the parent's layout direction, and the
-                // parent here is the horizontal strip holding the gutter — so
-                // without this the header, rows and footer would be laid out
-                // side by side instead of stacked.
-                ui.vertical(|ui| {
-                    ui.set_width(metrics.px(outer_width(config)));
-                    super::blackbox::draw_rail(ui, metrics, rail, clicks);
-                    egui::Frame::none()
-                        .inner_margin(margin(metrics, SIDE_PADDING, 14.0))
-                        .show(ui, |ui| {
-                            ui.set_width(metrics.px(card_width(config)));
-                            draw_header(ui, metrics, &snapshot.relative_meta, snapshot.weather, scroll);
-                            if rows.is_empty() {
-                                placeholder(ui, metrics, "waiting for nearby cars\u{2026}");
-                                return Vec::new();
-                            }
-                            let row_rects = rows
-                                .iter()
-                                .enumerate()
-                                .map(|(i, car)| {
-                                    let marked = car.cust_id.and_then(|id| options.danger.get(&id).copied());
-                                    draw_car_row(
-                                        ui,
-                                        metrics,
-                                        car,
-                                        RowContext {
-                                            odd: i % 2 == 1,
-                                            class_count,
-                                            first: i == 0,
-                                            show_flags: options.show_flags,
-                                            marked,
-                                            config,
-                                        },
-                                    )
+            // The rail runs the card's full width, so the card's own padding is
+            // applied inside it, around the header, rows and footer, rather than
+            // by the frame.
+            let card =
+                super::card_frame(metrics, CARD_BG, margin(metrics, 0.0, 0.0), super::table_card_rounding(metrics))
+                    .show(ui, |ui| {
+                        // `Frame::show` inherits the parent's layout direction, and the
+                        // parent here is the horizontal strip holding the gutter — so
+                        // without this the header, rows and footer would be laid out
+                        // side by side instead of stacked.
+                        ui.vertical(|ui| {
+                            ui.set_width(metrics.px(outer_width(config)));
+                            super::blackbox::draw_rail(ui, metrics, rail, clicks);
+                            egui::Frame::none()
+                                .inner_margin(margin(metrics, SIDE_PADDING, 14.0))
+                                .show(ui, |ui| {
+                                    ui.set_width(metrics.px(card_width(config)));
+                                    draw_header(ui, metrics, &snapshot.relative_meta, snapshot.weather, scroll);
+                                    if rows.is_empty() {
+                                        placeholder(ui, metrics, "waiting for nearby cars\u{2026}");
+                                        return Vec::new();
+                                    }
+                                    let row_rects = rows
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, car)| {
+                                            let marked = car.cust_id.and_then(|id| options.danger.get(&id).copied());
+                                            draw_car_row(
+                                                ui,
+                                                metrics,
+                                                car,
+                                                RowContext {
+                                                    odd: i % 2 == 1,
+                                                    class_count,
+                                                    first: i == 0,
+                                                    show_flags: options.show_flags,
+                                                    marked,
+                                                    config,
+                                                },
+                                            )
+                                        })
+                                        .collect();
+                                    draw_footer(ui, metrics, &snapshot.relative_meta, options.fuel_target);
+                                    row_rects
                                 })
-                                .collect();
-                            draw_footer(ui, metrics, &snapshot.relative_meta, options.fuel_target);
-                            row_rects
+                                .inner
                         })
                         .inner
-                })
-                .inner
-            });
+                    });
 
-        for (car, row_rect) in rows.iter().zip(card.inner) {
-            let slot = Rect::from_min_size(
-                egui::pos2(gutter_rect.left(), row_rect.top()),
-                metrics.vec2(GUTTER_WIDTH, ROW_HEIGHT),
-            );
-            let marked = car.cust_id.and_then(|id| options.danger.get(&id).copied());
-            draw_status_marker(ui, metrics, car, slot, options.show_off_tracks);
-            danger_context_menu(ui, metrics, car, row_rect, marked, clicks);
-        }
-    });
+            for (car, row_rect) in rows.iter().zip(card.inner) {
+                let slot = Rect::from_min_size(
+                    egui::pos2(gutter_rect.left(), row_rect.top()),
+                    metrics.vec2(GUTTER_WIDTH, ROW_HEIGHT),
+                );
+                let marked = car.cust_id.and_then(|id| options.danger.get(&id).copied());
+                draw_status_marker(ui, metrics, car, slot, options.show_off_tracks);
+                danger_context_menu(ui, metrics, car, row_rect, marked, clicks);
+            }
+            card.response.rect
+        })
+        .inner;
+    Some(card_rect)
 }
 
 /// Right-click a row to mark its driver dangerous, or clear the mark.
@@ -385,7 +382,7 @@ fn draw_header(ui: &mut Ui, metrics: Metrics, meta: &RelativeMeta, weather: Weat
         ui,
         egui::pos2(rect.left() + metrics.px(SOF_LABEL_WIDTH + 8.0), middle),
         egui::Align2::LEFT_CENTER,
-        RichText::new(sof_text).size(metrics.px(HEADER_VALUE_SIZE)).strong().color(text_primary()),
+        RichText::new(sof_text.clone()).size(metrics.px(HEADER_VALUE_SIZE)).strong().color(text_primary()),
     );
 
     let incidents_text = match meta.incident_limit {
@@ -401,9 +398,11 @@ fn draw_header(ui: &mut Ui, metrics: Metrics, meta: &RelativeMeta, weather: Weat
     );
     icons::cross(ui, cross, text_secondary());
 
-    draw_conditions(ui, metrics, egui::pos2(cross.left() - metrics.px(18.0), middle), weather);
-    // Context gets its own line only when needed. Long spectator names must
-    // never paint across the incident count or changing weather at narrow widths.
+    let conditions_left = draw_conditions(ui, metrics, egui::pos2(cross.left() - metrics.px(18.0), middle), weather);
+    // Driver/scroll context shares this header line. Its measured limits keep
+    // it clear of both SOF and the weather/incident cluster, so a long name
+    // is shortened rather than making the Relative taller or covering either
+    // of the values that change during a race.
     if meta.spectating.is_some() || meta.team_mate.is_some() || scroll != 0 {
         let mut notices = Vec::new();
         // Keep the offset first so it survives elision of an unusually long name.
@@ -416,13 +415,16 @@ fn draw_header(ui: &mut Ui, metrics: Metrics, meta: &RelativeMeta, weather: Weat
         if let Some(driver) = &meta.team_mate {
             notices.push(format!("Driving {driver}"));
         }
-        let (notice, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), metrics.px(18.0)), egui::Sense::hover());
         let colour = if scroll != 0 { theme::caution() } else { ACCENT };
-        let text = elide_to_width(ui, &notices.join("  \u{00B7}  "), notice.width(), |text| {
+        let sof_value = RichText::new(sof_text).size(metrics.px(HEADER_VALUE_SIZE)).strong();
+        let left = rect.left() + metrics.px(SOF_LABEL_WIDTH + 8.0) + text_width(ui, sof_value) + metrics.px(16.0);
+        let right = conditions_left - metrics.px(14.0);
+        let text = elide_to_width(ui, &notices.join("  \u{00B7}  "), (right - left).max(0.0), |text| {
             RichText::new(text).size(metrics.px(SUBTITLE_SIZE)).color(colour)
         });
-        paint_text(ui, notice.left_center(), egui::Align2::LEFT_CENTER, text);
+        if right > left {
+            paint_text(ui, egui::pos2(left, middle), egui::Align2::LEFT_CENTER, text);
+        }
     }
     ui.add_space(metrics.px(8.0));
     let (rule, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), metrics.px(1.0)), egui::Sense::hover());
@@ -506,7 +508,7 @@ fn draw_car_row(ui: &mut Ui, metrics: Metrics, car: &CarSnapshot, row: RowContex
 
     if config.ordered_columns() == crate::config::RelativeColumn::ALL {
         // The position, in the readout face, centred on its plate.
-        paint_text(
+        paint_numeric_text(
             ui,
             egui::pos2(rect.left() + plate_width / 2.0, middle),
             egui::Align2::CENTER_CENTER,
@@ -524,7 +526,7 @@ fn draw_car_row(ui: &mut Ui, metrics: Metrics, car: &CarSnapshot, row: RowContex
         // says and what the sim paints on the car ahead, so it is the thing that
         // ties a row to the car in the mirror.
         if config.show_car_number && !car.car_number.is_empty() {
-            paint_text(
+            paint_numeric_text(
                 ui,
                 egui::pos2(rect.left() + metrics.px(NUMBER_X), middle),
                 egui::Align2::LEFT_CENTER,
@@ -561,6 +563,10 @@ fn draw_car_row(ui: &mut Ui, metrics: Metrics, car: &CarSnapshot, row: RowContex
     rect
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one relative row needs its geometry, configuration and precomputed visual state together"
+)]
 fn draw_ordered_columns(
     ui: &mut Ui,
     metrics: Metrics,
@@ -597,7 +603,7 @@ fn draw_ordered_columns(
                     if car.is_focus { PLAYER_PLATE } else { POSITION_PLATE },
                 );
                 ui.painter().rect_filled(Rect::from_min_size(cell.min, metrics.vec2(2.0, ROW_HEIGHT)), 0.0, accent);
-                paint_text(
+                paint_numeric_text(
                     ui,
                     cell.center(),
                     egui::Align2::CENTER_CENTER,
@@ -605,7 +611,7 @@ fn draw_ordered_columns(
                 );
             }
             C::CarNumber => {
-                paint_text(
+                paint_numeric_text(
                     ui,
                     egui::pos2(x + metrics.px(4.0), middle),
                     egui::Align2::LEFT_CENTER,
@@ -640,7 +646,7 @@ fn draw_ordered_columns(
             C::LapTime => {
                 let text =
                     config.lap_metric.value(car.recent_laps).map_or_else(|| "?".to_owned(), format_short_lap_time);
-                paint_text(
+                paint_numeric_text(
                     ui,
                     cell.center(),
                     egui::Align2::CENTER_CENTER,
@@ -648,10 +654,10 @@ fn draw_ordered_columns(
                 );
             }
             C::Rating => {
-                draw_irating_badge(ui, metrics, car, egui::pos2(cell.right() - metrics.px(4.0), middle), in_pits)
+                draw_irating_badge(ui, metrics, car, egui::pos2(cell.right() - metrics.px(4.0), middle), in_pits);
             }
             C::Gap => {
-                paint_text(
+                paint_numeric_text(
                     ui,
                     egui::pos2(cell.right() - metrics.px(4.0), middle),
                     egui::Align2::RIGHT_CENTER,
@@ -659,11 +665,11 @@ fn draw_ordered_columns(
                 );
             }
         }
-        if c == C::Position {
-            if let Some(level) = marked {
-                let shifted = cell.translate(egui::vec2(cell.width() - metrics.px(BAR_X + 3.0), 0.0));
-                paint_danger_mark(ui, metrics, shifted, middle, level);
-            }
+        if c == C::Position
+            && let Some(level) = marked
+        {
+            let shifted = cell.translate(egui::vec2(cell.width() - metrics.px(BAR_X + 3.0), 0.0));
+            paint_danger_mark(ui, metrics, shifted, middle, level);
         }
         x += w;
     }
@@ -761,7 +767,7 @@ fn draw_row_trailing(ui: &mut Ui, metrics: Metrics, car: &CarSnapshot, rect: Rec
     // most rows are off your lap at some point, and a block of color behind
     // most of the panel stops meaning anything.
     let gap_right = right;
-    paint_text(
+    paint_numeric_text(
         ui,
         egui::pos2(gap_right, middle),
         egui::Align2::RIGHT_CENTER,
@@ -875,6 +881,17 @@ fn draw_status_marker(ui: &Ui, metrics: Metrics, car: &CarSnapshot, slot: Rect, 
             egui::Align2::CENTER_CENTER,
             RichText::new("PIT").monospace().size(metrics.px(12.0)).strong().color(Color32::BLACK),
         );
+    } else if car.is_out_lap {
+        // A fresh car is predictable but not yet at race pace. Keep OUT in
+        // the same single-status gutter as PIT so it is visible without
+        // stealing room from the driver's name or timing columns.
+        ui.painter().rect_filled(rect, rounding, theme::caution());
+        paint_text(
+            ui,
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            RichText::new("OUT").monospace().size(metrics.px(12.0)).strong().color(Color32::BLACK),
+        );
     } else {
         let count = if show_off_tracks { car.off_tracks } else { 0 };
         super::paint_off_track_marker(ui, metrics, rect, car.track_location == TrackLocation::OffTrack, count);
@@ -925,6 +942,26 @@ fn gap_text(car: &CarSnapshot) -> String {
     // too coarse to tell a pass from a stalemate. Past a second the extra
     // digit is noise, and it would widen the column for every row.
     if gap < HUNDREDTHS_BELOW_SECS { format!("{gap:.2}") } else { format!("{gap:.1}") }
+}
+
+/// The overlay panel can land on fractional logical coordinates (notably
+/// after a DPI change or a drag). Rasterising the condensed and monospace
+/// numeric runs at those changing fractions makes just the figures appear to
+/// shimmer while the vector icons remain still. Pin numeric ink to a physical
+/// pixel without changing the row geometry or the hit rectangles.
+fn snapped_numeric_pos(pos: Pos2, pixels_per_point: f32) -> Pos2 {
+    if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        egui::pos2(
+            (pos.x * pixels_per_point).round() / pixels_per_point,
+            (pos.y * pixels_per_point).round() / pixels_per_point,
+        )
+    } else {
+        pos
+    }
+}
+
+fn paint_numeric_text(ui: &Ui, pos: Pos2, anchor: egui::Align2, text: RichText) {
+    paint_text(ui, snapped_numeric_pos(pos, ui.ctx().pixels_per_point()), anchor, text);
 }
 
 /// Grey in the pits — which outranks everything else, since a stopped car's
@@ -1036,7 +1073,7 @@ const FUEL_TARGET_SLACK: f32 = 0.02;
 /// a permanent near-zero that trains the eye to skip the one place a real
 /// forecast would appear. Live rain has no such gate: once water is falling,
 /// any printable amount of it is the figure that matters.
-fn draw_conditions(ui: &Ui, metrics: Metrics, right: Pos2, weather: WeatherSnapshot) {
+fn draw_conditions(ui: &Ui, metrics: Metrics, right: Pos2, weather: WeatherSnapshot) -> f32 {
     let mut right = right;
     if weather.on_wet_tyres {
         right.x = draw_wet_tag(ui, metrics, right) - metrics.px(WET_TAG_GAP);
@@ -1054,7 +1091,7 @@ fn draw_conditions(ui: &Ui, metrics: Metrics, right: Pos2, weather: WeatherSnaps
 
     let live = super::weather::live_rain(&weather);
     let Some(rain) = live.or_else(|| weather.precip_chance.filter(|c| *c > PRECIP_WORTH_SHOWING)) else {
-        return;
+        return road.left();
     };
     let mut edge = road.left() - metrics.px(14.0);
     let precip = RichText::new(format!("{:.0}%", rain * 100.0)).size(metrics.px(FOOTER_SIZE)).strong().color(WIND);
@@ -1064,6 +1101,7 @@ fn draw_conditions(ui: &Ui, metrics: Metrics, right: Pos2, weather: WeatherSnaps
 
     let cloud = Rect::from_center_size(egui::pos2(edge - metrics.px(10.0), right.y), metrics.vec2(20.0, 16.0));
     icons::fog(ui, cloud, text_tertiary());
+    cloud.left()
 }
 
 /// The straight-edged block saying the player's own car is on wet tyres —
@@ -1146,6 +1184,7 @@ mod tests {
             is_fastest_overall: false,
             irating_change_estimate: None,
             is_focus,
+            is_out_lap: false,
             off_tracks: 0,
             lap_diff: 0,
             best_recent_lap_secs: None,
@@ -1175,6 +1214,66 @@ mod tests {
     #[test]
     fn the_player_row_reads_zero() {
         assert_eq!(gap_text(&car(0.0, true)), "0.00");
+    }
+
+    #[test]
+    fn numeric_ink_stays_on_one_physical_pixel_across_subpixel_panel_jitter() {
+        // 125% Windows scaling is where fractional logical panel positions
+        // are most common. Both positions are within the same device pixel.
+        let before = snapped_numeric_pos(egui::pos2(120.06, 64.11), 1.25);
+        let after = snapped_numeric_pos(egui::pos2(120.31, 64.35), 1.25);
+        assert_eq!(before, after);
+        assert_eq!(before, egui::pos2(120.0, 64.0));
+    }
+
+    #[test]
+    fn an_out_lap_gets_the_relative_out_badge_without_overriding_pit_status() {
+        let ctx = egui::Context::default();
+        let mut out_lap = car(0.0, false);
+        out_lap.is_out_lap = true;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                draw_status_marker(
+                    ui,
+                    Metrics::new(1.0),
+                    &out_lap,
+                    Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(32.0, 32.0)),
+                    false,
+                );
+            });
+        });
+        let labels: Vec<&str> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"OUT"));
+
+        out_lap.track_location = TrackLocation::InPitStall;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                draw_status_marker(
+                    ui,
+                    Metrics::new(1.0),
+                    &out_lap,
+                    Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(32.0, 32.0)),
+                    false,
+                );
+            });
+        });
+        let labels: Vec<&str> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"PIT"));
+        assert!(!labels.contains(&"OUT"));
     }
 
     /// A hand-edited width outside the slider's range — or not a number at

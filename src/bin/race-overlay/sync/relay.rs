@@ -39,6 +39,11 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// a fuel figure could care about.
 const PUMP_INTERVAL: Duration = Duration::from_millis(50);
 
+/// A full 24-hour ledger is delivered in bounded pieces. Even the largest
+/// event shape is far below a KiB, so this remains well under the protocol's
+/// eight-MiB socket ceiling while avoiding one giant allocation/write.
+const BACKLOG_CHUNK_EVENTS: usize = 10_000;
+
 /// Failed invites allowed per [`FAIL_WINDOW`] before joins are refused blind.
 ///
 /// An 8-character code from a 31-letter alphabet has ~40 bits of entropy;
@@ -138,7 +143,7 @@ impl std::fmt::Display for InviteCode {
     }
 }
 
-/// One room: a subsession's ledger and whoever is connected to it.
+/// One room: a concrete iRacing session phase's ledger and whoever is connected to it.
 #[derive(Debug, Default)]
 struct Room {
     ledger: Ledger,
@@ -210,7 +215,7 @@ impl Relay {
             .map_err(|err| anyhow::anyhow!("could not bind 127.0.0.1:{port} for team sync: {err}"))?;
         let local_addr = listener.local_addr()?;
         let invite = Arc::new(invite);
-        let rooms: Arc<Mutex<HashMap<u64, Room>>> = Arc::new(Mutex::new(HashMap::new()));
+        let rooms: Arc<Mutex<HashMap<(u64, i32), Room>>> = Arc::new(Mutex::new(HashMap::new()));
         let failures = Arc::new(Mutex::new(FailedJoins::default()));
         let next_conn_id = Arc::new(AtomicU64::new(1));
 
@@ -245,7 +250,7 @@ fn serve_connection(
     stream: TcpStream,
     conn_id: u64,
     invite: &InviteCode,
-    rooms: &Mutex<HashMap<u64, Room>>,
+    rooms: &Mutex<HashMap<(u64, i32), Room>>,
     failures: &Mutex<FailedJoins>,
 ) {
     // The timeout covers the WebSocket handshake and the Hello both; a
@@ -257,10 +262,12 @@ fn serve_connection(
     };
 
     let hello = match read_frame(&mut ws) {
-        Some(FromClient::Hello { subsession, invite, member, have }) => Some((subsession, invite, member, have)),
+        Some(FromClient::Hello { subsession, session_num, invite, member, have }) => {
+            Some((subsession, session_num, invite, member, have))
+        }
         _ => None,
     };
-    let Some((subsession, invite_presented, member, have)) = hello else {
+    let Some((subsession, session_num, invite_presented, member, have)) = hello else {
         return;
     };
 
@@ -292,36 +299,47 @@ fn serve_connection(
     // arriving during the hold lands in the outbox and follows the backlog.
     let (outbox_tx, outbox) = std::sync::mpsc::channel();
     let mut rooms_guard = rooms.lock().expect("no thread panics while holding the rooms");
-    let room = rooms_guard.entry(subsession).or_default();
+    let room_key = (subsession, session_num);
+    let room = rooms_guard.entry(room_key).or_default();
     room.clients.insert(conn_id, RoomSlot { member: member.clone(), outbox: outbox_tx.clone() });
     let welcome = FromRelay::Welcome { members: room.members(), have: room.ledger.tips() };
-    let backlog = FromRelay::Backlog(room.ledger.after(&have));
+    let backlog = room.ledger.after(&have);
     let _ = outbox_tx.send(welcome);
-    let _ = outbox_tx.send(backlog);
+    if backlog.is_empty() {
+        let _ = outbox_tx.send(FromRelay::Backlog(Vec::new()));
+    } else {
+        for chunk in backlog.chunks(BACKLOG_CHUNK_EVENTS) {
+            let _ = outbox_tx.send(FromRelay::Backlog(chunk.to_vec()));
+        }
+    }
+    // Empty history still needs an explicit completion marker; it is what
+    // releases a newly connected client's queued observations.
+    let _ = outbox_tx.send(FromRelay::CaughtUp);
     room.fanout(conn_id, &FromRelay::Roster(room.members()));
     drop(rooms_guard);
-    println!("note: team sync: {} joined subsession {subsession}", member.name);
+    println!("note: team sync: {} joined subsession {subsession} session {session_num}", member.name);
 
     let _ = ws.get_ref().set_read_timeout(Some(PUMP_INTERVAL));
-    pump(&mut ws, conn_id, subsession, rooms, &outbox);
+    pump(&mut ws, conn_id, room_key, member.cust_id, rooms, &outbox);
 
     let mut rooms = rooms.lock().expect("no thread panics while holding the rooms");
-    if let Some(room) = rooms.get_mut(&subsession) {
+    if let Some(room) = rooms.get_mut(&room_key) {
         room.clients.remove(&conn_id);
         room.fanout(conn_id, &FromRelay::Roster(room.members()));
         // The room itself — and its ledger — outlives its members on
         // purpose: an empty room is a team that all disconnected, and the
         // ledger is exactly what they need back.
     }
-    println!("note: team sync: {} left subsession {subsession}", member.name);
+    println!("note: team sync: {} left subsession {subsession} session {session_num}", member.name);
 }
 
 /// Shuttles frames both ways until the connection dies.
 fn pump(
     ws: &mut WebSocket<TcpStream>,
     conn_id: u64,
-    subsession: u64,
-    rooms: &Mutex<HashMap<u64, Room>>,
+    room_key: (u64, i32),
+    cust_id: u32,
+    rooms: &Mutex<HashMap<(u64, i32), Room>>,
     outbox: &Receiver<FromRelay>,
 ) {
     loop {
@@ -338,13 +356,28 @@ fn pump(
         }
         match ws.read() {
             Ok(Message::Binary(data)) => {
-                if let Ok(FromClient::Publish(envelope)) = decode::<FromClient>(&data) {
-                    let mut rooms = rooms.lock().expect("no thread panics while holding the rooms");
-                    if let Some(room) = rooms.get_mut(&subsession)
-                        && room.ledger.insert(envelope.clone())
-                    {
-                        room.fanout(conn_id, &FromRelay::Relayed(envelope));
-                    }
+                let Ok(frame) = decode::<FromClient>(&data) else { return };
+                let (envelope, is_publish) = match frame {
+                    FromClient::Publish(envelope) => (envelope, true),
+                    FromClient::Recover(envelope) => (envelope, false),
+                    // A second hello is a protocol violation; all other
+                    // non-publish messages are invalid after registration.
+                    FromClient::Hello { .. } => return,
+                };
+                // A normal publish is owned by its authenticated room member.
+                // Recovery is deliberately allowed to carry another member's
+                // old envelope, but only after this connection has joined the
+                // same invite/subsession room.
+                if is_publish && envelope.producer != cust_id {
+                    return;
+                }
+                let mut rooms = rooms.lock().expect("no thread panics while holding the rooms");
+                if let Some(room) = rooms.get_mut(&room_key)
+                    && room.ledger.accepts_relayed(&envelope)
+                    && room.ledger.insert(envelope.clone())
+                {
+                    let frame = fanout_frame(envelope, is_publish);
+                    room.fanout(conn_id, &frame);
                 }
             }
             // Pings are answered by tungstenite itself; the flush in the
@@ -360,6 +393,13 @@ fn pump(
             Err(_) => return,
         }
     }
+}
+
+/// Labels newly produced frames as live and replica repair frames as replay.
+/// Keeping this distinction at the relay boundary is what prevents a peer's
+/// recovery of an old `PitWrite` from reaching a driver's live command path.
+fn fanout_frame(envelope: super::protocol::Envelope, is_publish: bool) -> FromRelay {
+    if is_publish { FromRelay::Relayed(envelope) } else { FromRelay::Recovered(envelope) }
 }
 
 /// Reads and decodes one client frame, if one arrives in time.
@@ -419,5 +459,20 @@ mod tests {
         }
         assert!(failures.throttled(start), "the limit itself must throttle");
         assert!(!failures.throttled(start + FAIL_WINDOW), "old failures age out");
+    }
+
+    #[test]
+    fn recovered_events_are_never_labelled_live() {
+        let envelope = super::super::protocol::Envelope {
+            producer: 22,
+            seq: 1,
+            session_time: 10.0,
+            event: super::super::protocol::Event::PitWrite {
+                requester: "Spec".to_owned(),
+                request: crate::telemetry::pit::PitRequest::SetFuel(40),
+            },
+        };
+        assert!(matches!(fanout_frame(envelope.clone(), true), FromRelay::Relayed(_)));
+        assert!(matches!(fanout_frame(envelope, false), FromRelay::Recovered(_)));
     }
 }

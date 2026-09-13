@@ -23,12 +23,24 @@ use crate::config::SyncConfig;
 use crate::telemetry::pit::{Corner, PitRequest};
 use crate::telemetry::snapshot::{Seat, TelemetrySnapshot};
 
+/// A driver scalar normally arrives at most a second apart while any crew
+/// member is connected. Keep a short outage grace period, then withhold the
+/// live-only car gauges rather than presenting an old tank as current.
+const SYNCED_CAR_STALE_AFTER_SECS: f64 = 5.0;
+
+/// A one-off pit action is useful only while it is genuinely live. The app
+/// gives an accepted write a further short local queue lifetime; reject a
+/// frame already older than this on the shared session clock before it enters
+/// that queue at all.
+const LIVE_PIT_WRITE_MAX_AGE_SECS: f64 = 2.0;
+
 /// Inputs of a connection attempt, retained after refusal to avoid retrying it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConnectionIdentity {
     relay_url: String,
     invite: String,
     subsession: u64,
+    session_num: i32,
     cust_id: u32,
     name: String,
 }
@@ -42,9 +54,10 @@ pub struct TeamSync {
     /// Whether anyone else is in the room, from the last roster — the gate on
     /// the scalars tick (nothing to animate for an empty room).
     listeners: bool,
-    /// The subsession the current client is joined to, so a new session
-    /// (`SubSessionID` changes) tears the old connection down and starts fresh.
-    joined_subsession: Option<u64>,
+    /// The exact iRacing session phase the current client is joined to. A
+    /// new `SessionNum` in the same subsession is still a new room because
+    /// the phase clock restarts at zero.
+    joined_session: Option<(u64, i32)>,
     connection_identity: Option<ConnectionIdentity>,
     refused_identity: Option<ConnectionIdentity>,
     /// This member's display name, for stamping the writes it sends.
@@ -52,10 +65,22 @@ pub struct TeamSync {
     /// The latest `SessionTime` seen, stamped onto events this member sends
     /// outside the per-frame produce path (a spec's writes).
     last_session_time: f64,
+    /// Session clock of the newest live driver-scalar measurement. The store
+    /// retains older facts for history and restart recovery; this separate
+    /// marker controls whether its fuel/armed-service readout is safe to show
+    /// as *current*.
+    last_driver_scalar_session_time: Option<f64>,
+    /// Wall-clock arrival time of the newest scalar. A remote session clock
+    /// alone cannot prove liveness after a stalled socket, so both clocks
+    /// must remain fresh before the UI calls the values current.
+    last_driver_scalar_received_at: Option<Instant>,
     /// Crew-chief pit writes received live, waiting for the driver's overlay
     /// to apply them — see [`TeamSync::take_pit_writes`]. Only live frames add
     /// here; a backlog never re-arms a stale write.
     pending_writes: Vec<(String, PitRequest)>,
+    /// Whether this frame has a current driving snapshot. Replicated state is
+    /// useful to every seat, while one-off pit commands are only safe here.
+    accept_pit_writes: bool,
     /// Events this member published itself, waiting to be folded into its own
     /// store on the next frame — the relay never echoes a frame back to its
     /// sender, so without this a spec would set a fuel target or tyre policy
@@ -79,8 +104,23 @@ impl TeamSync {
             self.refused_identity = None;
             return;
         }
+        // A missing or non-driving snapshot is not merely an empty producer
+        // tick. It means we no longer have authority to act on the car. Do
+        // keep draining the replicated ledger below, but discard the local
+        // edge detectors and transient commands so an old `Driving` frame
+        // cannot publish a made-up lap or apply a pit change after telemetry
+        // has gone stale (or after a driver swap).
+        self.accept_pit_writes = snapshot.is_some_and(|snap| snap.seat == Seat::Driving);
+        if let Some(snap) = snapshot {
+            self.last_session_time = snap.session_time_secs;
+        }
+        if !self.accept_pit_writes {
+            self.source = EventSource::default();
+            self.was_on_pit_road = false;
+            self.pending_writes.clear();
+        }
         self.ensure_connected(config, snapshot);
-        self.drain_incoming();
+        self.drain_incoming(now);
         self.fold_own_writes();
         self.apply_tyre_policy(snapshot);
         self.publish_if_driving(snapshot, now);
@@ -91,6 +131,14 @@ impl TeamSync {
     /// [`super::store::TeamState::synced_car`].
     #[must_use]
     pub fn synced_car(&self) -> Option<super::store::SyncedCar> {
+        let measured_at = self.last_driver_scalar_session_time?;
+        let received_at = self.last_driver_scalar_received_at?;
+        if self.last_session_time >= measured_at && self.last_session_time - measured_at > SYNCED_CAR_STALE_AFTER_SECS {
+            return None;
+        }
+        if Instant::now().saturating_duration_since(received_at).as_secs_f64() > SYNCED_CAR_STALE_AFTER_SECS {
+            return None;
+        }
         self.state.synced_car()
     }
 
@@ -117,6 +165,11 @@ impl TeamSync {
         for (seq, (session_time, event)) in events.iter().enumerate() {
             let seq = u32::try_from(seq).unwrap_or(u32::MAX).saturating_add(1);
             self.state.apply(&Envelope { producer: 1, seq, session_time: *session_time, event: event.clone() });
+            if matches!(event, Event::DriverScalars { .. }) {
+                self.last_driver_scalar_session_time = Some(*session_time);
+                self.last_driver_scalar_received_at = Some(Instant::now());
+            }
+            self.last_session_time = self.last_session_time.max(*session_time);
         }
     }
 
@@ -211,7 +264,7 @@ impl TeamSync {
             // The store is kept: turning sync off and on within a session
             // should not forget the ledger already gathered.
             self.listeners = false;
-            self.joined_subsession = None;
+            self.joined_session = None;
             self.connection_identity = None;
             // Un-applied writes are dropped rather than carried across a
             // reconnect — a stale pit adjustment is not one to spring later.
@@ -232,15 +285,14 @@ impl TeamSync {
         &mut self,
         config: &SyncConfig,
         snapshot: Option<&TelemetrySnapshot>,
-        start: impl FnOnce(String, u64, String, Member) -> SyncClient,
+        start: impl FnOnce(String, u64, i32, String, Member) -> SyncClient,
     ) {
         let Some(identity) = snapshot.map(|snap| &snap.identity) else { return };
-        let (Some(subsession), Some(cust_id)) = (identity.subsession, identity.player_cust_id) else {
+        let (Some(subsession), Some(session_num), Some(cust_id)) =
+            (identity.subsession, identity.session_num, identity.player_cust_id)
+        else {
             return;
         };
-        if self.joined_subsession == Some(subsession) && self.client.is_some() {
-            return;
-        }
         if config.relay_url.trim().is_empty() {
             return;
         }
@@ -249,11 +301,21 @@ impl TeamSync {
             relay_url: config.relay_url.clone(),
             invite: config.invite.clone(),
             subsession,
+            session_num,
             cust_id,
             name: name.clone(),
         };
         if self.refused_identity.as_ref() == Some(&attempt) {
             return;
+        }
+        // A settings edit during the same race must replace the live socket:
+        // otherwise pasting a corrected relay URL or invite appears to work
+        // in the UI while the client stays connected to the old room.
+        if self.connection_identity.as_ref() == Some(&attempt) && self.client.is_some() {
+            return;
+        }
+        if self.client.is_some() {
+            self.disconnect();
         }
         self.refused_identity = None;
         let member = Member { cust_id, name: name.clone() };
@@ -264,6 +326,8 @@ impl TeamSync {
         // must not suppress this session's opening tick.
         self.state = TeamState::default();
         self.source = EventSource::default();
+        self.last_driver_scalar_session_time = None;
+        self.last_driver_scalar_received_at = None;
         self.pending_writes.clear();
         if let Ok(mut queue) = self.self_published.lock() {
             queue.clear();
@@ -271,13 +335,13 @@ impl TeamSync {
         self.was_on_pit_road = false;
         self.listeners = false;
         self.member_name = Some(name);
-        self.client = Some(start(config.relay_url.clone(), subsession, config.invite.clone(), member));
+        self.client = Some(start(config.relay_url.clone(), subsession, session_num, config.invite.clone(), member));
         self.connection_identity = Some(attempt);
-        self.joined_subsession = Some(subsession);
+        self.joined_session = Some((subsession, session_num));
     }
 
     /// Folds every waiting relay frame into the store and roster.
-    fn drain_incoming(&mut self) {
+    fn drain_incoming(&mut self, now: Instant) {
         let Some(client) = &self.client else { return };
         // `try_iter` takes only what is queued now; the connection thread
         // keeps filling it, and the next frame takes the rest.
@@ -286,21 +350,34 @@ impl TeamSync {
             match frame {
                 FromRelay::Backlog(envelopes) => {
                     for envelope in &envelopes {
+                        self.observe_driver_freshness(envelope, now);
                         self.state.apply(envelope);
                     }
+                }
+                FromRelay::Recovered(envelope) => {
+                    // Recovered data repairs state after a relay restart. It
+                    // is deliberately not a live relay frame: in particular
+                    // a historical PitWrite cannot reach pending_writes.
+                    self.observe_driver_freshness(&envelope, now);
+                    self.state.apply(&envelope);
                 }
                 FromRelay::Relayed(envelope) => {
                     // A live pit write is queued for the driver's overlay to
                     // apply — never from a backlog, so a stale write can't
                     // re-arm the box on reconnect.
-                    if let Event::PitWrite { requester, request } = &envelope.event {
+                    if self.is_actively_driving()
+                        && self.live_pit_write_is_fresh(&envelope)
+                        && let Event::PitWrite { requester, request } = &envelope.event
+                    {
                         self.pending_writes.push((requester.clone(), *request));
                     }
+                    self.observe_driver_freshness(&envelope, now);
                     self.state.apply(&envelope);
                 }
                 FromRelay::Welcome { members, .. } | FromRelay::Roster(members) => {
                     self.listeners = members.len() > 1;
                 }
+                FromRelay::CaughtUp => {}
                 FromRelay::Refused { .. } => {
                     self.refused_identity = self.connection_identity.clone();
                     self.disconnect();
@@ -310,20 +387,57 @@ impl TeamSync {
         }
     }
 
+    /// A pit write can only be acted on during a frame backed by a current
+    /// driving snapshot. The app deliberately calls `update(None)` when its
+    /// telemetry has aged out; that still consumes replicated state but makes
+    /// one-off controls expire rather than wait for a later reconnect.
+    fn is_actively_driving(&self) -> bool {
+        self.accept_pit_writes
+    }
+
+    /// Uses the session clock rather than receipt time, so a websocket frame
+    /// delayed in transit cannot become fresh merely by arriving now. A value
+    /// slightly ahead of this snapshot is allowed: teammates' snapshots do
+    /// not tick in lockstep, and phase isolation prevents an old phase from
+    /// appearing as a future event.
+    fn live_pit_write_is_fresh(&self, envelope: &Envelope) -> bool {
+        envelope.session_time >= self.last_session_time
+            || self.last_session_time - envelope.session_time <= LIVE_PIT_WRITE_MAX_AGE_SECS
+    }
+
+    /// Records only the driver's once-per-second heartbeat. A lap or tyre
+    /// reading can be old for a whole stint, so neither is evidence that the
+    /// tank is still live. `max` keeps a late/out-of-order backlog frame from
+    /// making a newer reading look stale.
+    fn observe_driver_freshness(&mut self, envelope: &Envelope, now: Instant) {
+        if matches!(envelope.event, Event::DriverScalars { .. }) {
+            let previous = self.last_driver_scalar_session_time.unwrap_or(f64::NEG_INFINITY);
+            if envelope.session_time >= previous {
+                self.last_driver_scalar_session_time = Some(envelope.session_time);
+                self.last_driver_scalar_received_at = Some(now);
+            }
+        }
+    }
+
     /// Produces and publishes the driver's events, if the player is driving.
     fn publish_if_driving(&mut self, snapshot: Option<&TelemetrySnapshot>, now: Instant) {
-        if let Some(snap) = snapshot {
-            // Tracked whatever the seat, so a spectator's writes are stamped
-            // with a live session clock too.
-            self.last_session_time = snap.session_time_secs;
+        let Some(snapshot) = snapshot.filter(|snap| snap.seat == Seat::Driving) else { return };
+
+        // iRacing can expose the seat before its private fuel scalar. Never
+        // turn that temporary absence into a believable zero-litre team
+        // update; reset the edge source so the first valid sample becomes a
+        // fresh baseline instead.
+        if !snapshot.pit_service.fuel_reading_valid {
+            self.source = EventSource::default();
+            return;
         }
         let Some(client) = &self.client else { return };
-        let Some(snapshot) = snapshot.filter(|snap| snap.seat == Seat::Driving) else { return };
 
         let service = &snapshot.pit_service;
         let observation = DriverObservation {
             session_time: snapshot.session_time_secs,
             lap: u16::try_from(snapshot.relative_meta.current_lap.max(0)).unwrap_or(u16::MAX),
+            car_idx: snapshot.relative.get(snapshot.focus_index).map(|car| car.car_idx),
             fuel_litres: service.fuel_level_litres,
             fuel_per_lap_litres: service.fuel_per_lap_litres,
             service_fuel_litres: service.fuel_armed.then(|| clamp_litres(service.fuel_amount_litres)),
@@ -382,13 +496,14 @@ mod tests {
         };
         let mut snapshot = crate::demo::snapshot();
         snapshot.identity.subsession = Some(123);
+        snapshot.identity.session_num = Some(0);
         snapshot.identity.player_cust_id = Some(456);
         let mut sync = TeamSync::default();
-        sync.ensure_connected_with(&config, Some(&snapshot), |_, _, _, _| fake_client());
+        sync.ensure_connected_with(&config, Some(&snapshot), |_, _, _, _, _| fake_client());
         let (tx, incoming) = mpsc::channel();
         sync.client.as_mut().expect("connected").incoming = incoming;
         tx.send(FromRelay::Refused { reason: "bad invite".to_owned() }).expect("queue refusal");
-        sync.drain_incoming();
+        sync.drain_incoming(Instant::now());
         assert!(sync.client.is_none());
         (sync, config, snapshot)
     }
@@ -397,7 +512,7 @@ mod tests {
     fn refused_credentials_do_not_restart_each_frame() {
         let (mut sync, config, snapshot) = refused_runtime();
         for _ in 0..10 {
-            sync.ensure_connected_with(&config, Some(&snapshot), |_, _, _, _| {
+            sync.ensure_connected_with(&config, Some(&snapshot), |_, _, _, _, _| {
                 panic!("refused credentials must not restart")
             });
         }
@@ -413,7 +528,7 @@ mod tests {
                 2 => snapshot.identity.subsession = Some(124),
                 _ => snapshot.identity.player_cust_id = Some(457),
             }
-            sync.ensure_connected_with(&config, Some(&snapshot), |_, _, _, _| fake_client());
+            sync.ensure_connected_with(&config, Some(&snapshot), |_, _, _, _, _| fake_client());
             assert!(sync.client.is_some(), "changed input {change} must allow retry");
         }
     }
@@ -423,7 +538,7 @@ mod tests {
         let (mut sync, config, snapshot) = refused_runtime();
         let disabled = SyncConfig { enabled: false, ..config.clone() };
         sync.update(&disabled, Some(&snapshot), Instant::now());
-        sync.ensure_connected_with(&config, Some(&snapshot), |_, _, _, _| fake_client());
+        sync.ensure_connected_with(&config, Some(&snapshot), |_, _, _, _, _| fake_client());
         assert!(sync.client.is_some());
     }
 
@@ -437,7 +552,7 @@ mod tests {
             ..TeamSync::default()
         };
         sync.set_fuel_target(Some(2.0));
-        assert_eq!(outgoing.recv().expect("published").session_time, 10.0);
+        assert!((outgoing.recv().expect("published").session_time - 10.0).abs() < f64::EPSILON);
         sync.last_session_time = 30.0;
         sync.fold_own_writes();
         sync.state.apply(&Envelope {
@@ -446,6 +561,185 @@ mod tests {
             session_time: 20.0,
             event: Event::FuelTarget { requester: "other".to_owned(), litres_per_lap: Some(3.0) },
         });
-        assert_eq!(sync.fuel_target(), Some(3.0));
+        assert!((sync.fuel_target().expect("other target") - 3.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_missing_snapshot_keeps_replication_but_expires_driver_authority() {
+        let (publish, published) = mpsc::channel();
+        let (incoming_tx, incoming) = mpsc::channel();
+        let mut sync = TeamSync {
+            client: Some(SyncClient::from_test_channels(incoming, publish)),
+            listeners: true,
+            ..TeamSync::default()
+        };
+        let config = SyncConfig { enabled: true, relay_url: "ws://relay".to_owned(), ..SyncConfig::default() };
+        let mut snap = crate::demo::snapshot();
+        snap.seat = Seat::Driving;
+        snap.relative_meta.current_lap = 5;
+        snap.identity.subsession = Some(1);
+        snap.identity.session_num = Some(0);
+        snap.identity.player_cust_id = Some(7);
+        sync.joined_session = Some((1, 0));
+        sync.connection_identity = Some(ConnectionIdentity {
+            relay_url: config.relay_url.clone(),
+            invite: config.invite.clone(),
+            subsession: 1,
+            session_num: 0,
+            cust_id: 7,
+            name: "driver".to_owned(),
+        });
+
+        // Establish the source's lap baseline, then let telemetry age out.
+        sync.update(&config, Some(&snap), Instant::now());
+        while published.try_recv().is_ok() {}
+        sync.update(&config, None, Instant::now());
+
+        // A live control arriving while telemetry is stale is consumed from
+        // the ledger but must not wait around to alter a later driver's box.
+        incoming_tx
+            .send(FromRelay::Relayed(Envelope {
+                producer: 22,
+                seq: 1,
+                session_time: 20.0,
+                event: Event::PitWrite { requester: "Spec".to_owned(), request: PitRequest::SetFuel(40) },
+            }))
+            .expect("queue live write");
+        sync.update(&config, None, Instant::now());
+        assert!(sync.take_pit_writes().is_empty(), "stale telemetry cannot defer a pit write");
+
+        // Returning with a later lap establishes a new baseline instead of
+        // treating all disconnected time as one made-up completed lap.
+        snap.relative_meta.current_lap = 7;
+        sync.update(&config, Some(&snap), Instant::now());
+        assert!(
+            published.try_iter().all(|outgoing| !matches!(outgoing.event, Event::LapClosed { .. })),
+            "no lap spans stale telemetry"
+        );
+    }
+
+    #[test]
+    fn synced_car_is_hidden_when_either_liveness_clock_is_old() {
+        let scalar = Event::DriverScalars {
+            car_idx: Some(7),
+            fuel_litres: 42.0,
+            service_fuel_litres: Some(20),
+            tyres_armed: [false; 4],
+            tyre_pressures_kpa: [165.0; 4],
+        };
+        let mut sync = TeamSync::default();
+        sync.state.apply(&Envelope { producer: 11, seq: 1, session_time: 100.0, event: scalar });
+        sync.last_driver_scalar_session_time = Some(100.0);
+        sync.last_driver_scalar_received_at = Some(Instant::now());
+        sync.last_session_time = 100.0;
+        assert!(sync.synced_car().is_some(), "a just-arrived scalar is live");
+
+        sync.last_session_time = 106.0;
+        assert!(sync.synced_car().is_none(), "a six-second session gap is stale");
+
+        sync.last_session_time = 100.0;
+        sync.last_driver_scalar_received_at = Instant::now().checked_sub(std::time::Duration::from_secs(6));
+        assert!(sync.synced_car().is_none(), "a six-second receive gap is stale");
+    }
+
+    #[test]
+    fn an_old_backlog_scalar_cannot_become_live_just_by_arriving_now() {
+        let (incoming_tx, incoming) = mpsc::channel();
+        let (publish, _published) = mpsc::channel();
+        let mut sync = TeamSync {
+            client: Some(SyncClient::from_test_channels(incoming, publish)),
+            last_session_time: 100.0,
+            ..TeamSync::default()
+        };
+        incoming_tx
+            .send(FromRelay::Backlog(vec![Envelope {
+                producer: 11,
+                seq: 1,
+                session_time: 90.0,
+                event: Event::DriverScalars {
+                    car_idx: Some(7),
+                    fuel_litres: 42.0,
+                    service_fuel_litres: None,
+                    tyres_armed: [false; 4],
+                    tyre_pressures_kpa: [165.0; 4],
+                },
+            }]))
+            .expect("queue old history");
+        sync.drain_incoming(Instant::now());
+        assert!(sync.synced_car().is_none(), "receipt time must not revive a ten-second-old scalar");
+    }
+
+    #[test]
+    fn recovered_pit_writes_rebuild_history_without_rearming_the_driver() {
+        let (incoming_tx, incoming) = mpsc::channel();
+        let (publish, _published) = mpsc::channel();
+        let mut sync = TeamSync {
+            client: Some(SyncClient::from_test_channels(incoming, publish)),
+            accept_pit_writes: true,
+            ..TeamSync::default()
+        };
+        incoming_tx
+            .send(FromRelay::Recovered(Envelope {
+                producer: 22,
+                seq: 1,
+                session_time: 10.0,
+                event: Event::PitWrite { requester: "Spec".to_owned(), request: PitRequest::SetFuel(40) },
+            }))
+            .expect("queue recovery");
+        sync.drain_incoming(Instant::now());
+        assert!(sync.take_pit_writes().is_empty(), "recovery is history, never a live pit action");
+    }
+
+    #[test]
+    fn a_network_delayed_live_pit_write_expires_on_the_session_clock() {
+        let (incoming_tx, incoming) = mpsc::channel();
+        let (publish, _published) = mpsc::channel();
+        let mut sync = TeamSync {
+            client: Some(SyncClient::from_test_channels(incoming, publish)),
+            accept_pit_writes: true,
+            last_session_time: 15.0,
+            ..TeamSync::default()
+        };
+        incoming_tx
+            .send(FromRelay::Relayed(Envelope {
+                producer: 22,
+                seq: 1,
+                session_time: 10.0,
+                event: Event::PitWrite { requester: "Spec".to_owned(), request: PitRequest::SetFuel(40) },
+            }))
+            .expect("queue delayed command");
+        sync.drain_incoming(Instant::now());
+        assert!(sync.take_pit_writes().is_empty(), "a five-second-old network frame must not arm the box");
+
+        incoming_tx
+            .send(FromRelay::Relayed(Envelope {
+                producer: 22,
+                seq: 2,
+                session_time: 14.0,
+                event: Event::PitWrite { requester: "Spec".to_owned(), request: PitRequest::SetFuel(40) },
+            }))
+            .expect("queue fresh command");
+        sync.drain_incoming(Instant::now());
+        assert_eq!(sync.take_pit_writes(), vec![("Spec".to_owned(), PitRequest::SetFuel(40))]);
+    }
+
+    #[test]
+    fn an_unavailable_private_fuel_reading_never_publishes_a_fake_zero() {
+        let (publish, published) = mpsc::channel();
+        let (_, incoming) = mpsc::channel();
+        let mut sync =
+            TeamSync { client: Some(SyncClient::from_test_channels(incoming, publish)), ..TeamSync::default() };
+        let mut snap = crate::demo::snapshot();
+        snap.seat = Seat::Driving;
+        snap.pit_service.fuel_level_litres = 0.0;
+        snap.pit_service.fuel_reading_valid = false;
+        sync.publish_if_driving(Some(&snap), Instant::now());
+        assert!(published.try_recv().is_err(), "missing fuel must be silent, not a zero-litre scalar");
+
+        snap.pit_service.fuel_reading_valid = true;
+        snap.pit_service.fuel_level_litres = 42.0;
+        sync.publish_if_driving(Some(&snap), Instant::now());
+        let emitted = published.recv().expect("the first valid reading publishes");
+        assert!(!matches!(emitted.event, Event::DriverScalars { fuel_litres, .. } if fuel_litres == 0.0));
     }
 }

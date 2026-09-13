@@ -71,19 +71,26 @@ impl SyncClient {
     /// Nothing is validated here; a bad URL simply fails every connection
     /// attempt, with a note each time the backoff resets.
     #[must_use]
-    pub fn start(url: String, subsession: u64, invite: String, member: Member) -> Self {
+    pub fn start(url: String, subsession: u64, session_num: i32, invite: String, member: Member) -> Self {
         let (incoming_tx, incoming) = std::sync::mpsc::channel();
         let (publish, publish_rx) = std::sync::mpsc::channel();
         let (shutdown_tx, shutdown) = std::sync::mpsc::channel();
-        std::thread::spawn(move || run(&url, subsession, &invite, &member, &incoming_tx, &publish_rx, &shutdown));
+        std::thread::spawn(move || {
+            run(&url, subsession, session_num, &invite, &member, &incoming_tx, &publish_rx, &shutdown);
+        });
         Self { incoming, publish, _shutdown: shutdown_tx }
     }
 }
 
 /// The connection loop: one iteration per (re)connection.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the thread entrypoint receives its explicit immutable connection inputs"
+)]
 fn run(
     url: &str,
     subsession: u64,
+    session_num: i32,
     invite: &str,
     member: &Member,
     incoming: &Sender<FromRelay>,
@@ -95,7 +102,7 @@ fn run(
     let mut replica = Ledger::default();
     let mut backoff = BACKOFF_START;
     loop {
-        match connect_once(url, subsession, invite, member, &mut replica, incoming, publish) {
+        match connect_once(url, subsession, session_num, invite, member, &mut replica, incoming, publish) {
             // A session ended cleanly: the app dropped its handles.
             ConnectionEnd::HandlesDropped => return,
             ConnectionEnd::Refused(reason) => {
@@ -129,9 +136,11 @@ enum ConnectionEnd {
 }
 
 /// Dials, joins and pumps one connection until it dies.
+#[expect(clippy::too_many_arguments, reason = "one connection attempt needs the explicit socket and replica inputs")]
 fn connect_once(
     url: &str,
     subsession: u64,
+    session_num: i32,
     invite: &str,
     member: &Member,
     replica: &mut Ledger,
@@ -154,8 +163,13 @@ fn connect_once(
         _ => {}
     }
 
-    let hello =
-        FromClient::Hello { subsession, invite: invite.to_owned(), member: member.clone(), have: replica.tips() };
+    let hello = FromClient::Hello {
+        subsession,
+        session_num,
+        invite: invite.to_owned(),
+        member: member.clone(),
+        have: replica.tips(),
+    };
     if let Err(err) = ws.send(Message::Binary(encode(&hello).into())) {
         return ConnectionEnd::NeverConnected(err.to_string());
     }
@@ -169,29 +183,41 @@ fn connect_once(
     // before assigning identities to queued events.
     let mut welcomed = false;
     let mut caught_up = false;
+    // Anything already in the channel when catch-up completes was created
+    // while this socket was absent. Measurements can safely be recovered;
+    // one-off pit commands cannot be delayed across a disconnect.
+    let mut discard_buffered_pit_writes = true;
 
     loop {
-        while caught_up {
-            match publish.try_recv() {
-                Ok(outgoing) => {
-                    let envelope = Envelope {
-                        producer: member.cust_id,
-                        seq: next_seq,
-                        session_time: outgoing.session_time,
-                        event: outgoing.event,
-                    };
-                    next_seq = next_seq.saturating_add(1);
-                    // Into the replica first: if the send fails, the event
-                    // survives there, and the re-offer pass after the next
-                    // `Welcome` delivers it — the relay cannot back-fill
-                    // what it never received.
-                    replica.insert(envelope.clone());
-                    if ws.send(Message::Binary(encode(&FromClient::Publish(envelope)).into())).is_err() {
-                        return ConnectionEnd::Dropped("publish failed".to_owned());
+        if caught_up {
+            loop {
+                match publish.try_recv() {
+                    Ok(outgoing) => {
+                        if discard_buffered_pit_writes && matches!(outgoing.event, Event::PitWrite { .. }) {
+                            continue;
+                        }
+                        let envelope = Envelope {
+                            producer: member.cust_id,
+                            seq: next_seq,
+                            session_time: outgoing.session_time,
+                            event: outgoing.event,
+                        };
+                        next_seq = next_seq.saturating_add(1);
+                        // Into the replica first: if the send fails, the event
+                        // survives there, and the re-offer pass after the next
+                        // `Welcome` delivers it — the relay cannot back-fill
+                        // what it never received.
+                        replica.insert(envelope.clone());
+                        if ws.send(Message::Binary(encode(&FromClient::Publish(envelope)).into())).is_err() {
+                            return ConnectionEnd::Dropped("publish failed".to_owned());
+                        }
                     }
+                    Err(TryRecvError::Empty) => {
+                        discard_buffered_pit_writes = false;
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => return ConnectionEnd::HandlesDropped,
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return ConnectionEnd::HandlesDropped,
             }
         }
         match ws.read() {
@@ -208,7 +234,7 @@ fn connect_once(
                 absorb(&frame, replica, &mut next_seq, member.cust_id);
                 match &frame {
                     FromRelay::Welcome { .. } => welcomed = true,
-                    FromRelay::Backlog(_) if welcomed => caught_up = true,
+                    FromRelay::CaughtUp if welcomed => caught_up = true,
                     _ => {}
                 }
                 // Anything of this member's own that the relay lacks — laps
@@ -218,9 +244,11 @@ fn connect_once(
                 // duplicates are dropped by every ledger anyway.
                 if let FromRelay::Welcome { have, .. } = &frame {
                     for envelope in replica.after(have) {
-                        if envelope.producer == member.cust_id
-                            && ws.send(Message::Binary(encode(&FromClient::Publish(envelope)).into())).is_err()
-                        {
+                        // The relay asked for this exact gap in its ledger.
+                        // Replaying any producer repairs a host restart from
+                        // the replicas held by spectators, while ordinary
+                        // publishing below remains restricted to our own id.
+                        if ws.send(Message::Binary(encode(&FromClient::Recover(envelope)).into())).is_err() {
                             return ConnectionEnd::Dropped("re-offer failed".to_owned());
                         }
                     }
@@ -258,10 +286,10 @@ fn absorb(frame: &FromRelay, replica: &mut Ledger, next_seq: &mut u32, cust_id: 
             }
             *next_seq = (*next_seq).max(replica.next_seq(cust_id));
         }
-        FromRelay::Relayed(envelope) => {
+        FromRelay::Relayed(envelope) | FromRelay::Recovered(envelope) => {
             replica.insert(envelope.clone());
         }
-        FromRelay::Roster(_) | FromRelay::Refused { .. } => {}
+        FromRelay::CaughtUp | FromRelay::Roster(_) | FromRelay::Refused { .. } => {}
     }
 }
 
@@ -281,6 +309,7 @@ mod tests {
             run(
                 "not a websocket URL",
                 1,
+                0,
                 "invite",
                 &Member { cust_id: 7, name: "Driver".to_owned() },
                 &incoming_tx,
@@ -317,9 +346,11 @@ mod tests {
             for event in history {
                 ledger.insert(event);
             }
-            for frame in
-                [FromRelay::Welcome { members: vec![], have: ledger.tips() }, FromRelay::Backlog(ledger.after(&[]))]
-            {
+            for frame in [
+                FromRelay::Welcome { members: vec![], have: ledger.tips() },
+                FromRelay::Backlog(ledger.after(&[])),
+                FromRelay::CaughtUp,
+            ] {
                 ws.send(Message::Binary(encode(&frame).into())).expect("send catch-up");
             }
             let Message::Binary(data) = ws.read().expect("queued publish") else { panic!("expected publish") };
@@ -338,6 +369,7 @@ mod tests {
         let _ = connect_once(
             &url,
             1,
+            0,
             "invite",
             &Member { cust_id: 7, name: "Driver".to_owned() },
             &mut replica,
@@ -351,5 +383,129 @@ mod tests {
         let mut expected = old_events;
         expected.push(published);
         assert_eq!(replica.after(&[]), expected, "catch-up must preserve both old and new events");
+    }
+
+    #[test]
+    fn a_spectator_replica_restores_driver_history_after_the_host_restarts() {
+        let driver_event = Envelope {
+            producer: 11,
+            seq: 1,
+            session_time: 90.0,
+            event: Event::LapClosed { lap: 1, fuel_litres: 57.4, used_litres: 2.6 },
+        };
+
+        // First host gives a spectator the driver's event, then disappears.
+        let first_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind first relay");
+        let first_url = format!("ws://{}", first_listener.local_addr().expect("first address"));
+        let first_event = driver_event.clone();
+        let first = std::thread::spawn(move || {
+            let (stream, _) = first_listener.accept().expect("accept spectator");
+            let mut ws = tungstenite::accept(stream).expect("handshake");
+            let _ = ws.read().expect("hello");
+            ws.send(Message::Binary(encode(&FromRelay::Welcome { members: vec![], have: vec![] }).into()))
+                .expect("welcome");
+            ws.send(Message::Binary(encode(&FromRelay::Backlog(vec![first_event])).into())).expect("backlog");
+            ws.close(None).expect("host restart");
+        });
+
+        let (incoming_tx, _incoming) = std::sync::mpsc::channel();
+        let (_publish, publish_rx) = std::sync::mpsc::channel();
+        let mut replica = Ledger::default();
+        let _ = connect_once(
+            &first_url,
+            77,
+            0,
+            "invite",
+            &Member { cust_id: 22, name: "Spec".to_owned() },
+            &mut replica,
+            &incoming_tx,
+            &publish_rx,
+        );
+        first.join().expect("first host stopped");
+        assert_eq!(replica.after(&[]), vec![driver_event.clone()]);
+
+        // Fresh host has no ledger. Welcome reports the gap, so the spectator
+        // sends a recovery frame with the driver's original identity.
+        let second_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind restarted relay");
+        let second_url = format!("ws://{}", second_listener.local_addr().expect("second address"));
+        let second = std::thread::spawn(move || {
+            let (stream, _) = second_listener.accept().expect("accept spectator");
+            let mut ws = tungstenite::accept(stream).expect("handshake");
+            let Message::Binary(hello) = ws.read().expect("hello") else { panic!("expected hello") };
+            let FromClient::Hello { have, .. } = decode(&hello).expect("decode hello") else {
+                panic!("expected hello")
+            };
+            assert_eq!(have, vec![super::super::protocol::ProducerSeq { producer: 11, seq: 1 }]);
+            ws.send(Message::Binary(encode(&FromRelay::Welcome { members: vec![], have: vec![] }).into()))
+                .expect("welcome from empty host");
+            let Message::Binary(recovery) = ws.read().expect("recovery") else { panic!("expected recovery") };
+            let FromClient::Recover(recovered) = decode(&recovery).expect("decode recovery") else {
+                panic!("a spectator must use recovery, not publish")
+            };
+            ws.send(Message::Binary(encode(&FromRelay::Backlog(vec![])).into())).expect("empty backlog");
+            ws.send(Message::Binary(encode(&FromRelay::CaughtUp).into())).expect("caught up");
+            ws.close(None).expect("close");
+            recovered
+        });
+        let _ = connect_once(
+            &second_url,
+            77,
+            0,
+            "invite",
+            &Member { cust_id: 22, name: "Spec".to_owned() },
+            &mut replica,
+            &incoming_tx,
+            &publish_rx,
+        );
+        assert_eq!(second.join().expect("second host stopped"), driver_event);
+    }
+
+    #[test]
+    fn a_pit_write_buffered_during_a_disconnect_is_dropped_not_delayed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind relay");
+        let url = format!("ws://{}", listener.local_addr().expect("relay address"));
+        let relay = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept client");
+            let mut ws = tungstenite::accept(stream).expect("handshake");
+            let _ = ws.read().expect("hello");
+            for frame in
+                [FromRelay::Welcome { members: vec![], have: vec![] }, FromRelay::Backlog(vec![]), FromRelay::CaughtUp]
+            {
+                ws.send(Message::Binary(encode(&frame).into())).expect("catch up");
+            }
+            let Message::Binary(data) = ws.read().expect("safe queued event") else { panic!("expected publish") };
+            let FromClient::Publish(envelope) = decode(&data).expect("decode publish") else {
+                panic!("expected ordinary publish")
+            };
+            ws.close(None).expect("close");
+            envelope
+        });
+        let (incoming_tx, _incoming) = std::sync::mpsc::channel();
+        let (publish, publish_rx) = std::sync::mpsc::channel();
+        publish
+            .send(Outgoing {
+                session_time: 10.0,
+                event: Event::PitWrite {
+                    requester: "Spec".to_owned(),
+                    request: crate::telemetry::pit::PitRequest::SetFuel(40),
+                },
+            })
+            .expect("queue unsafe command while offline");
+        let safe = Event::OffTrack { car_idx: 7, tally: 1 };
+        publish.send(Outgoing { session_time: 11.0, event: safe.clone() }).expect("queue durable observation");
+        let mut replica = Ledger::default();
+        let _ = connect_once(
+            &url,
+            1,
+            0,
+            "invite",
+            &Member { cust_id: 22, name: "Spec".to_owned() },
+            &mut replica,
+            &incoming_tx,
+            &publish_rx,
+        );
+        let delivered = relay.join().expect("relay finished");
+        assert_eq!(delivered.event, safe, "the stale pit write was discarded before it could be stamped or sent");
+        assert!(replica.after(&[]).iter().all(|envelope| !matches!(envelope.event, Event::PitWrite { .. })));
     }
 }

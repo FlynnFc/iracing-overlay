@@ -9,8 +9,8 @@
 //! Entry point: connects to iRacing on a background thread and shows the
 //! GT3 relative overlay window.
 //!
-//! Reads `race-overlay.toml` from the launcher's folder (falling back to
-//! the working directory, or built-in defaults if neither exists).
+//! Reads `%APPDATA%\race\race-overlay.toml`, migrating a legacy file beside
+//! the executable or in the working directory when needed.
 //!
 //! Windowing is handled by `egui_overlay`, which creates a transparent,
 //! always-on-top, undecorated, OpenGL-rendered window and lets us toggle
@@ -52,19 +52,7 @@ const DUMP_WAIT: Duration = Duration::from_secs(60);
 
 fn main() {
     attach_parent_console();
-    if std::env::args().any(|arg| arg == "--dump-session-info") {
-        dump_session_info();
-        return;
-    }
-    if std::env::args().any(|arg| arg == "--dump-all-vars") {
-        println!("waiting up to {DUMP_WAIT:?} for iRacing (be on track, in the car, for meaningful values)...");
-        if let Err(err) = telemetry::session::dump_all_vars(DUMP_WAIT) {
-            println!("error: {err:#}");
-        }
-        return;
-    }
-    if std::env::args().any(|arg| arg == "--dump-vars") {
-        dump_vars();
+    if run_early_diagnostic() {
         return;
     }
     if let Some(spec) = std::env::args().find_map(|arg| arg.strip_prefix("--sync-host=").map(str::to_owned)) {
@@ -85,6 +73,41 @@ fn main() {
         capture_bind(&action);
         return;
     }
+    start_overlay();
+}
+
+/// Runs the early, non-interactive diagnostics and reports whether one ran.
+fn run_early_diagnostic() -> bool {
+    if std::env::args().any(|arg| arg == "--check-config") {
+        check_config();
+        return true;
+    }
+    if let Some(path) =
+        std::env::args().find_map(|arg| arg.strip_prefix("--capture-scoring=").map(std::path::PathBuf::from))
+    {
+        capture_scoring(&path);
+        return true;
+    }
+    if std::env::args().any(|arg| arg == "--dump-session-info") {
+        dump_session_info();
+        return true;
+    }
+    if std::env::args().any(|arg| arg == "--dump-all-vars") {
+        println!("waiting up to {DUMP_WAIT:?} for iRacing (be on track, in the car, for meaningful values)...");
+        if let Err(err) = telemetry::session::dump_all_vars(DUMP_WAIT) {
+            println!("error: {err:#}");
+        }
+        return true;
+    }
+    if std::env::args().any(|arg| arg == "--dump-vars") {
+        dump_vars();
+        return true;
+    }
+    false
+}
+
+/// Starts the ordinary overlay after no command-line diagnostic was selected.
+fn start_overlay() {
     let demo = std::env::args().any(|arg| arg == "--demo");
     let demo_states = demo_states();
     // Reproducible settings previews, e.g. --demo --demo-settings=standings
@@ -178,6 +201,60 @@ fn main() {
         states: demo_states,
     };
     egui_overlay::start(OverlayApp::new(rx, request_tx, config, demo, tray, launched_from));
+}
+
+/// Diagnoses saved settings without opening the UI or exposing sync credentials.
+fn check_config() {
+    match OverlayConfig::load() {
+        Ok(config) => {
+            println!("Settings loaded: {}", config::config_path().display());
+            println!(
+                "Relative: width {}, scale {}, {} ahead / {} behind",
+                config.relative.width, config.relative.scale, config.relative.ahead_count, config.relative.behind_count
+            );
+            println!("Bound controls: {} / {}", config.binds.pairs().len(), input::Action::ALL.len());
+            println!("Danger marks: {}", config.danger.len());
+        }
+        Err(error) => {
+            eprintln!("Settings could not be loaded: {error:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Captures numeric scorer evidence without opening the overlay or writing to
+/// iRacing. `--capture-seconds` is intentionally bounded so this diagnostic
+/// cannot accidentally become an unbounded background recorder.
+fn capture_scoring(path: &std::path::Path) {
+    let seconds = match scoring_capture_seconds() {
+        Ok(seconds) => seconds,
+        Err(message) => {
+            println!("error: {message}");
+            return;
+        }
+    };
+    println!("capturing scorer telemetry for {seconds}s into {}...", path.display());
+    match telemetry::scoring_capture::capture(path, Duration::from_secs(seconds)) {
+        Ok(report) => println!(
+            "wrote {} numeric rows to {}; summary: {}",
+            report.rows,
+            report.data_path.display(),
+            report.summary_path.display()
+        ),
+        Err(error) => println!("error: {error:#}"),
+    }
+}
+
+fn scoring_capture_seconds() -> Result<u64, String> {
+    let value = std::env::args()
+        .find_map(|arg| arg.strip_prefix("--capture-seconds=").map(str::to_owned))
+        .unwrap_or_else(|| "300".to_owned());
+    let seconds =
+        value.parse::<u64>().map_err(|_error| "--capture-seconds must be a whole number from 1 to 3600".to_owned())?;
+    if !(1..=3600).contains(&seconds) {
+        return Err("--capture-seconds must be from 1 to 3600".to_owned());
+    }
+    Ok(seconds)
 }
 
 /// Queues the one snapshot a demo run renders, in whatever states were asked
@@ -391,7 +468,10 @@ fn sync_join(spec: &str) {
         return;
     };
     let member = sync::protocol::Member { cust_id, name: name.trim().to_owned() };
-    let client = sync::client::SyncClient::start(url.trim().to_owned(), subsession, invite.trim().to_owned(), member);
+    // The diagnostic room is phase zero; normal overlays take SessionNum
+    // from iRacing and never mix practice, qualifying and race histories.
+    let client =
+        sync::client::SyncClient::start(url.trim().to_owned(), subsession, 0, invite.trim().to_owned(), member);
 
     let burst = [
         sync::protocol::Event::StintBoundary { driver: name.trim().to_owned() },
@@ -399,6 +479,7 @@ fn sync_join(spec: &str) {
         sync::protocol::Event::PitStopObserved { car_idx: 7, stationary_secs: 31.5, took_tyres: true },
         sync::protocol::Event::OffTrack { car_idx: 7, tally: 1 },
         sync::protocol::Event::DriverScalars {
+            car_idx: Some(7),
             fuel_litres: 42.0,
             service_fuel_litres: Some(30),
             tyres_armed: [true, true, false, false],

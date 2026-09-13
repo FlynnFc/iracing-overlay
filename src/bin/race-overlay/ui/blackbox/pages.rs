@@ -76,11 +76,7 @@ pub fn request_for(action: Action, control: Control, kind: &RowKind, service: &P
                     RowKind::Fuel { litres, .. } => *litres,
                     _ => round_litres(service.fuel_amount_litres),
                 };
-                return Some(if service.fuel_armed {
-                    PitRequest::ClearFuel
-                } else {
-                    PitRequest::SetFuel(amount)
-                });
+                return Some(if service.fuel_armed { PitRequest::ClearFuel } else { PitRequest::SetFuel(amount) });
             }
             // The same wheel selection can toggle service in Auto mode, but
             // its amount belongs to the planner until Auto Fuel is turned off.
@@ -311,7 +307,12 @@ pub fn tires(snapshot: &TelemetrySnapshot, bars: crate::config::TyreBars) -> Pag
     });
     PageLayout {
         controls,
-        shape: Shape::Corners { compound: service.pending_tyre_compound, readouts: Box::new(readouts), bars, wear_threshold_pct: None },
+        shape: Shape::Corners {
+            compound: service.pending_tyre_compound,
+            readouts: Box::new(readouts),
+            bars,
+            wear_threshold_pct: None,
+        },
     }
 }
 
@@ -639,7 +640,10 @@ mod tests {
         for action in [Action::Increment, Action::Decrement] {
             assert_eq!(request_for(action, Control::Fuel, kind, &snapshot.pit_service), None);
         }
-        assert_eq!(request_for(Action::Toggle, Control::Fuel, kind, &snapshot.pit_service), Some(PitRequest::SetFuel(55)));
+        assert_eq!(
+            request_for(Action::Toggle, Control::Fuel, kind, &snapshot.pit_service),
+            Some(PitRequest::SetFuel(55))
+        );
         let Shape::Fuel { gauge, .. } = layout.shape else { panic!("fuel page") };
         assert!((gauge.adding_litres - 55.0).abs() < f32::EPSILON);
     }

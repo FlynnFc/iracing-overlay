@@ -8,18 +8,21 @@
 //! scale with it. An older file found beside the exe or in the working
 //! directory is migrated there once, on the next run.
 //!
-//! Two processes write this file — the overlay itself, and
-//! `race-overlay.exe --bind <action>` — and each loads its own copy at
-//! startup. Every write therefore goes through [`OverlayConfig::update`],
-//! which re-reads the file first, so neither can revert what the other saved
-//! in the meantime.
+//! The overlay and the bind command can both start from an older copy. Update
+//! re-reads before applying its one change, while the overlay applies a
+//! structural diff from its baseline to a fresh disk copy. Both paths preserve
+//! unrelated concurrent settings.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use race_tools::config::find_beside_exe_or_cwd;
 use serde::{Deserialize, Serialize};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
+use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
 use crate::input::{Action, Bind};
 use crate::tray::Panel;
@@ -33,15 +36,20 @@ const CONFIG_FILE_NAME: &str = "race-overlay.toml";
 /// the repo's name rather than this binary's.
 const CONFIG_DIR_NAME: &str = "race";
 
+/// Each writer creates a distinct sibling before atomically replacing the
+/// settings file. The sequence is only an extra guard after the process id;
+/// the write mutex below serializes normal writers too.
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// A save is retried by the overlay's normal debounce loop. Never wait long
+/// enough for a wedged second process to make the racing UI feel hung.
+const CONFIG_LOCK_WAIT_MS: u32 = 250;
+
 /// Configuration for `race-overlay`, persisted across runs.
 ///
-/// `Clone` so a save can take the whole live copy and write it over the file
-/// it re-read a moment earlier — see `app::save_config`.
+/// Clone lets the overlay retain a baseline and later persist only its
+/// structural changes; see [`Self::save_changes`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each is a user-facing on/off setting in the file; a state machine would misdescribe them"
-)]
 pub struct OverlayConfig {
     /// Settings for the Relative widget.
     #[serde(default)]
@@ -98,8 +106,32 @@ pub struct OverlayConfig {
     /// [`DangerLevel`]. Persisted so a mark made in one session warns of the
     /// same driver in every future one. Keyed by cust-id, not name or
     /// car-index, because that is the one identifier stable across sessions.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, deserialize_with = "deserialize_danger", skip_serializing_if = "BTreeMap::is_empty")]
     pub danger: BTreeMap<u32, DangerLevel>,
+}
+
+/// TOML table keys are strings, including a customer id written without
+/// quotes (`[danger]` then `1381357 = "caution"`). Deserializing through an
+/// intermediate `toml::Value` for legacy migrations used to leave that key
+/// conversion to the value deserializer, which rejects numeric map keys in
+/// some TOML versions and makes the *entire* settings file fail to load.
+///
+/// Decode the keys as the TOML strings they are, then validate and convert
+/// them explicitly. Serialization remains the ordinary `BTreeMap<u32, _>`
+/// form, so existing files and human-edited numeric keys stay compatible.
+fn deserialize_danger<'de, D>(deserializer: D) -> Result<BTreeMap<u32, DangerLevel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let entries = BTreeMap::<String, DangerLevel>::deserialize(deserializer)?;
+    entries
+        .into_iter()
+        .map(|(customer_id, level)| {
+            customer_id.parse::<u32>().map(|customer_id| (customer_id, level)).map_err(|error| {
+                serde::de::Error::custom(format!("danger customer id `{customer_id}` is not a u32: {error}"))
+            })
+        })
+        .collect()
 }
 
 /// How dangerous a marked driver is, escalating — see `plans/danger-drivers.md`.
@@ -337,7 +369,7 @@ fn default_fuel_margin_laps() -> f32 {
 /// The keyboard defaults mirror iRacing's own: `F3` through `F8` select the
 /// black box pages there, so the same keys reaching the same pages here means
 /// one less thing to relearn.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct BindsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_page: Option<Bind>,
@@ -878,6 +910,59 @@ impl StandingsColumn {
         }
     }
 }
+
+/// What the Standings timing column compares each car against.
+///
+/// The class leader is the conventional broadcast view. The interval view
+/// compares a car with the classified car immediately ahead in its class,
+/// which stays useful after both cars are a lap down.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StandingsGapMode {
+    #[default]
+    Leader,
+    NextClassified,
+    /// Alternates the visible comparison on a fixed timer.
+    Auto,
+}
+
+impl StandingsGapMode {
+    pub const ALL: [Self; 3] = [Self::Leader, Self::NextClassified, Self::Auto];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Leader => "Class leader",
+            Self::NextClassified => "Next classified car",
+            Self::Auto => "Alternate GAP / INT",
+        }
+    }
+
+    pub fn header_label(self) -> &'static str {
+        match self {
+            Self::Leader => "GAP",
+            Self::NextClassified => "INT",
+            Self::Auto => "AUTO",
+        }
+    }
+
+    #[must_use]
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Leader => Self::NextClassified,
+            Self::NextClassified => Self::Auto,
+            Self::Auto => Self::Leader,
+        }
+    }
+}
+
+/// Bounds for the alternating GAP/INT interval. The renderer applies this
+/// too, so a hand-edited TOML file cannot create a zero-length cycle.
+pub const STANDINGS_GAP_AUTO_SECONDS_RANGE: std::ops::RangeInclusive<u32> = 1..=120;
+
+fn default_standings_gap_auto_seconds() -> u32 {
+    5
+}
+
 fn default_standings_columns() -> Vec<StandingsColumn> {
     StandingsColumn::ALL.to_vec()
 }
@@ -920,6 +1005,15 @@ pub struct StandingsConfig {
     /// panel spends over the track. The player's own class is always shown.
     #[serde(default)]
     pub show_other_classes: bool,
+    /// While spectating, show every classified driver in the selected class
+    /// sections. The table keeps a compact height and scrolls below its
+    /// heading, so a large field does not cover the circuit.
+    #[serde(default)]
+    pub spectator_full: bool,
+    /// Number of standings rows visible before the spectator table scrolls.
+    /// The rendering code clamps hand-edited values to 8 through 30.
+    #[serde(default = "default_standings_full_rows")]
+    pub full_rows: usize,
     /// Print each car's current stint length, in laps, beside its stint bar.
     #[serde(default = "default_true")]
     pub show_stint_laps: bool,
@@ -945,6 +1039,14 @@ pub struct StandingsConfig {
     pub show_flags: bool,
     #[serde(default = "default_true")]
     pub show_off_tracks: bool,
+    /// Whether the timing column is the class-leader deficit or the interval
+    /// to the classified car immediately ahead. The heading can also switch
+    /// this while the overlay is interactive.
+    #[serde(default)]
+    pub gap_mode: StandingsGapMode,
+    /// Seconds an automatic timing-gap mode keeps GAP or INT before swapping.
+    #[serde(default = "default_standings_gap_auto_seconds")]
+    pub gap_auto_seconds: u32,
     #[serde(default = "default_standings_columns")]
     pub column_order: Vec<StandingsColumn>,
 }
@@ -960,15 +1062,31 @@ impl Default for StandingsConfig {
             endurance_mode: EnduranceMode::default(),
             tyre_change_secs: default_tyre_change_secs(),
             show_other_classes: false,
+            spectator_full: false,
+            full_rows: default_standings_full_rows(),
             show_stint_laps: true,
             show_tyres: true,
             show_position_change: true,
             name_width: default_standings_name_width(),
             show_flags: true,
             show_off_tracks: true,
+            gap_mode: StandingsGapMode::default(),
+            gap_auto_seconds: default_standings_gap_auto_seconds(),
             column_order: default_standings_columns(),
         }
     }
+}
+
+impl StandingsConfig {
+    /// The safe alternating period used by the renderer for persisted values.
+    #[must_use]
+    pub fn gap_auto_period_seconds(&self) -> u32 {
+        self.gap_auto_seconds.clamp(*STANDINGS_GAP_AUTO_SECONDS_RANGE.start(), *STANDINGS_GAP_AUTO_SECONDS_RANGE.end())
+    }
+}
+
+fn default_standings_full_rows() -> usize {
+    16
 }
 
 /// The width the Standings' design mockup gives its driver band — see
@@ -1214,6 +1332,83 @@ pub fn config_path() -> PathBuf {
     beside_exe.unwrap_or_else(|| PathBuf::from(CONFIG_FILE_NAME))
 }
 
+/// A machine-local, cross-process lock around the read-modify-write settings
+/// path. The overlay and `--bind` are separate processes; a Rust mutex would
+/// only protect threads in one of them. Windows abandons the mutex if a
+/// process crashes, which is safe here because each write uses an atomic
+/// replace and the next owner re-reads the surviving file.
+#[derive(Debug)]
+struct ConfigWriteLock(HANDLE);
+
+impl ConfigWriteLock {
+    fn acquire() -> anyhow::Result<Self> {
+        // SAFETY: the name is a static NUL-terminated Windows string; the
+        // returned handle is owned by this guard and closed in `Drop`.
+        let handle = unsafe { CreateMutexW(None, false, windows::core::w!("Local\\race-overlay-config-write")) }
+            .context("creating race-overlay settings write mutex")?;
+        // SAFETY: `handle` is a valid mutex handle made immediately above.
+        let result = unsafe { WaitForSingleObject(handle, CONFIG_LOCK_WAIT_MS) };
+        if result == WAIT_OBJECT_0 || result == WAIT_ABANDONED {
+            Ok(Self(handle))
+        } else {
+            // SAFETY: no ownership was acquired, but the handle is still ours.
+            unsafe { CloseHandle(handle) }.context("closing race-overlay settings write mutex")?;
+            anyhow::bail!("waiting for race-overlay settings write mutex returned {result:?}");
+        }
+    }
+}
+
+impl Drop for ConfigWriteLock {
+    fn drop(&mut self) {
+        // SAFETY: successful construction means this thread owns the mutex;
+        // the handle was created by this guard and has not otherwise escaped.
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// Serializes the schema through the same TOML shape the file uses. Keeping
+/// the merge at this layer makes absent optional values real deletions rather
+/// than indistinguishable defaults.
+fn config_toml_value(config: &OverlayConfig) -> anyhow::Result<toml::Value> {
+    let text = toml::to_string(config).context("serializing race-overlay settings for merge")?;
+    toml::from_str(&text).context("reading serialized race-overlay settings for merge")
+}
+
+/// Applies every structural change from `baseline` to `edited` onto `target`.
+/// Tables recurse so an overlay moving `relative.pos` cannot overwrite a bind
+/// or a sync change another process wrote meanwhile. Scalars, arrays, new
+/// fields and removed optional fields replace or remove exactly that key.
+fn apply_toml_changes(baseline: &toml::Value, edited: &toml::Value, target: &mut toml::Value) {
+    let (Some(baseline), Some(edited), Some(target)) = (baseline.as_table(), edited.as_table(), target.as_table_mut())
+    else {
+        *target = edited.clone();
+        return;
+    };
+
+    let mut keys: Vec<&str> = baseline.keys().chain(edited.keys()).map(String::as_str).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    for key in keys {
+        match (baseline.get(key), edited.get(key)) {
+            (Some(before), Some(after)) if before == after => {}
+            (Some(_), None) => {
+                target.remove(key);
+            }
+            (None, Some(after)) => {
+                target.insert(key.to_owned(), after.clone());
+            }
+            (Some(before), Some(after)) => {
+                let target_value = target.entry(key.to_owned()).or_insert_with(|| before.clone());
+                apply_toml_changes(before, after, target_value);
+            }
+            (None, None) => unreachable!("a union of keys cannot be absent from both tables"),
+        }
+    }
+}
+
 /// Suffix given to a settings file after it has been migrated out of the
 /// build folder, so an edit to the stale copy can't look like it did nothing.
 const MIGRATED_SUFFIX: &str = "moved";
@@ -1285,17 +1480,33 @@ impl OverlayConfig {
     /// the result can't be written. Nothing is written in the first case: a
     /// file that failed to parse is a file to look at, not to replace.
     pub fn update(change: impl FnOnce(&mut Self)) -> anyhow::Result<()> {
+        let _lock = ConfigWriteLock::acquire()?;
         let mut config = Self::load()?;
         change(&mut config);
-        config.save()
+        config.save_to_unlocked(&config_path())
     }
 
-    /// Writes this configuration to [`config_path`].
+    /// Saves only the changes made since `baseline`, preserving settings a
+    /// second overlay or `--bind` process wrote after this process started.
+    ///
+    /// This is deliberately a structural TOML diff rather than a hand-kept
+    /// field list. New settings therefore persist automatically, and an
+    /// explicit deletion (for example clearing a bind or danger mark) is
+    /// carried through too. The disk file is parsed before any write; a
+    /// malformed file is never replaced with defaults.
     ///
     /// # Errors
-    /// Returns an error if the folder can't be created or the file written.
-    pub fn save(&self) -> anyhow::Result<()> {
-        self.save_to(&config_path())
+    /// Returns an error if the current on-disk config cannot load or if the
+    /// merged result cannot be serialized and atomically written.
+    pub fn save_changes(&self, baseline: &Self) -> anyhow::Result<()> {
+        let _lock = ConfigWriteLock::acquire()?;
+        let disk = Self::load()?;
+        let baseline = config_toml_value(baseline)?;
+        let edited = config_toml_value(self)?;
+        let mut merged = config_toml_value(&disk)?;
+        apply_toml_changes(&baseline, &edited, &mut merged);
+        let merged: Self = merged.try_into().context("validating merged race-overlay.toml")?;
+        merged.save_to_unlocked(&config_path())
     }
 
     /// Writes this configuration to an explicit TOML file path.
@@ -1309,12 +1520,29 @@ impl OverlayConfig {
     /// Returns an error if the value can't be serialized, the parent folder
     /// can't be created, or either the write or the rename fails.
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
+        let _lock = ConfigWriteLock::acquire()?;
+        self.save_to_unlocked(path)
+    }
+
+    /// Writes while the caller owns [`ConfigWriteLock`]. Kept separate so
+    /// `update` and `save_changes` can hold one lock across their initial
+    /// read and final replace, rather than merely serializing the last half.
+    fn save_to_unlocked(&self, path: &Path) -> anyhow::Result<()> {
         let text = toml::to_string_pretty(self).context("serializing race-overlay.toml")?;
         if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        let temp = path.with_extension("toml.tmp");
-        std::fs::write(&temp, text).with_context(|| format!("writing {}", temp.display()))?;
+        let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or("tmp");
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp = path.with_extension(format!("{extension}.{}.{}.tmp", std::process::id(), sequence));
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)
+            .with_context(|| format!("creating {}", temp.display()))?;
+        file.write_all(text.as_bytes()).with_context(|| format!("writing {}", temp.display()))?;
+        file.sync_all().with_context(|| format!("flushing {}", temp.display()))?;
+        drop(file);
         std::fs::rename(&temp, path).with_context(|| format!("renaming {} into place", temp.display()))
     }
 }
@@ -1443,8 +1671,10 @@ mod tests {
     /// every still-supported panel instead of failing to load.
     #[test]
     fn configs_with_the_retired_pit_stall_section_still_load() {
-        let cfg: OverlayConfig = toml::from_str("[relative]\nwidth = 812.0\n[pit_stall]\npos = [10.0, 20.0]\nvisible = false\nrange_m = 25.0\n")
-            .expect("retired widget settings must be ignored");
+        let cfg: OverlayConfig = toml::from_str(
+            "[relative]\nwidth = 812.0\n[pit_stall]\npos = [10.0, 20.0]\nvisible = false\nrange_m = 25.0\n",
+        )
+        .expect("retired widget settings must be ignored");
         assert!((cfg.relative.width - 812.0).abs() < f32::EPSILON);
         assert!(cfg.standings.visible);
     }
@@ -1475,6 +1705,48 @@ mod tests {
         assert!((parsed.relative.pos[0] - 10.0).abs() < f32::EPSILON);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_baseline_diff_preserves_an_external_bind_but_applies_local_panel_changes() {
+        let baseline = OverlayConfig::default();
+        let mut edited = baseline.clone();
+        edited.relative.pos = [10.0, 20.0];
+
+        let mut disk = baseline.clone();
+        disk.binds.set(Action::NextPage, Bind::Key { vk: 0x72 });
+        disk.sync.enabled = true;
+
+        let before = config_toml_value(&baseline).expect("serialize baseline");
+        let after = config_toml_value(&edited).expect("serialize edits");
+        let mut merged = config_toml_value(&disk).expect("serialize disk");
+        apply_toml_changes(&before, &after, &mut merged);
+        let merged: OverlayConfig = merged.try_into().expect("merged config stays valid");
+
+        assert_eq!(merged.binds.next_page, Some(Bind::Key { vk: 0x72 }));
+        assert!(merged.sync.enabled);
+        assert!((merged.relative.pos[0] - 10.0).abs() < f32::EPSILON);
+        assert!((merged.relative.pos[1] - 20.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_baseline_diff_carries_an_explicit_bind_deletion() {
+        let mut baseline = OverlayConfig::default();
+        baseline.binds.set(Action::NextPage, Bind::Key { vk: 0x72 });
+        let mut edited = baseline.clone();
+        edited.binds.clear(Action::NextPage);
+
+        // A different process changed another field after this overlay loaded.
+        let mut disk = baseline.clone();
+        disk.sync.enabled = true;
+        let before = config_toml_value(&baseline).expect("serialize baseline");
+        let after = config_toml_value(&edited).expect("serialize edits");
+        let mut merged = config_toml_value(&disk).expect("serialize disk");
+        apply_toml_changes(&before, &after, &mut merged);
+        let merged: OverlayConfig = merged.try_into().expect("merged config stays valid");
+
+        assert_eq!(merged.binds.next_page, None, "clearing a bind is a persisted user change");
+        assert!(merged.sync.enabled, "an unrelated external change survives");
     }
 
     /// A half-written settings file is every setting in it gone, so the write
@@ -1582,6 +1854,34 @@ mod tests {
         assert_eq!(parsed.danger.get(&789_012), Some(&DangerLevel::Caution));
     }
 
+    /// `OverlayConfig::load_from` first parses into `toml::Value` so it can
+    /// migrate legacy switches. This is the exact path used at startup, and
+    /// numeric TOML table keys must not make it discard otherwise valid
+    /// binds, positions, and sync settings.
+    #[test]
+    fn a_numeric_danger_key_survives_the_startup_value_migration_path() {
+        let cfg = OverlayConfig::parse(
+            r#"
+[relative]
+pos = [321.0, 45.0]
+
+[binds.next_page]
+kind = "key"
+vk = 114
+
+[danger]
+1381357 = "caution"
+"9000001" = "severe"
+"#,
+        )
+        .expect("valid numeric danger keys must load through toml::Value");
+
+        assert_eq!(cfg.binds.next_page, Some(Bind::Key { vk: 114 }), "a danger mark cannot unbind controls");
+        assert_eq!(cfg.danger.get(&1_381_357), Some(&DangerLevel::Caution));
+        assert_eq!(cfg.danger.get(&9_000_001), Some(&DangerLevel::Severe));
+        assert!((cfg.relative.pos[0] - 321.0).abs() < f32::EPSILON);
+    }
+
     #[test]
     fn danger_levels_serialize_lowercase_and_escalate() {
         // The wire form is stable and human-editable; the order is the menu's.
@@ -1677,5 +1977,53 @@ mod tests {
         assert!((parsed.standings.pit_loss_secs - 42.0).abs() < f32::EPSILON);
         assert!((parsed.radar.range_ms - 750.0).abs() < f32::EPSILON);
         assert!((parsed.radar.pos[0] - 3.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn standings_gap_mode_defaults_to_class_leader_and_round_trips() {
+        let old: OverlayConfig = toml::from_str("[standings]\nvisible = true\n").expect("old config parses");
+        assert_eq!(old.standings.gap_mode, StandingsGapMode::Leader);
+        assert_eq!(old.standings.gap_auto_period_seconds(), 5);
+
+        let mut cfg = OverlayConfig::default();
+        cfg.standings.gap_mode = StandingsGapMode::Auto;
+        cfg.standings.gap_auto_seconds = 12;
+        let text = toml::to_string(&cfg).expect("serialize");
+        assert!(text.contains("gap_mode = \"auto\""));
+        assert!(text.contains("gap_auto_seconds = 12"));
+        let parsed: OverlayConfig = toml::from_str(&text).expect("round-trip");
+        assert_eq!(parsed.standings.gap_mode, StandingsGapMode::Auto);
+        assert_eq!(parsed.standings.gap_auto_period_seconds(), 12);
+    }
+
+    #[test]
+    fn standings_auto_gap_period_defaults_and_clamps_hand_edited_values() {
+        let default = StandingsConfig::default();
+        assert_eq!(default.gap_auto_period_seconds(), 5);
+
+        let too_short: OverlayConfig =
+            toml::from_str("[standings]\ngap_auto_seconds = 0\n").expect("config parses before its render clamp");
+        assert_eq!(too_short.standings.gap_auto_period_seconds(), 1);
+
+        let too_long: OverlayConfig =
+            toml::from_str("[standings]\ngap_auto_seconds = 999\n").expect("config parses before its render clamp");
+        assert_eq!(too_long.standings.gap_auto_period_seconds(), 120);
+    }
+
+    #[test]
+    fn spectator_standings_view_defaults_to_compact_and_round_trips() {
+        let old: OverlayConfig = toml::from_str("[standings]\nvisible = true\n").expect("old config parses");
+        assert!(!old.standings.spectator_full);
+        assert_eq!(old.standings.full_rows, 16);
+
+        let mut cfg = OverlayConfig::default();
+        cfg.standings.spectator_full = true;
+        cfg.standings.full_rows = 22;
+        let text = toml::to_string(&cfg).expect("serialize");
+        assert!(text.contains("spectator_full = true"));
+        assert!(text.contains("full_rows = 22"));
+        let parsed: OverlayConfig = toml::from_str(&text).expect("round-trip");
+        assert!(parsed.standings.spectator_full);
+        assert_eq!(parsed.standings.full_rows, 22);
     }
 }

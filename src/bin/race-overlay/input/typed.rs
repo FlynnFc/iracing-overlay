@@ -10,8 +10,9 @@
 //!
 //! Instead, while such a field has egui's focus, the keys a number needs are
 //! read off [`super::keys::is_key_down`] each frame and replayed to egui as
-//! synthetic events. Only the numeric set is watched: digits, minus, the
-//! decimal point, and editing keys. Letters are left alone deliberately —
+//! synthetic events. The numeric set and clipboard shortcuts are watched:
+//! digits, minus, decimal point, editing keys, and Ctrl+A/C/V/X. Ordinary
+//! letters are left alone deliberately —
 //! this is a number pad for sliders, not a keyboard hook, and the smaller
 //! the set the smaller the surprise when some other window has the driver's
 //! actual attention.
@@ -81,6 +82,7 @@ const WATCHED: &[Watched] = &[
 pub struct TypedKeys {
     /// Which watched keys were down last frame, by index into [`WATCHED`].
     down: Vec<bool>,
+    shortcut_down: [bool; 4],
 }
 
 impl TypedKeys {
@@ -89,31 +91,60 @@ impl TypedKeys {
     /// Inactive frames still clear the held state, so a key held across the
     /// moment a field gains focus is not replayed as a fresh press, and one
     /// held across losing it cannot ghost a release into the next field.
-    pub fn poll(&mut self, active: bool, events: &mut Vec<egui::Event>) {
+    /// Returns true only on a Paste shortcut edge. The window backend reads
+    /// the clipboard on that explicit request, not on ordinary frames.
+    pub fn poll(&mut self, active: bool, events: &mut Vec<egui::Event>) -> bool {
+        self.poll_keys(active, events, is_key_down)
+    }
+
+    fn poll_keys(&mut self, active: bool, events: &mut Vec<egui::Event>, key_down: impl Fn(u16) -> bool) -> bool {
         if !active {
             self.down.clear();
-            return;
+            self.shortcut_down = [false; 4];
+            return false;
+        }
+        let ctrl = key_down(0x11);
+        let modifiers =
+            egui::Modifiers { ctrl, command: ctrl, shift: key_down(0x10), alt: key_down(0x12), ..Default::default() };
+        let mut paste = false;
+        for (index, vk) in [0x41, 0x43, 0x56, 0x58].into_iter().enumerate() {
+            let down = key_down(vk);
+            if ctrl && down && !self.shortcut_down[index] {
+                match vk {
+                    0x41 => events.push(egui::Event::Key {
+                        key: egui::Key::A,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    }),
+                    0x43 => events.push(egui::Event::Copy),
+                    0x56 => paste = true,
+                    0x58 => events.push(egui::Event::Cut),
+                    _ => unreachable!(),
+                }
+            }
+            self.shortcut_down[index] = down;
         }
         self.down.resize(WATCHED.len(), false);
         for (watched, was_down) in WATCHED.iter().zip(&mut self.down) {
-            let is_down = is_key_down(watched.vk);
+            let is_down = key_down(watched.vk);
             if is_down == *was_down {
                 continue;
             }
             *was_down = is_down;
             if let Some(key) = watched.key {
-                events.push(egui::Event::Key {
-                    key,
-                    physical_key: None,
-                    pressed: is_down,
-                    repeat: false,
-                    modifiers: egui::Modifiers::default(),
-                });
+                events.push(egui::Event::Key { key, physical_key: None, pressed: is_down, repeat: false, modifiers });
             }
-            if is_down && let Some(text) = watched.text {
+            if is_down
+                && !modifiers.ctrl
+                && !modifiers.alt
+                && let Some(text) = watched.text
+            {
                 events.push(egui::Event::Text(text.to_owned()));
             }
         }
+        paste
     }
 }
 
@@ -126,7 +157,7 @@ mod tests {
     /// and, worse, a release edge would be sent into a fresh session.
     #[test]
     fn deactivating_forgets_held_keys() {
-        let mut typed = TypedKeys { down: vec![true; WATCHED.len()] };
+        let mut typed = TypedKeys { down: vec![true; WATCHED.len()], ..Default::default() };
         let mut events = Vec::new();
         typed.poll(false, &mut events);
         assert!(events.is_empty());
@@ -148,5 +179,38 @@ mod tests {
             assert!(WATCHED.iter().any(|watched| watched.vk == 0x30 + offset), "top-row digit {offset}");
             assert!(WATCHED.iter().any(|watched| watched.vk == 0x60 + offset), "numpad digit {offset}");
         }
+    }
+
+    #[test]
+    fn clipboard_shortcuts_are_edge_triggered_and_require_a_focused_field() {
+        let mut typed = TypedKeys::default();
+        let mut events = Vec::new();
+        assert!(!typed.poll_keys(false, &mut events, |vk| [0x11, 0x56].contains(&vk)));
+        assert!(typed.poll_keys(true, &mut events, |vk| [0x11, 0x56].contains(&vk)));
+        assert!(
+            !typed.poll_keys(true, &mut events, |vk| [0x11, 0x56].contains(&vk)),
+            "holding Ctrl+V must not repeat paste"
+        );
+        assert!(events.is_empty());
+        typed.poll_keys(true, &mut events, |_| false);
+        typed.poll_keys(true, &mut events, |vk| [0x11, 0x43].contains(&vk));
+        assert!(matches!(events.last(), Some(egui::Event::Copy)));
+        typed.poll_keys(true, &mut events, |vk| [0x11, 0x58].contains(&vk));
+        assert!(matches!(events.last(), Some(egui::Event::Cut)));
+    }
+
+    #[test]
+    fn select_all_and_shift_selection_preserve_modifiers_without_typing_control_digits() {
+        let mut typed = TypedKeys::default();
+        let mut events = Vec::new();
+        typed.poll_keys(true, &mut events, |vk| [0x11, 0x41, 0x31].contains(&vk));
+        assert!(
+            matches!(events.as_slice(), [egui::Event::Key { key: egui::Key::A, modifiers, .. }] if modifiers.command)
+        );
+        events.clear();
+        typed.poll_keys(true, &mut events, |vk| [0x10, 0x25].contains(&vk));
+        assert!(
+            matches!(events.as_slice(), [egui::Event::Key { key: egui::Key::ArrowLeft, modifiers, .. }] if modifiers.shift)
+        );
     }
 }

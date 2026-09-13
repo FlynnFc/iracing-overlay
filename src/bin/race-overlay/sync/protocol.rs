@@ -23,8 +23,12 @@ use serde::{Deserialize, Serialize};
 /// armed tyre pressures to [`Event::DriverScalars`] and the latched-tyre
 /// readings event ([`Event::TyreReadings`]); v4 added the shared fuel target
 /// ([`Event::FuelTarget`]); v5 the standing tyre directive
-/// ([`Event::TyrePolicySet`]).
-pub const PROTOCOL_VERSION: u8 = 5;
+/// ([`Event::TyrePolicySet`]); v6 lets a client restore a newly restarted
+/// relay from its retained replica without impersonating the original
+/// producer; v7 split rooms by iRacing session phase and added the car
+/// identity to driver-only scalars; v8 made recovery replay-safe and added a
+/// catch-up completion marker for chunked full-race backlogs.
+pub const PROTOCOL_VERSION: u8 = 8;
 
 /// One member's produced events, identified and ordered.
 ///
@@ -70,6 +74,10 @@ pub enum Event {
     /// every screen shows what iRacing actually armed, not what anyone asked
     /// for.
     DriverScalars {
+        /// The team car this private measurement belongs to. A spectator may
+        /// be camera-focused on another car, so consumers must match it
+        /// before showing the shared tank or pit-service state.
+        car_idx: Option<i32>,
         fuel_litres: f32,
         /// Litres armed to add at the next stop; `None` when fuelling is
         /// unticked.
@@ -170,6 +178,10 @@ pub enum FromClient {
         /// iRacing `SubSessionID` — the room key. Members of the same
         /// subsession end up in the same room with zero configuration.
         subsession: u64,
+        /// iRacing `SessionNum` within the subsession. Practice, qualifying,
+        /// and race can share a subsession while their clocks restart, so this
+        /// is part of the room key rather than merely display metadata.
+        session_num: i32,
         /// The invite code the host handed out, verified in constant time.
         invite: String,
         member: Member,
@@ -178,6 +190,13 @@ pub enum FromClient {
         have: Vec<ProducerSeq>,
     },
     Publish(Envelope),
+    /// Re-offers a retained event that the relay explicitly reported missing
+    /// in its `Welcome`. This is recovery only: unlike [`Self::Publish`], the
+    /// envelope can have been originally produced by another team member.
+    /// It lets a spectator repair a host relay after it restarts while the
+    /// driver is offline, without ever sampling or producing driver-only
+    /// telemetry itself.
+    Recover(Envelope),
 }
 
 /// Everything the relay ever sends.
@@ -192,12 +211,20 @@ pub enum FromRelay {
         /// can't fork the numbering.
         have: Vec<ProducerSeq>,
     },
-    /// Everything the `Hello`'s `have` list said was missing, oldest first.
-    /// Sent once, straight after `Welcome`; replayed through the same
-    /// handlers as live events.
+    /// A chunk of what the `Hello`'s `have` list said was missing, oldest
+    /// first. Large 24-hour histories arrive in several bounded chunks and
+    /// are replayed through the same state handlers as initial history.
     Backlog(Vec<Envelope>),
+    /// All initial [`Self::Backlog`] chunks have arrived. A client must not
+    /// assign new sequence numbers until this marker, because a later chunk
+    /// could extend its own producer history.
+    CaughtUp,
     /// One live event from another member.
     Relayed(Envelope),
+    /// An event restored from a peer's retained replica after the relay lost
+    /// its room ledger. It is historical even though it arrived now: state
+    /// may fold it, but a transient pit write must never be acted on.
+    Recovered(Envelope),
     /// Someone joined or left; sent to the whole room.
     Roster(Vec<Member>),
     /// The `Hello` was rejected; the connection closes after this.
@@ -206,11 +233,10 @@ pub enum FromRelay {
 
 /// The largest message either side will accept, in bytes.
 ///
-/// The one big legitimate message is a full-session backlog — a few hundred
-/// kilobytes for a 24-hour race at the ledger's rates — so four megabytes is
-/// generous headroom while still refusing the 64 MB tungstenite would
-/// otherwise buffer for a single hostile frame from inside the room.
-const MAX_MESSAGE_BYTES: usize = 4 << 20;
+/// Long race histories transfer in bounded chunks. Eight megabytes provides
+/// headroom per chunk while refusing the 64 MB tungstenite would otherwise
+/// buffer for a single frame from inside the room.
+pub const MAX_MESSAGE_BYTES: usize = 8 << 20;
 
 /// The socket limits both the relay and the client run with.
 #[must_use]
@@ -267,7 +293,9 @@ mod tests {
                 have: vec![ProducerSeq { producer: 1, seq: 9 }],
             },
             FromRelay::Backlog(vec![envelope.clone()]),
-            FromRelay::Relayed(envelope),
+            FromRelay::CaughtUp,
+            FromRelay::Relayed(envelope.clone()),
+            FromRelay::Recovered(envelope),
             FromRelay::Refused { reason: "bad invite".to_owned() },
         ];
         for message in messages {
@@ -313,6 +341,7 @@ mod tests {
             seq: 10,
             session_time: 901.0,
             event: Event::DriverScalars {
+                car_idx: Some(7),
                 fuel_litres: 33.3,
                 service_fuel_litres: Some(28),
                 tyres_armed: [true, false, true, false],

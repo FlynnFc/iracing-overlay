@@ -21,7 +21,8 @@ use egui::{Color32, Context, RichText, Slider, Stroke, Ui};
 use super::{CAUTION, launcher_page, logos};
 use crate::config::{
     BlackBoxConfig, EnduranceMode, FasterClassConfig, LogoConfig, LogoShape, LogoStyle, LogoVariant, OverlayConfig,
-    RadarConfig, RelativeConfig, StandingsConfig, SyncConfig, TyreBars,
+    RadarConfig, RelativeConfig, STANDINGS_GAP_AUTO_SECONDS_RANGE, StandingsConfig, StandingsGapMode, SyncConfig,
+    TyreBars,
 };
 use crate::input::{Action, Actions};
 
@@ -58,6 +59,8 @@ const RELATIVE_COUNT_RANGE: std::ops::RangeInclusive<u8> = 1..=10;
 const PIT_LOSS_RANGE: std::ops::RangeInclusive<f32> = 10.0..=90.0;
 /// The tyre-change threshold, in seconds of stationary time.
 const TYRE_SECS_RANGE: std::ops::RangeInclusive<f32> = 5.0..=60.0;
+/// Rows kept in view before the spectator standings table scrolls.
+const STANDINGS_FULL_ROWS_RANGE: std::ops::RangeInclusive<usize> = 8..=30;
 /// A car's length, in metres: a Mazda MX-5 to a prototype.
 const CAR_LENGTH_RANGE: std::ops::RangeInclusive<f32> = 3.0..=6.0;
 /// How many car lengths each half of a radar bar covers.
@@ -258,6 +261,15 @@ pub struct Outcome {
     /// Every panel's position was put back to its default. The app has to
     /// forget where egui last had each panel for that to take.
     pub reset_positions: bool,
+    /// A button requested a clipboard read; the window backend performs it.
+    pub paste: Option<SyncPaste>,
+}
+
+/// Team-sync field targeted by an explicit Paste button.
+#[derive(Debug, Clone, Copy)]
+pub enum SyncPaste {
+    RelayUrl,
+    Invite,
 }
 
 /// Draws the window if it is open, applying every change straight to `config`.
@@ -386,6 +398,11 @@ pub fn draw(
                             ui.set_width((content_width - 40.0).max(160.0));
                             ui.spacing_mut().item_spacing.x = 8.0;
                             ui.label(RichText::new(window.page.label()).size(24.0).strong().color(TEXT));
+                            if let Some(error) =
+                                ui.ctx().data(|data| data.get_temp::<String>(egui::Id::new("settings_save_error")))
+                            {
+                                ui.add(egui::Label::new(RichText::new(error).small().color(CAUTION)).wrap());
+                            }
                             ui.add(
                                 egui::Label::new(RichText::new(window.page.subtitle()).size(13.0).color(MUTED)).wrap(),
                             );
@@ -395,9 +412,7 @@ pub fn draw(
                             let tab = match window.page {
                                 Page::Relative | Page::Standings => panel_tabs(ui, window.page.slug(), Some("Columns")),
                                 Page::BlackBox => panel_tabs(ui, window.page.slug(), Some("Pages")),
-                                Page::RadarBars | Page::FasterClass => {
-                                    panel_tabs(ui, window.page.slug(), None)
-                                }
+                                Page::RadarBars | Page::FasterClass => panel_tabs(ui, window.page.slug(), None),
                                 _ => PanelTab::Layout,
                             };
                             // Each page owns its scroll position. The fixed viewport keeps
@@ -425,6 +440,7 @@ pub fn draw(
                                         .inner;
                                     outcome.changed |= page_outcome.changed;
                                     outcome.reset_positions |= page_outcome.reset_positions;
+                                    outcome.paste = page_outcome.paste.or(outcome.paste);
                                 });
                         });
                     });
@@ -760,6 +776,7 @@ fn relative(ui: &mut Ui, config: &mut RelativeConfig, tab: PanelTab) -> Outcome 
     outcome
 }
 
+#[expect(clippy::too_many_lines, reason = "the related standings controls remain in one content/layout page")]
 fn standings(ui: &mut Ui, config: &mut StandingsConfig, tab: PanelTab) -> Outcome {
     let mut outcome = Outcome::default();
     if tab == PanelTab::Layout {
@@ -781,6 +798,35 @@ fn standings(ui: &mut Ui, config: &mut StandingsConfig, tab: PanelTab) -> Outcom
             .changed();
     }
     if tab == PanelTab::Content {
+        section_label(ui, "SPECTATOR VIEW");
+        outcome.changed |= ui
+            .checkbox(&mut config.spectator_full, "Full classified standings while watching")
+            .on_hover_text("Shows every classified driver in the selected class sections. The table scrolls below its fixed heading.")
+            .changed();
+        outcome.changed |= ui
+            .add(Slider::new(&mut config.full_rows, STANDINGS_FULL_ROWS_RANGE).text("Visible rows"))
+            .on_hover_text(
+                "The full spectator table scrolls after this many rows, keeping the panel within a sensible height.",
+            )
+            .changed();
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("Timing gap");
+            for mode in StandingsGapMode::ALL {
+                outcome.changed |= ui.selectable_value(&mut config.gap_mode, mode, mode.label()).changed();
+            }
+        });
+        ui.add_enabled_ui(config.gap_mode == StandingsGapMode::Auto, |ui| {
+            outcome.changed |= ui
+                .add(
+                    Slider::new(&mut config.gap_auto_seconds, STANDINGS_GAP_AUTO_SECONDS_RANGE)
+                        .suffix(" s")
+                        .text("Alternate every"),
+                )
+                .on_hover_text("How long each GAP or INT view stays on screen (1–120 seconds).")
+                .changed();
+        });
+        ui.small("Click GAP, INT or AUTO in the standings heading to switch during a race.");
         outcome.changed |= ui
             .checkbox(&mut config.show_other_classes, "Show other classes' leaders")
             .on_hover_text("A section per class you aren't in, each showing just its leader.")
@@ -1065,6 +1111,7 @@ fn team_sync(ui: &mut Ui, config: &mut SyncConfig, host: &HostStatus) -> Outcome
             .on_hover_text("The host's Tailscale Funnel address as wss://, or ws://host:port on a LAN.")
             .on_disabled_hover_text("While hosting, this overlay connects to its own relay automatically.")
             .changed();
+        sync_clipboard_buttons(ui, &config.relay_url, SyncPaste::RelayUrl, &mut outcome);
     });
     ui.label("Invite code");
     outcome.changed |= ui
@@ -1074,6 +1121,10 @@ fn team_sync(ui: &mut Ui, config: &mut SyncConfig, host: &HostStatus) -> Outcome
              generated the moment hosting starts — hand that one out.",
         )
         .changed();
+    sync_clipboard_buttons(ui, &config.invite, SyncPaste::Invite, &mut outcome);
+    if let Some(message) = ui.ctx().data(|data| data.get_temp::<String>(egui::Id::new("sync_clipboard_status"))) {
+        ui.label(RichText::new(message).small().color(MUTED));
+    }
     ui.add_space(8.0);
     outcome.changed |= ui
         .checkbox(&mut config.allow_team_pit_control, "Let my team adjust my pit box")
@@ -1088,8 +1139,7 @@ fn team_sync(ui: &mut Ui, config: &mut SyncConfig, host: &HostStatus) -> Outcome
         egui::Label::new(
             RichText::new(
                 "One member ticks Host and shares their funnel URL and invite code; everyone else \
-                 just fills them in here. Changes to the URL or code take hold when sync is toggled \
-                 or the next session starts.",
+                 just fills them in here. Changes to the URL or code reconnect automatically.",
             )
             .small(),
         )
@@ -1100,6 +1150,18 @@ fn team_sync(ui: &mut Ui, config: &mut SyncConfig, host: &HostStatus) -> Outcome
         outcome.changed = true;
     }
     outcome
+}
+
+fn sync_clipboard_buttons(ui: &mut Ui, value: &str, target: SyncPaste, outcome: &mut Outcome) {
+    ui.horizontal(|ui| {
+        if ui.add_enabled(!value.is_empty(), egui::Button::new("Copy")).clicked() {
+            ui.output_mut(|output| value.clone_into(&mut output.copied_text));
+            ui.ctx().data_mut(|data| data.remove::<String>(egui::Id::new("sync_clipboard_status")));
+        }
+        if ui.button("Paste").clicked() {
+            outcome.paste = Some(target);
+        }
+    });
 }
 
 /// The Binds page: one row per black box action, with press-to-capture.

@@ -69,6 +69,9 @@ pub struct LapFuel {
 /// is what keeps the page from unlocking on an empty session.
 #[derive(Debug, Clone)]
 pub struct SyncedCar {
+    /// iRacing car index this picture belongs to. Callers match it against
+    /// their camera focus before drawing private team telemetry.
+    pub car_idx: Option<i32>,
     /// Who is in the car, for the page's "via <driver>" tag.
     pub driver: Option<String>,
     /// The latest tank, in litres.
@@ -95,6 +98,8 @@ pub struct SyncedCar {
 pub struct TeamState {
     /// The latest tank reading, from the most recent scalars or lap-close.
     fuel_litres: Option<f32>,
+    /// The car identity carried by the latest driver scalar.
+    car_idx: Option<i32>,
     /// The latest armed pit service: litres to add (`None` = fuelling off)
     /// and which corners are ticked. This is the echo every screen shows.
     service_fuel_litres: Option<i16>,
@@ -116,6 +121,7 @@ pub struct TeamState {
     driver: Option<String>,
     /// Independent clocks prevent unrelated events from hiding newer values.
     fuel_as_of: Option<Version>,
+    car_idx_as_of: Option<Version>,
     service_as_of: Option<Version>,
     tyre_readings_as_of: Option<Version>,
     fuel_target_as_of: Option<Version>,
@@ -132,8 +138,11 @@ impl TeamState {
                 self.record_lap(LapFuel { lap: *lap, fuel_after_litres: *fuel_litres, used_litres: *used_litres });
                 self.set_fuel(*fuel_litres, envelope);
             }
-            Event::DriverScalars { fuel_litres, service_fuel_litres, tyres_armed, tyre_pressures_kpa } => {
+            Event::DriverScalars { car_idx, fuel_litres, service_fuel_litres, tyres_armed, tyre_pressures_kpa } => {
                 self.set_fuel(*fuel_litres, envelope);
+                if Version::advance(&mut self.car_idx_as_of, envelope) {
+                    self.car_idx = *car_idx;
+                }
                 if Version::advance(&mut self.service_as_of, envelope) {
                     self.service_fuel_litres = *service_fuel_litres;
                     self.tyres_armed = *tyres_armed;
@@ -211,6 +220,7 @@ impl TeamState {
     pub fn synced_car(&self) -> Option<SyncedCar> {
         let fuel_litres = self.fuel_litres?;
         Some(SyncedCar {
+            car_idx: self.car_idx,
             driver: self.driver.clone(),
             fuel_litres,
             burn_per_lap: self.recent_burn_litres(BURN_WINDOW_LAPS),
@@ -264,6 +274,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "the replay invariant intentionally compares identical wire values")]
     fn multi_producer_backlog_matches_live_state() {
         use super::super::ledger::Ledger;
         use crate::telemetry::snapshot::TyreState;
@@ -280,17 +291,15 @@ mod tests {
             };
             let events = [
                 Event::DriverScalars {
+                    car_idx: Some(if old { 1 } else { 2 }),
                     fuel_litres: if old { 60.0 } else { 50.0 },
-                    service_fuel_litres: if old { Some(30) } else { None },
+                    service_fuel_litres: old.then_some(30),
                     tyres_armed: [old; 4],
                     tyre_pressures_kpa: [if old { 165.0 } else { 175.0 }; 4],
                 },
                 Event::TyreReadings(TyreInfo { corners: [corner; 4] }),
-                Event::FuelTarget { requester: "Crew".to_owned(), litres_per_lap: if old { Some(2.5) } else { None } },
-                Event::TyrePolicySet {
-                    requester: "Crew".to_owned(),
-                    policy: if old { Some(TyrePolicy::Never) } else { None },
-                },
+                Event::FuelTarget { requester: "Crew".to_owned(), litres_per_lap: old.then_some(2.5) },
+                Event::TyrePolicySet { requester: "Crew".to_owned(), policy: old.then_some(TyrePolicy::Never) },
                 Event::StintBoundary { driver: if old { "Old" } else { "New" }.to_owned() },
             ];
             for (seq, event) in (1_u32..).zip(events) {
@@ -373,6 +382,7 @@ mod tests {
             1,
             10.0,
             Event::DriverScalars {
+                car_idx: Some(1),
                 fuel_litres: 52.0,
                 service_fuel_litres: Some(30),
                 tyres_armed: [true; 4],
@@ -392,6 +402,7 @@ mod tests {
             1,
             100.0,
             Event::DriverScalars {
+                car_idx: Some(1),
                 fuel_litres: 55.5,
                 service_fuel_litres: Some(30),
                 tyres_armed: [true, true, false, false],
@@ -410,6 +421,7 @@ mod tests {
             2,
             200.0,
             Event::DriverScalars {
+                car_idx: Some(2),
                 fuel_litres: 50.0,
                 service_fuel_litres: None,
                 tyres_armed: [false; 4],
@@ -421,6 +433,7 @@ mod tests {
             1,
             100.0,
             Event::DriverScalars {
+                car_idx: Some(1),
                 fuel_litres: 58.0,
                 service_fuel_litres: None,
                 tyres_armed: [false; 4],
@@ -456,6 +469,7 @@ mod tests {
             3,
             21.0,
             Event::DriverScalars {
+                car_idx: Some(1),
                 fuel_litres: 47.5,
                 service_fuel_litres: Some(35),
                 tyres_armed: [true; 4],
@@ -480,6 +494,7 @@ mod tests {
             1,
             10.0,
             Event::DriverScalars {
+                car_idx: Some(1),
                 fuel_litres: 40.0,
                 service_fuel_litres: Some(25),
                 tyres_armed: [true, true, false, false],
@@ -504,6 +519,7 @@ mod tests {
             1,
             10.0,
             Event::DriverScalars {
+                car_idx: Some(1),
                 fuel_litres: 40.0,
                 service_fuel_litres: None,
                 tyres_armed: [false; 4],
@@ -597,6 +613,7 @@ mod tests {
             1,
             10.0,
             Event::DriverScalars {
+                car_idx: Some(1),
                 fuel_litres: 40.0,
                 service_fuel_litres: Some(20),
                 tyres_armed: [false; 4],

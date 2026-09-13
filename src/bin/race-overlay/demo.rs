@@ -20,6 +20,8 @@ use crate::telemetry::snapshot::{
     RadarSide, RadarSnapshot, RelativeMeta, Seat, SessionKind, StandingsEntry, TelemetrySnapshot, TrackWetness,
     TyreCompound, TyreInfo, TyreState, WeatherSnapshot,
 };
+use crate::telemetry::stint_estimation::{EstimateBasis, StintAge};
+use crate::telemetry::team_driver_pace::{KnownTeamDriver, StrengthBasis, TeamDriverStrength};
 
 /// The header's session-wide figures: a 45-minute race twenty minutes in,
 /// under green, as the driver sees it.
@@ -127,6 +129,9 @@ pub fn snapshot() -> TelemetrySnapshot {
             lap_driven_pct: Some(0.4),
             stops_remaining: Some(1),
             projected_class_position: Some(10),
+            net_gap_from_scoring: false,
+            net_uses_estimated_stint: false,
+            stops_remaining_range: None,
             best_stops_in_class: Some(0),
         },
         pit_projection: None,
@@ -134,6 +139,7 @@ pub fn snapshot() -> TelemetrySnapshot {
             fuel_armed: true,
             fuel_amount_litres: 55.0,
             fuel_level_litres: 55.0,
+            fuel_reading_valid: true,
             tank_capacity_litres: Some(110.0),
             // 55.0 / 2.94 == 18.7 laps, the figure on the mockup.
             fuel_per_lap_litres: Some(2.94),
@@ -455,6 +461,8 @@ fn standings() -> Vec<StandingsEntry> {
                 driver_name: Arc::from(row.name),
                 car_screen_name: Arc::from(row.car),
                 irating: row.irating,
+                team_driver_strength: None,
+                team_drivers: Arc::default(),
                 flair_id: demo_flair(usize::try_from(car_idx).unwrap_or(0)),
                 car_class_id: class.0,
                 car_class_short_name: Arc::from(class.1),
@@ -462,12 +470,17 @@ fn standings() -> Vec<StandingsEntry> {
                 best_lap_secs: row.best,
                 last_lap_secs: row.last,
                 gap_to_leader_secs: row.gap,
+                scoring_gap_to_leader_secs: None,
+                net_gap_from_scoring: false,
+                net_uses_estimated_stint: false,
                 pit_stops: 1,
                 last_pit_secs: Some(28.4),
                 avg_pit_secs: Some(26.9),
                 stops_remaining: Some(1),
+                stops_remaining_range: None,
                 projected_class_position: Some(row.class_position),
                 current_stint_laps: 6,
+                stint_age: StintAge::Observed(6),
                 current_stint_secs: 9.0 * 60.0,
                 avg_stint_laps: Some(7),
                 avg_stint_secs: Some(11.0 * 60.0),
@@ -477,10 +490,9 @@ fn standings() -> Vec<StandingsEntry> {
                 is_focus: row.name == "Driver 11",
                 off_tracks: if row.name == "Driver 12" { 2 } else { 0 },
                 penalty: None,
-                // One tow ticking and one car gambling on wets, so a
-                // screenshot exercises both markers — on rows the standings
-                // window actually shows.
-                tow_secs: (row.name == "Driver 7").then_some(43.0),
+                // Rivals do not publish a confirmed tow timer. The explicit
+                // tow demo state supplies one for the player's own car.
+                tow_secs: None,
                 tyre: Some(TyreCompound {
                     letter: if row.name == "Driver 12" { 'W' } else { 'D' },
                     wet: row.name == "Driver 12",
@@ -660,6 +672,7 @@ fn relative() -> Vec<CarSnapshot> {
             best_recent_lap_secs: Some(row.recent_lap),
             recent_laps: [Some(row.recent_lap + 0.4), Some(row.recent_lap), Some(row.recent_lap + 0.2)],
             penalty: row.penalty,
+            is_out_lap: false,
         })
         .collect()
 }
@@ -675,6 +688,7 @@ fn relative() -> Vec<CarSnapshot> {
 ///
 /// See `docs/features/shoot.ps1`, which drives these to build the feature
 /// page's images.
+#[expect(clippy::too_many_lines, reason = "the screenshot-state catalogue remains readable as one ordered match")]
 pub fn apply_state(snapshot: &mut TelemetrySnapshot, state: &str) {
     use crate::telemetry::snapshot::{CourseFlag, GridStatus};
 
@@ -714,6 +728,20 @@ pub fn apply_state(snapshot: &mut TelemetrySnapshot, state: &str) {
             snapshot.seat = Seat::TeamMate(Arc::from("Ben Whitfield"));
             snapshot.relative_meta.team_mate = Some(Arc::from("Ben Whitfield"));
         }
+        "outlap" => {
+            if let Some(car) = snapshot.relative.iter_mut().find(|car| car.is_focus) {
+                car.track_location = TrackLocation::OnTrack;
+                car.is_out_lap = true;
+            }
+        }
+        "tow" => {
+            if let Some(car) = snapshot.standings.iter_mut().find(|car| car.is_focus) {
+                car.tow_secs = Some(43.0);
+                car.track_location = TrackLocation::NotInWorld;
+            }
+            snapshot.seat = Seat::OutOfCar;
+            snapshot.pit_service.in_car = false;
+        }
         "grid" => {
             snapshot.relative_meta.grid =
                 Some(GridStatus { cars_gridded: 27, car_count: 36, countdown_secs: Some(92.0) });
@@ -747,6 +775,225 @@ pub fn apply_state(snapshot: &mut TelemetrySnapshot, state: &str) {
             snapshot.pit_service.fuel_level_litres = 46.0;
             snapshot.pit_service.fuel_amount_litres = 46.0;
         }
+        // A mixed-confidence field for the expanded spectator standings:
+        // one narrow lap-timing estimate, a wider normal-fuel-cycle prior, an
+        // explicitly unknown boundary, and the usual observed stints.
+        "estimated" => {
+            snapshot.endurance.stops_remaining = None;
+            snapshot.endurance.stops_remaining_range = Some((1, 2));
+            snapshot.endurance.projected_class_position = None;
+            snapshot.endurance.best_stops_in_class = None;
+            snapshot.endurance.net_uses_estimated_stint = true;
+            for entry in &mut snapshot.standings {
+                entry.avg_stint_laps = Some(12);
+                entry.stops_remaining_range = None;
+                entry.net_uses_estimated_stint = true;
+                entry.projected_class_position = None;
+                if entry.is_focus {
+                    entry.stint_age = StintAge::Estimated { min: 9, max: 15, basis: EstimateBasis::StrategyPrior };
+                    entry.stops_remaining = None;
+                    entry.stops_remaining_range = Some((1, 2));
+                }
+            }
+            if let Some(entry) = snapshot.standings.get_mut(4) {
+                entry.stint_age = StintAge::Estimated { min: 9, max: 10, basis: EstimateBasis::LapTiming };
+                entry.current_stint_laps = 10;
+                entry.stops_remaining_range = Some((1, 1));
+                entry.net_uses_estimated_stint = true;
+            }
+            if let Some(entry) = snapshot.standings.get_mut(5) {
+                entry.stint_age = StintAge::Estimated { min: 9, max: 15, basis: EstimateBasis::StrategyPrior };
+                entry.current_stint_laps = 15;
+                entry.stops_remaining = None;
+                entry.stops_remaining_range = Some((1, 2));
+                entry.net_uses_estimated_stint = true;
+            }
+            if let Some(entry) = snapshot.standings.get_mut(6) {
+                entry.stint_age = StintAge::Unknown;
+                entry.projected_class_position = None;
+                entry.stops_remaining = None;
+                entry.stops_remaining_range = None;
+                entry.net_uses_estimated_stint = true;
+            }
+        }
+        // Team entries expose a compact rank mark beside iRating. One roster
+        // still compares by rating; another has enough clean, closed stints
+        // to compare by measured pace. The final GT3 rows stay empty to show
+        // that solo/unseen teams never acquire a made-up badge.
+        "team-strength" => {
+            let rating_roster: Arc<[KnownTeamDriver]> = vec![
+                KnownTeamDriver {
+                    team_id: 71,
+                    user_id: 501,
+                    driver_name: "Nora Patel".to_owned(),
+                    irating: Some(6420),
+                    clean_average_lap_secs: None,
+                    completed_clean_stints: 0,
+                    active: true,
+                    provisional: true,
+                },
+                KnownTeamDriver {
+                    team_id: 71,
+                    user_id: 502,
+                    driver_name: "Jamie Reed".to_owned(),
+                    irating: Some(4880),
+                    clean_average_lap_secs: None,
+                    completed_clean_stints: 0,
+                    active: false,
+                    provisional: true,
+                },
+                KnownTeamDriver {
+                    team_id: 71,
+                    user_id: 503,
+                    driver_name: "Casey Ward".to_owned(),
+                    irating: Some(3240),
+                    clean_average_lap_secs: None,
+                    completed_clean_stints: 0,
+                    active: false,
+                    provisional: true,
+                },
+            ]
+            .into();
+            let pace_roster: Arc<[KnownTeamDriver]> = vec![
+                KnownTeamDriver {
+                    team_id: 72,
+                    user_id: 601,
+                    driver_name: "Sana Cole".to_owned(),
+                    irating: Some(3150),
+                    clean_average_lap_secs: Some(101.842),
+                    completed_clean_stints: 2,
+                    active: true,
+                    provisional: true,
+                },
+                KnownTeamDriver {
+                    team_id: 72,
+                    user_id: 602,
+                    driver_name: "Robin Moss".to_owned(),
+                    irating: Some(5880),
+                    clean_average_lap_secs: Some(102.615),
+                    completed_clean_stints: 1,
+                    active: false,
+                    provisional: true,
+                },
+                KnownTeamDriver {
+                    team_id: 72,
+                    user_id: 603,
+                    driver_name: "Eli Grant".to_owned(),
+                    irating: Some(4290),
+                    clean_average_lap_secs: Some(103.104),
+                    completed_clean_stints: 2,
+                    active: false,
+                    provisional: true,
+                },
+            ]
+            .into();
+            let set = |entry: &mut StandingsEntry, strength: TeamDriverStrength, roster: Arc<[KnownTeamDriver]>| {
+                entry.team_driver_strength = Some(strength);
+                entry.team_drivers = roster;
+            };
+            if let Some(entry) = snapshot.standings.get_mut(4) {
+                set(
+                    entry,
+                    TeamDriverStrength {
+                        car_idx: entry.car_idx,
+                        team_id: 71,
+                        user_id: 501,
+                        basis: StrengthBasis::Rating,
+                        rank: Some(1),
+                        compared_count: 3,
+                        chevrons: 3,
+                        known_count: 3,
+                        provisional: true,
+                    },
+                    Arc::clone(&rating_roster),
+                );
+            }
+            if let Some(entry) = snapshot.standings.get_mut(5) {
+                set(
+                    entry,
+                    TeamDriverStrength {
+                        car_idx: entry.car_idx,
+                        team_id: 71,
+                        user_id: 502,
+                        basis: StrengthBasis::Rating,
+                        rank: Some(2),
+                        compared_count: 3,
+                        chevrons: 0,
+                        known_count: 3,
+                        provisional: true,
+                    },
+                    Arc::clone(&rating_roster),
+                );
+            }
+            if let Some(entry) = snapshot.standings.get_mut(6) {
+                set(
+                    entry,
+                    TeamDriverStrength {
+                        car_idx: entry.car_idx,
+                        team_id: 71,
+                        user_id: 503,
+                        basis: StrengthBasis::Rating,
+                        rank: Some(3),
+                        compared_count: 3,
+                        chevrons: -3,
+                        known_count: 3,
+                        provisional: true,
+                    },
+                    rating_roster,
+                );
+            }
+            if let Some(entry) = snapshot.standings.get_mut(7) {
+                set(
+                    entry,
+                    TeamDriverStrength {
+                        car_idx: entry.car_idx,
+                        team_id: 72,
+                        user_id: 601,
+                        basis: StrengthBasis::CleanPace,
+                        rank: Some(1),
+                        compared_count: 3,
+                        chevrons: 3,
+                        known_count: 3,
+                        provisional: true,
+                    },
+                    Arc::clone(&pace_roster),
+                );
+            }
+            if let Some(entry) = snapshot.standings.get_mut(8) {
+                set(
+                    entry,
+                    TeamDriverStrength {
+                        car_idx: entry.car_idx,
+                        team_id: 72,
+                        user_id: 602,
+                        basis: StrengthBasis::CleanPace,
+                        rank: Some(2),
+                        compared_count: 3,
+                        chevrons: 0,
+                        known_count: 3,
+                        provisional: true,
+                    },
+                    Arc::clone(&pace_roster),
+                );
+            }
+            if let Some(entry) = snapshot.standings.get_mut(9) {
+                set(
+                    entry,
+                    TeamDriverStrength {
+                        car_idx: entry.car_idx,
+                        team_id: 72,
+                        user_id: 603,
+                        basis: StrengthBasis::CleanPace,
+                        rank: Some(3),
+                        compared_count: 3,
+                        chevrons: -3,
+                        known_count: 3,
+                        provisional: true,
+                    },
+                    pace_roster,
+                );
+            }
+        }
         "raining" => {
             snapshot.weather.precip_now = Some(0.78);
             snapshot.weather.precip_chance = Some(0.9);
@@ -774,6 +1021,8 @@ pub fn apply_state(snapshot: &mut TelemetrySnapshot, state: &str) {
 pub fn sync_events() -> Vec<(f64, crate::sync::protocol::Event)> {
     use crate::sync::protocol::{Event, TyrePolicy};
 
+    let car_idx = snapshot().relative.iter().find(|car| car.is_focus).map(|car| car.car_idx);
+
     let mut events = vec![(0.0, Event::StintBoundary { driver: "Alex Holder".to_owned() })];
     // A dozen closed laps, so the spectator's burn average has a window to
     // read and the store's lap history is populated.
@@ -785,6 +1034,7 @@ pub fn sync_events() -> Vec<(f64, crate::sync::protocol::Event)> {
     events.push((
         2021.0,
         Event::DriverScalars {
+            car_idx,
             fuel_litres: 43.8,
             service_fuel_litres: Some(64),
             tyres_armed: [true, true, false, false],
