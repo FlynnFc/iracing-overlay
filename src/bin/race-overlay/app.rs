@@ -377,6 +377,12 @@ impl OverlayApp {
             team_sync.demo_seed(&crate::demo::sync_events());
         }
         let settling_blackbox = config.blackbox.clone();
+        if !demo {
+            crate::iraceplan::start();
+        } else if demo_page == Some(blackbox::Page::Stints) || states.iter().any(|state| state == "stints" || state.starts_with("handover")) {
+            crate::iraceplan::show_demo(&states);
+            team_sync.demo_seed(&crate::iraceplan::handover::demo_events(&states));
+        }
         Self {
             rx,
             latest: None,
@@ -959,6 +965,14 @@ impl OverlayApp {
         // Computed before the `self.black_box` borrow below, as it reads
         // `self.team_sync`.
         let fuel_target_readout = self.fuel_target_readout(latest);
+        let telemetry_fresh = self.fresh_snapshot(Instant::now()).is_some();
+        let handover = crate::iraceplan::handover::current(
+            self.fresh_snapshot(Instant::now()), self.team_sync.synced_car().as_ref(), self.config.blackbox.fuel_margin_laps,
+        ).map(|handover| {
+            let ready = self.team_sync.handover_ready(handover.key);
+            let can_mark = handover.incoming && (!handover.stale || ready) && self.team_sync.can_mark_ready(handover.key);
+            crate::iraceplan::handover::Panel { handover, ready, can_mark }
+        });
         let mut preview_config = self.config.blackbox.clone();
         if let Some(page) = preview_page {
             preview_config.hidden_pages.retain(|hidden| *hidden != page);
@@ -966,15 +980,19 @@ impl OverlayApp {
         let pages = blackbox::configured_pages(latest, synced.as_ref(), &preview_config);
         let black_box = if preview_page.is_some() { &mut self.preview_black_box } else { &mut self.black_box };
         black_box.settle_page(pages);
+        let handover_synced = self.team_sync.synced_car();
         let mut layout = blackbox::layout_for(
             black_box.page(),
-            latest,
+            if black_box.page() == blackbox::Page::Stints && !telemetry_fresh { None } else { latest },
             &self.config.blackbox,
             black_box.auto_fuel_litres(),
             black_box.box_called(),
-            synced.as_ref(),
+            if black_box.page() == blackbox::Page::Stints { handover_synced.as_ref() } else { synced.as_ref() },
             sync_controls,
         );
+        if let blackbox::Shape::Stints(view) = &mut layout.shape {
+            view.set_handover(handover.as_ref());
+        }
         if let blackbox::Shape::Corners { wear_threshold_pct, .. } = &mut layout.shape {
             *wear_threshold_pct = self.team_sync.tyre_policy().and_then(|(policy, _)| match policy {
                 crate::sync::protocol::TyrePolicy::BelowWear { threshold_pct } => Some(threshold_pct),
@@ -994,7 +1012,7 @@ impl OverlayApp {
             let synced_ref = synced.as_ref();
             let drag = draggable_panel(egui_context, "relative", pos, |ui| {
                 let drawn_clicks =
-                    blackbox::draw(ui, black_box, latest, &relative_config, &layout, row_options, synced_ref, pages);
+                    blackbox::draw(ui, black_box, latest, &relative_config, &layout, row_options, synced_ref, pages, handover.as_ref());
                 if preview_page.is_some() {
                     for click in drawn_clicks {
                         let _ = black_box.click(
@@ -1222,6 +1240,9 @@ impl EguiOverlay for OverlayApp {
             self.demo || self.latest_at.is_some_and(|at| now.saturating_duration_since(at) < SNAPSHOT_STALE);
         let sync_snapshot = self.latest.as_ref().filter(|_| telemetry_fresh);
         self.team_sync.update(&sync_config, sync_snapshot, now);
+        if self.demo {
+            self.team_sync.refresh_demo(now);
+        }
         self.apply_team_writes();
         // Every mark drawn this frame is chosen by the logo config in
         // force; see `ui::logos::apply`.
@@ -1351,6 +1372,15 @@ impl EguiOverlay for OverlayApp {
             // A click is the same action the bind would have sent, landed on
             // the control it was made on — see `BlackBox::click`.
             for click in clicks {
+                if let blackbox::Click::HandoverReady { key, ready } = click {
+                    if let Some(handover) = crate::iraceplan::handover::current(
+                        self.fresh_snapshot(Instant::now()), self.team_sync.synced_car().as_ref(), self.config.blackbox.fuel_margin_laps,
+                    ) && handover.key == key && handover.incoming
+                        && (handover.due || self.team_sync.handover_ready(key)) && (!handover.stale || !ready) {
+                        self.team_sync.set_handover_ready(key, ready);
+                    }
+                    continue;
+                }
                 if let blackbox::Click::Control { index, action } = click {
                     match control_at(index) {
                         Some(blackbox::Control::FuelTarget) => {

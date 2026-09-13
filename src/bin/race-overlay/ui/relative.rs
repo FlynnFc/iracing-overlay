@@ -1169,6 +1169,7 @@ mod tests {
 
     fn car(gap: f32, is_focus: bool) -> CarSnapshot {
         CarSnapshot {
+            team_id: None,
             car_idx: 0,
             cust_id: None,
             position: 3,

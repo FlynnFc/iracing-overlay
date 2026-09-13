@@ -155,6 +155,15 @@ try {
   Invoke-Shot -Name 'blackbox-fuel-crew'    -Panel relative -Page fuel -State 'spectating,sync'
   Invoke-Shot -Name 'blackbox-tires-crew'   -Panel relative -Page tires -State 'spectating,sync'
 
+  # --- iRacePlan schedule and handover states -----------------------------
+  Invoke-Shot -Name 'blackbox-stints'       -Panel relative -Page stints -State 'stints'
+  Invoke-Shot -Name 'handover-plan'         -Panel relative -Page relative -State 'handover'
+  Invoke-Shot -Name 'handover-ready'        -Panel relative -Page stints -State 'handover-ready'
+  Invoke-Shot -Name 'handover-crew'         -Panel relative -Page relative -State 'handover-crew'
+  Invoke-Shot -Name 'handover-pits'         -Panel relative -Page relative -State 'handover-pits'
+  Invoke-Shot -Name 'handover-stale'        -Panel relative -Page stints -State 'handover-stale'
+  Invoke-Shot -Name 'handover-delay'        -Panel relative -Page stints -State 'handover-delay'
+
   # --- The other panels ---------------------------------------------------
   Invoke-Shot -Name 'standings-default'   -Panel standings
   Invoke-Shot -Name 'standings-tyres'     -Panel standings -PanelLines "show_tyres = true`nshow_stint_laps = true"

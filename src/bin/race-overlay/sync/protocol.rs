@@ -28,7 +28,18 @@ use serde::{Deserialize, Serialize};
 /// producer; v7 split rooms by iRacing session phase and added the car
 /// identity to driver-only scalars; v8 made recovery replay-safe and added a
 /// catch-up completion marker for chunked full-race backlogs.
-pub const PROTOCOL_VERSION: u8 = 8;
+/// v9 adds handover-specific driver readiness acknowledgements.
+pub const PROTOCOL_VERSION: u8 = 9;
+
+/// Exact assignment being acknowledged. A changed start time invalidates an old Ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct HandoverKey {
+    pub planning_id: u64,
+    pub strategy_id: u64,
+    pub stint_number: u32,
+    pub driver_id: u32,
+    pub starts_at: i64,
+}
 
 /// One member's produced events, identified and ordered.
 ///
@@ -110,6 +121,9 @@ pub enum Event {
     /// driver swaps, with the driver's overlay deciding each stop against it
     /// as the box approaches. See `plans/strategy-spec-mode.md`.
     TyrePolicySet { requester: String, policy: Option<TyrePolicy> },
+    /// A driver acknowledges only their own incoming stint. Durable session state,
+    /// keyed to one assignment; never a command to change drivers or pit service.
+    HandoverReady { key: HandoverKey, ready: bool },
 }
 
 /// The standing answer to "do we take tyres at the next stop?".

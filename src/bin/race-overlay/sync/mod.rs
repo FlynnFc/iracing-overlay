@@ -107,6 +107,34 @@ mod tests {
         assert_eq!(seq, 4, "a restarted producer continues its sequence from the relay's tip");
     }
 
+    #[test]
+    fn handover_ready_reaches_driver_and_late_joining_crew() {
+        let invite = InviteCode::generate().unwrap();
+        let relay = Relay::spawn(0, invite.clone()).unwrap();
+        let url = format!("ws://{}", relay.local_addr());
+        let incoming = SyncClient::start(url.clone(), 99, 0, invite.to_string(), member(22, "Incoming"));
+        let seated = SyncClient::start(url.clone(), 99, 0, invite.to_string(), member(11, "Seated"));
+        wait_for(&incoming, |frame| matches!(frame, FromRelay::CaughtUp).then_some(()));
+        wait_for(&seated, |frame| matches!(frame, FromRelay::CaughtUp).then_some(()));
+        let key = super::protocol::HandoverKey { planning_id: 10, strategy_id: 20, stint_number: 5, driver_id: 22, starts_at: 1000 };
+        incoming.publish.send(Outgoing { session_time: 30.0, event: Event::HandoverReady { key, ready: true } }).unwrap();
+        let event = wait_for(&seated, |frame| match frame {
+            FromRelay::Relayed(envelope) if matches!(envelope.event, Event::HandoverReady { .. }) => Some(envelope.clone()),
+            _ => None,
+        });
+        let mut state = super::store::TeamState::default();
+        state.apply(&event);
+        assert!(state.handover_ready(key));
+        let late = SyncClient::start(url, 99, 0, invite.to_string(), member(33, "Crew"));
+        let backlog = wait_for(&late, |frame| match frame {
+            FromRelay::Backlog(events) if events.iter().any(|envelope| matches!(envelope.event, Event::HandoverReady { .. })) => Some(events.clone()),
+            _ => None,
+        });
+        let mut replay = super::store::TeamState::default();
+        for event in backlog { replay.apply(&event); }
+        assert!(replay.handover_ready(key));
+    }
+
     /// A wrong code gets a `Refused` and no data; the client stops retrying.
     #[test]
     fn a_wrong_invite_is_refused() {
@@ -215,6 +243,7 @@ mod tests {
             session_num: Some(0),
             player_cust_id: Some(cust_id),
             player_name: Some(std::sync::Arc::from("Member")),
+            ..Default::default()
         };
         snapshot.seat = seat;
         snapshot

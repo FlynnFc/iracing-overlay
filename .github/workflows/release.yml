@@ -36,7 +36,13 @@ jobs:
         run: cargo test
 
       - name: Build
-        run: cargo build --release --no-default-features
+        env:
+          IRACEPLAN: ${{ secrets.IRACEPLAN }}
+        # Deliberately bundled for shared team setup. Desktop binaries cannot
+        # keep an embedded API key secret from their recipients.
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:IRACEPLAN)) { throw "Missing IRACEPLAN repository secret" }
+          cargo build --release --no-default-features --features bundled-iraceplan
 
       - name: Package
         shell: pwsh

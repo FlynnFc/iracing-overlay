@@ -7,6 +7,7 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/icon.ico");
+    println!("cargo:rerun-if-env-changed=IRACEPLAN");
 
     // Only Windows builds carry a resource section; on any other target this
     // is a no-op rather than a build failure.

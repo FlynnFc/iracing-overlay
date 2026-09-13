@@ -52,6 +52,8 @@ pub struct QualifyResult {
 /// track's own length.
 #[derive(Debug, Default, Deserialize)]
 pub struct WeekendInfo {
+    #[serde(rename = "TrackID", default)]
+    pub track_id: Option<u32>,
     /// The lap length as iRacing writes it, e.g. `"4.5298 km"`; parse with
     /// [`parse_track_length`].
     ///

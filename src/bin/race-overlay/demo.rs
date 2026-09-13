@@ -654,6 +654,7 @@ fn relative() -> Vec<CarSnapshot> {
     rows.into_iter()
         .enumerate()
         .map(|(i, row)| CarSnapshot {
+            team_id: None,
             car_idx: i32::try_from(i).unwrap_or(0),
             cust_id: Some(1000 + u32::try_from(i).unwrap_or(0)),
             position: row.position,
@@ -695,6 +696,8 @@ pub fn apply_state(snapshot: &mut TelemetrySnapshot, state: &str) {
     use crate::telemetry::snapshot::{CourseFlag, GridStatus};
 
     match state {
+        "stints" | "handover" | "handover-sync" | "handover-ready" | "handover-crew" | "handover-pits"
+        | "handover-stale" | "handover-delay" => crate::iraceplan::handover::demo_state(snapshot, state),
         // --- The black box's status border ---
         "caution" => snapshot.course_flag = CourseFlag::Yellow,
         "lastlap" => snapshot.course_flag = CourseFlag::White,

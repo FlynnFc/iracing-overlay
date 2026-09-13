@@ -1003,6 +1003,7 @@ fn black_box(ui: &mut Ui, all: &mut OverlayConfig, tab: PanelTab) -> Outcome {
         })
         .response
         .on_hover_text("What the three bars on each wheel of the Tires page show, from the last stop.");
+        crate::iraceplan::settings(ui);
     }
     if tab == PanelTab::Columns {
         ui.small("Choose the pages available in the Black Box, in tab order. Keep at least one visible.");

@@ -13,7 +13,7 @@
 //! therefore retains its own event version so live delivery and replay pick
 //! the same latest value.
 
-use super::protocol::{Envelope, Event, TyrePolicy};
+use super::protocol::{Envelope, Event, HandoverKey, TyrePolicy};
 use crate::telemetry::snapshot::TyreInfo;
 
 /// How many recent laps of fuel history to keep, for the trend readouts the
@@ -39,7 +39,7 @@ impl Version {
         let accept = held.is_none_or(|previous| {
             // Own writes currently have no wire identity. Preserve their
             // equal-time arrival order until the runtime has a real envelope.
-            let local = (next.producer, next.seq) == (0, 0) || (previous.producer, previous.seq) == (0, 0);
+            let local = next.seq == 0 || previous.seq == 0;
             if local {
                 next.session_time >= previous.session_time
             } else {
@@ -96,6 +96,9 @@ pub struct SyncedCar {
 /// is exactly right — a made-up zero would render as a real reading.
 #[derive(Debug, Default, Clone)]
 pub struct TeamState {
+    /// Only the latest acknowledgement per driver is needed. A later assignment
+    /// cannot accidentally inherit an earlier Ready after a reconnect.
+    readiness: std::collections::HashMap<u32, (HandoverKey, bool, Option<Version>)>,
     /// The latest tank reading, from the most recent scalars or lap-close.
     fuel_litres: Option<f32>,
     /// The car identity carried by the latest driver scalar.
@@ -134,6 +137,15 @@ impl TeamState {
     /// monotonic for replaceable fields (a later event version wins).
     pub fn apply(&mut self, envelope: &Envelope) {
         match &envelope.event {
+            Event::HandoverReady { key, ready } => {
+                if envelope.producer == key.driver_id && envelope.session_time.is_finite() {
+                    let held = self.readiness.entry(key.driver_id).or_insert((*key, false, None));
+                    if Version::advance(&mut held.2, envelope) {
+                        held.0 = *key;
+                        held.1 = *ready;
+                    }
+                }
+            }
             Event::LapClosed { lap, fuel_litres, used_litres } => {
                 self.record_lap(LapFuel { lap: *lap, fuel_after_litres: *fuel_litres, used_litres: *used_litres });
                 self.set_fuel(*fuel_litres, envelope);
@@ -180,6 +192,10 @@ impl TeamState {
     #[must_use]
     pub fn fuel_target(&self) -> Option<f32> {
         self.fuel_target
+    }
+
+    pub fn handover_ready(&self, key: HandoverKey) -> bool {
+        self.readiness.get(&key.driver_id).is_some_and(|(held, ready, _)| *held == key && *ready)
     }
 
     /// The standing tyre directive and who set it, or `None` if none stands.
@@ -267,6 +283,27 @@ impl TeamState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn readiness_is_scoped_to_driver_assignment_and_orders_replay() {
+        use super::super::protocol::{Envelope, Event, HandoverKey};
+        let key = HandoverKey { planning_id: 10, strategy_id: 20, stint_number: 5, driver_id: 7, starts_at: 1000 };
+        let ready = Envelope { producer: 7, seq: 1, session_time: 10.0, event: Event::HandoverReady { key, ready: true } };
+        let revoked = Envelope { producer: 7, seq: 2, session_time: 11.0, event: Event::HandoverReady { key, ready: false } };
+        let mut state = super::TeamState::default();
+        state.apply(&Envelope { producer: 8, ..ready.clone() });
+        assert!(!state.handover_ready(key), "another member cannot acknowledge for this driver");
+        state.apply(&ready);
+        assert!(state.handover_ready(key));
+        assert!(!state.handover_ready(HandoverKey { starts_at: 1001, ..key }));
+        assert!(!state.handover_ready(HandoverKey { stint_number: 14, ..key }));
+        state.apply(&revoked);
+        state.apply(&ready);
+        assert!(!state.handover_ready(key), "old replay cannot undo Not ready");
+        let mut replay = super::TeamState::default();
+        replay.apply(&revoked);
+        replay.apply(&ready);
+        assert_eq!(state.handover_ready(key), replay.handover_ready(key));
+    }
     use super::*;
 
     fn envelope(seq: u32, session_time: f64, event: Event) -> Envelope {

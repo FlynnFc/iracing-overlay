@@ -23,6 +23,7 @@ mod config;
 mod demo;
 mod focus;
 mod input;
+mod iraceplan;
 #[cfg(feature = "licence")]
 mod licence;
 mod perf;

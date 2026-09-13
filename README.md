@@ -13,7 +13,7 @@ exactly what the code draws.
 **Contents** — [Relative](#relative) · [Black box](#black-box) · [Standings](#standings) ·
 [Radar bars](#radar-bars) · [Faster class](#faster-class) ·
 [Status border](#status-border) · [Strategy](#strategy--fuel) ·
-[Team sync](#team-sync) · [Danger drivers](#danger-drivers) · [Seat layouts](#seat-layouts) ·
+[iRacePlan stints](#iraceplan-stints--handovers) � [Team sync](#team-sync) · [Danger drivers](#danger-drivers) · [Seat layouts](#seat-layouts) ·
 [Stream mode](#stream-mode) · [CPU](#cpu-behaviour) · [Themes](#themes) · [Settings](#settings-window) ·
 [Binds](#wheel-binds) · [Command line](#command-line)
 
@@ -26,7 +26,7 @@ through to the sim except where a panel actually is.
 
 - **Four panels**, each independently positioned, scaled and switched off: Relative, Standings, Radar Bars
   and Faster Class.
-- **A black box** sharing the Relative's frame — six pages walked with wheel buttons, with real pit service
+- **A black box** sharing the Relative's frame — up to seven pages walked with wheel buttons, with real pit service
   control (fuel, tyres, pressures, tearoff, fast repair).
 - **Estimates are labelled and honest.** Anything projected says so, and anything the sim has not published is
   left blank rather than guessed — a made-up number on a pit board loses races.
@@ -84,8 +84,9 @@ nothing to report draw nothing.
 
 ## Black box
 
-Six pages in the Relative's frame, walked with two wheel buttons. Every control is a real iRacing pit command,
-and every value shown is the sim's own echo of what is armed.
+Six built-in pages in the Relative's frame, walked with two wheel buttons, plus the optional
+[iRacePlan Stints page](#iraceplan-stints--handovers). Pit-service controls send real iRacing commands
+and show the sim's echo of what is armed. Schedule and strategy estimates are labelled separately.
 
 | | |
 |---|---|
@@ -227,6 +228,63 @@ of rival strategy; see [the calculation and its limits](docs/net-position.md).
 
 ---
 
+## iRacePlan stints & handovers
+
+Choose a race and strategy in **Settings > Black Box > Content** to add the **Stints** page.
+It shows the current or upcoming driver, planned end/start countdown, fuel target versus measured burn,
+next driver change, and the next three stints on a time-based board. The right-hand card gives the
+incoming driver, estimated change time, laps remaining and Ready status their own space. Times use
+your computer's local timezone.
+
+<img src="docs/features/img/blackbox-stints.png" alt="Visual Stints board with current-driver progress, fuel comparison, incoming-driver countdown and a calendar of driver lanes" width="700">
+
+**Read the rotation at a glance.** Driver colours connect the current-driver card, incoming driver and
+calendar lanes. Blocks are sized by planned duration; separate blocks show a driver staying in for
+another stint. An arrow marks a driver change, a moving **NOW** line locates the clock, and a green
+outline marks an acknowledged next assignment. Hover a block for exact times, laps and fuel load.
+The current driver's segmented bar labels observed laps or schedule progress explicitly.
+
+**Fuel target versus actual.** The driver's configured dry/wet target sits beside measured litres per lap
+and the difference. Live comparison requires a matching race, track, team and car. Spectators use fresh
+team-sync measurements; a missing reading is shown as unavailable. If the actual driver differs from the
+plan, the page says so and looks up that driver's own target.
+
+**Incoming-driver warning.** Near the next handover, an amber banner above any Black Box page tells the
+incoming spectator **DRIVING IN ~3 LAPS** (or fewer). It follows the planned team car even when the camera
+is watching someone else. The estimate combines planned progress, observed stint age and pace, and matching
+team-sync fuel with your fuel reserve. Without live fuel, it explicitly says **Plan estimate**.
+
+| State | What the crew sees |
+|---|---|
+| <img src="docs/features/img/handover-plan.png" alt="Incoming-driver warning above Relative, labelled Plan estimate with Ready unavailable until team sync connects" width="400"> | **Plan only.** The warning still appears without live fuel confirmation. Ready requires a team-sync connection. |
+| <img src="docs/features/img/handover-ready.png" alt="Incoming driver's Stints page showing Team sync plus plan, fuel agreement and READY acknowledged" width="400"> | **Ready acknowledged.** The incoming driver clicks **Ready** to share their acknowledgement, then **Not ready** to revoke it. The acknowledgement belongs to the exact assignment; a changed driver or start time needs a new one. |
+| <img src="docs/features/img/handover-crew.png" alt="Crew Relative page showing next driver Sam Taylor and READY acknowledged" width="400"> | **Crew view.** Other team members see the next driver's acknowledgement above their current page. Ready records what the driver said; it does not prove they are still online. |
+| <img src="docs/features/img/handover-pits.png" alt="Incoming-driver banner reading DRIVING NEXT, CAR IN PITS" width="400"> | **Car in the pits.** The banner changes to **DRIVING NEXT** and asks the crew to confirm the driver change. A low tank or pit entry alone does not confirm the team's handover decision. |
+
+<details>
+<summary><b>Delays and stale plans</b></summary>
+
+| State | What changes |
+|---|---|
+| <img src="docs/features/img/handover-delay.png" alt="Stints page showing an observed delayed stint and estimated handover later than the plan" width="400"> | **Running late.** Observed pit-exit age can keep a delayed double stint attached to its assignment. The live-fuel projection shows an estimated handover and its shift from the plan; ambiguous progress falls back to the labelled schedule. |
+| <img src="docs/features/img/handover-stale.png" alt="Stale iRacePlan warning with Ready disabled and the last schedule retained" width="400"> | **Plan unavailable.** Failed updates retain the last schedule with **STALE** labels and disable new Ready acknowledgements until the plan refreshes. |
+
+</details>
+
+The plan refreshes every 30 seconds. Estimated times stay in the overlay: the documented API does not
+support strategy edits, so revise the website plan in iRacePlan. All teammates and the relay need sync
+protocol **9** for shared Ready. See [connection setup and estimate limits](docs/iraceplan.md).
+
+These are synthetic demo captures, rendered through the same UI and event store as a race. The Ready
+capture starts with an acknowledgement already present; demo mode does not connect to a relay.
+Regenerate them with [the screenshot script](docs/features/shoot.ps1), or preview a state directly:
+
+```powershell
+race-overlay.exe --demo --demo-page=stints --demo-state=handover-ready --screenshot=handover.png
+```
+
+---
+
 ## Team sync
 
 Team sync shares the seated driver's private measurements, so a spectating crew chief sees fuel, tyres and
@@ -242,7 +300,7 @@ car limit. Reconnecting clients recover the shared event history while a relay o
 - **Recovery only transfers missing history.** Surviving clients can also restore a restarted relay.
   Historical pit commands rebuild history without issuing controls.
 - **Rooms include SubSessionID and SessionNum**, separating practice, qualifying and race history. An
-  invite code limits access. All members need the same protocol version; this build uses version 8.
+  invite code limits access. All members need the same protocol version; this build uses version 9, including the relay.
 
 **With only spectators connected**, each overlay keeps collecting public telemetry locally. Spectators
 do not broadcast fuel or tyre measurements; they send explicit crew decisions and requested recovery
@@ -383,7 +441,7 @@ panel behind the window is the preview — and are saved once they settle.
 | Logos | Manufacturer mark style and colour, with every known brand drawn as it will appear and a per-brand override. |
 | Radar Bars | Car length, range in car lengths and in time, bar size, the gap between the capsules, gaps in metres. |
 | Faster Class | Visibility, scale, warn/alert gaps and flash. |
-| Black Box | Auto Fuel and its margin, and whether the tyre bars show temperatures or wear. |
+| Black Box | Page order and visibility, Auto Fuel and its margin, tyre bar mode, and the iRacePlan connection with race/strategy selection. |
 | Team Sync | On/off, **host the relay from this PC** and its port, relay URL, invite code, and the pit-control consent. |
 | Binds | One row per wheel action, with press-to-capture. A control already bound elsewhere is taken anyway and the clash shown on both rows. |
 | Launcher | The programs to start with the overlay. |
@@ -412,12 +470,15 @@ answer. Binds can also be set from a terminal with `race-overlay.exe --bind <act
 |---|---|
 | `--demo` | Render the fixed demo snapshot; iRacing is not needed. |
 | `--check-config` | Print the settings path, Relative layout and bind count without opening the overlay or printing sync credentials. |
-| `--demo-page=<page>` | Open the black box on `relative`, `strategy`, `fuel`, `tires`, `in-car` or `weather`. |
+| `--demo-page=<page>` | Open the black box on `relative`, `strategy`, `fuel`, `tires`, `in-car`, `weather` or `stints`. |
 | `--demo-settings=<page>` | Open a settings page for a preview, e.g. `general`, `standings`, `black-box` or `binds`. Requires `--demo`; works with `--screenshot`. |
-| `--demo-state=<a,b>` | Put the demo snapshot into a named state — a caution, a box call, a spectator's seat — for a screenshot. |
+| `--demo-state=<a,b>` | Put the demo snapshot into a named state — a caution, a box call, a spectator's seat or an iRacePlan handover — for a screenshot. |
 | `--screenshot=<path>` | Write one rendered frame to a PNG and quit. The window stays hidden for the run. |
 | `--sync-host=<port>` | Run the team-sync relay from a terminal, printing the invite code and the funnel command. The settings page does the same without a terminal. |
 | `--sync-join=<url,subsession,code,name,custid>` | Join a relay and talk to it — a diagnostic for checking a link end to end. |
 | `--bind <action>` | Capture a wheel button for one action and save it. |
 | `--list-devices` | Every input device the overlay can see. |
 | `--dump-vars` / `--dump-all-vars` / `--dump-session-info` | What the sim is actually publishing right now. The first thing to reach for when a value reads wrong. |
+
+The iRacePlan demo states are `stints`, `handover` (plan only), `handover-sync`, `handover-ready`,
+`handover-crew`, `handover-pits`, `handover-delay` and `handover-stale`.

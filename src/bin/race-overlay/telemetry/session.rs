@@ -1500,6 +1500,7 @@ struct DriverMeta {
 /// the 60 Hz telemetry tick.
 #[derive(Debug, Default)]
 struct SessionInfoCache {
+    track_id: Option<u32>,
     last_update: Option<i32>,
     /// Only a successfully parsed revision may contribute new scoring evidence.
     valid_update: Option<i32>,
@@ -1571,6 +1572,7 @@ impl SessionInfoCache {
                 self.team_racing = info.weekend_info.team_racing != 0;
                 self.driver_user_id = info.driver_info.driver_user_id;
                 self.sub_session_id = info.weekend_info.sub_session_id;
+                self.track_id = info.weekend_info.track_id;
                 self.drivers = info
                     .driver_info
                     .drivers
@@ -2398,6 +2400,7 @@ unsafe fn build_snapshot(
         // on a grid, and any car whose position iRacing zeroes while it sits
         // in the pits.
         cars.push(CarSnapshot {
+            team_id: driver.team_id.and_then(|id| u32::try_from(id).ok()),
             car_idx,
             cust_id: driver.user_id.and_then(|id| u32::try_from(id).ok()),
             position: class_positions_by_car.get(&car_idx).copied().unwrap_or(positions[i]),
@@ -2428,6 +2431,7 @@ unsafe fn build_snapshot(
 
     if let (Some(i), Some(driver)) = (focus_idx, info.drivers.get(&focus_car_idx)) {
         cars.push(CarSnapshot {
+            team_id: driver.team_id.and_then(|id| u32::try_from(id).ok()),
             car_idx: focus_car_idx,
             cust_id: driver.user_id.and_then(|id| u32::try_from(id).ok()),
             position: class_positions_by_car
@@ -2763,6 +2767,8 @@ unsafe fn build_snapshot(
     // the entry's current driver name; in a team race that is whoever is in
     // the seat, which is exactly who a "set by" note should read.
     let identity = crate::telemetry::snapshot::SessionIdentity {
+        track_id: info.track_id,
+        team_id: info.drivers.get(&focus_car_idx).and_then(|d| d.team_id).and_then(|id| u32::try_from(id).ok()),
         subsession: info.sub_session_id,
         // `sync_to_session` retains the last concrete value through a brief
         // missing telemetry sample, so team sync cannot mistake that blink

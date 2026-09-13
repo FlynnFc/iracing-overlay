@@ -13,9 +13,14 @@ publish = false
 # the licensed build is produced and distributed separately.
 default = ["licence"]
 licence = []
+# Explicit opt-in for privately distributed builds. An embedded key is recoverable.
+bundled-iraceplan = []
 
 [dependencies]
 anyhow = "1.0.103"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
+serde_json = "1"
 egui = { version = "0.29", default-features = false }
 # Team sync (see plans/team-sync.md): invite-code entropy, compact wire
 # encoding, and the WebSocket both sides of the relay speak. `native-tls`
@@ -45,6 +50,7 @@ windows = { version = "0.62", features = [
     # iRacing's — see `perf`.
     "Win32_System_Threading",
     "Win32_Security",
+    "Win32_Security_Credentials",
     "Win32_System_Registry",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",

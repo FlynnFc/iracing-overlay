@@ -1059,6 +1059,7 @@ mod tests {
 
     fn car_at(car_idx: i32, gap: f32) -> CarSnapshot {
         CarSnapshot {
+            team_id: None,
             car_idx,
             cust_id: None,
             position: 1,

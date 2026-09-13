@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 /// position between the closest cars ahead and closest cars behind.
 #[derive(Debug, Clone)]
 pub struct CarSnapshot {
+    pub team_id: Option<u32>,
     /// The car's full display name, e.g. `"McLaren 720S GT3 EVO"`. Its first
     /// word is the manufacturer, which is what the Relative's brand mark is
     /// resolved from.
@@ -968,6 +969,9 @@ pub enum CourseFlag {
 /// read they are unknown, and the app simply does not connect yet.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionIdentity {
+    /// Circuit/configuration and focused entry identity, for matching external race plans.
+    pub track_id: Option<u32>,
+    pub team_id: Option<u32>,
     /// `WeekendInfo.SubSessionID` — the room key.
     pub subsession: Option<u64>,
     /// The concrete iRacing session number this snapshot belongs to. Kept

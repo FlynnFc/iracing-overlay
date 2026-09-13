@@ -29,6 +29,7 @@
 
 mod fuel_service;
 pub mod pages;
+mod stints;
 
 use std::time::{Duration, Instant};
 
@@ -307,11 +308,12 @@ pub enum Page {
     Strategy,
     InCarAdjustments,
     Weather,
+    Stints,
 }
 
 impl Page {
-    pub const ALL: [Self; 6] =
-        [Self::Relative, Self::Fuel, Self::Tires, Self::Strategy, Self::InCarAdjustments, Self::Weather];
+    pub const ALL: [Self; 7] =
+        [Self::Relative, Self::Fuel, Self::Tires, Self::Strategy, Self::InCarAdjustments, Self::Weather, Self::Stints];
 
     /// Where this page sits in [`Page::ALL`], which is what [`PageSet`] indexes
     /// by.
@@ -328,6 +330,7 @@ impl Page {
             Self::Tires => "TIRES",
             Self::InCarAdjustments => "IN-CAR",
             Self::Weather => "WEATHER",
+            Self::Stints => "STINTS",
         }
     }
 
@@ -339,6 +342,7 @@ impl Page {
             // The Relative follows whichever car is being watched, and the
             // weather is the session's.
             Self::Relative | Self::Weather => true,
+            Self::Stints => crate::iraceplan::available(),
             // The stop plan is about the player's own race, whoever is
             // driving it — and, while spectating, the team car's, once sync is
             // feeding its fuel. The traffic and pace it also reads come from
@@ -379,6 +383,7 @@ impl Page {
             Self::Tires => "tires",
             Self::InCarAdjustments => "in-car",
             Self::Weather => "weather",
+            Self::Stints => "stints",
         }
     }
 
@@ -392,6 +397,7 @@ impl Page {
             // Said plainly, because iRacing's own page is a forecast and this
             // one cannot be: no forecast is published to read.
             Self::Weather => Some("Current conditions"),
+            Self::Stints => Some("iRacePlan schedule · local time · planned values"),
             Self::InCarAdjustments => Some("Read-only"),
             // The pit window says how far to trust itself in its own workings
             // line, in its own terms.
@@ -412,7 +418,7 @@ impl Page {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageSet {
     mask: u16,
-    order: [Page; 6],
+    order: [Page; 7],
 }
 
 impl PageSet {
@@ -638,7 +644,7 @@ impl PageLayout {
             // in the terms of the page rather than in the terms of the app.
             // Read-only pages have no controls by definition, and are not
             // thereby empty.
-            Shape::PitWindow { .. } => false,
+            Shape::PitWindow { .. } | Shape::Stints(_) => false,
             Shape::Tiles(tiles) => tiles.is_empty(),
         }
     }
@@ -647,6 +653,7 @@ impl PageLayout {
 /// How a page arranges its controls.
 #[derive(Debug, Clone)]
 pub enum Shape {
+    Stints(Box<stints::View>),
     /// A column of rows with a cursor running down it — what a page is until
     /// it has earned something better.
     Rows,
@@ -838,6 +845,7 @@ pub enum Click {
     /// `None` clears it. Applied to the config by the app, not the black box.
     /// See `plans/danger-drivers.md`.
     Danger { cust_id: u32, level: Option<crate::config::DangerLevel> },
+    HandoverReady { key: crate::sync::protocol::HandoverKey, ready: bool },
 }
 
 /// The panel's own state: which page, where the cursor is, and how far the
@@ -1089,7 +1097,7 @@ impl BlackBox {
             }
             // Danger marks are the app's to persist, not the black box's — see
             // `app`. Nothing to do here.
-            Click::Danger { .. } => None,
+            Click::Danger { .. } | Click::HandoverReady { .. } => None,
         }
     }
 
@@ -1349,6 +1357,9 @@ pub fn layout_for(
     sync_controls: SyncControls,
 ) -> PageLayout {
     let rows = |controls: Vec<Row>| PageLayout { controls, shape: Shape::Rows };
+    if page == Page::Stints {
+        return PageLayout { controls: Vec::new(), shape: Shape::Stints(Box::new(stints::view(snapshot, synced))) };
+    }
     let Some(snapshot) = snapshot else {
         return rows(Vec::new());
     };
@@ -1359,6 +1370,7 @@ pub fn layout_for(
         Page::Tires => pages::tires(snapshot, settings.tyre_bars),
         Page::InCarAdjustments => pages::in_car(snapshot),
         Page::Weather => pages::weather(snapshot),
+        Page::Stints => unreachable!("handled before the telemetry guard"),
     }
 }
 
@@ -1486,10 +1498,15 @@ pub fn draw(
     options: super::RowOptions,
     _synced: Option<&crate::sync::store::SyncedCar>,
     pages: PageSet,
+    handover: Option<&crate::iraceplan::handover::Panel>,
 ) -> Vec<Click> {
     let page = state.page();
     let rail = Rail { pages, current: page };
     let metrics = Metrics::new(config.scale);
+    let mut clicks = Vec::new();
+    if let Some(panel) = handover.filter(|panel| panel.handover.due || (panel.handover.incoming && panel.ready)) {
+        stints::draw_handover(ui, metrics, panel, metrics.px(super::relative::outer_width(config)), &mut clicks);
+    }
     // The status border wraps whatever page is showing — the session's flag
     // and the player's box call are the widget's state, not a page's. See
     // `plans/blackbox-status-border.md`.
@@ -1499,7 +1516,6 @@ pub fn draw(
         // when the overlay is positioned against the top of the screen.
         ui.add_space(metrics.px(STATUS_HEADER_HEIGHT));
     }
-    let mut clicks = Vec::new();
     if page == Page::Relative {
         let scroll = state.scroll();
         // *under* the gutter's own markers — see `paint_status_frame`.
@@ -1524,6 +1540,7 @@ pub fn draw(
             }
             match &layout.shape {
                 Shape::Rows => draw_rows(ui, metrics, controls, cursor, &mut clicks),
+                Shape::Stints(view) => stints::draw(ui, metrics, view),
                 Shape::Corners { readouts, bars, wear_threshold_pct, .. } => {
                     draw_corners(ui, metrics, controls, cursor, readouts, *bars, *wear_threshold_pct, &mut clicks);
                 }
@@ -3465,11 +3482,20 @@ mod tests {
         assert_eq!(Page::from_arg("nonsense"), None);
     }
 
+    #[test]
+    fn connected_stints_page_participates_in_wheel_order() {
+        let mut pages = pages_for(None, None);
+        pages.mask |= 1 << Page::Stints.ordinal();
+        assert_eq!(pages.stepped(Page::Weather, 1), Page::Stints);
+        assert_eq!(pages.stepped(Page::Stints, 1), Page::Relative);
+        assert_eq!(pages.stepped(Page::Relative, -1), Page::Stints);
+    }
+
     /// No snapshot at all is a driver's view.
     #[test]
     fn gating_never_takes_away_a_page_from_a_driver() {
         let offered = pages_for(None, None);
-        for page in Page::ALL {
+        for page in Page::ALL.into_iter().filter(|page| *page != Page::Stints) {
             assert!(offered.contains(page), "{page:?} went missing");
         }
     }
@@ -3590,7 +3616,7 @@ mod tests {
         let snapshot = crate::demo::snapshot();
         assert_eq!(snapshot.seat, Seat::Driving, "the demo is a driver's view");
         let offered = pages_for(Some(&snapshot), None);
-        for page in Page::ALL {
+        for page in Page::ALL.into_iter().filter(|page| *page != Page::Stints) {
             assert!(offered.contains(page), "{page:?} went missing");
         }
     }
@@ -3623,7 +3649,7 @@ mod tests {
         let mut snapshot = crate::demo::snapshot();
         snapshot.seat = Seat::OutOfCar;
         let offered = pages_for(Some(&snapshot), None);
-        for page in Page::ALL {
+        for page in Page::ALL.into_iter().filter(|page| *page != Page::Stints) {
             assert!(offered.contains(page), "{page:?} went missing");
         }
     }

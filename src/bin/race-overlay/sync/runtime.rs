@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use super::client::{Outgoing, SyncClient};
 use super::feed::{DriverObservation, EventSource};
-use super::protocol::{Envelope, Event, FromRelay, Member, TyrePolicy};
+use super::protocol::{Envelope, Event, FromRelay, HandoverKey, Member, TyrePolicy};
 use super::store::TeamState;
 use crate::config::SyncConfig;
 use crate::telemetry::pit::{Corner, PitRequest};
@@ -153,6 +153,21 @@ impl TeamSync {
         self.publish(Event::FuelTarget { requester: self.requester(), litres_per_lap });
     }
 
+    pub fn handover_ready(&self, key: HandoverKey) -> bool {
+        self.state.handover_ready(key)
+    }
+
+    /// Readiness is a deliberate acknowledgement by the named driver, never by a spec on their behalf.
+    pub fn can_mark_ready(&self, key: HandoverKey) -> bool {
+        self.client.is_some() && self.connection_identity.as_ref().is_some_and(|id| id.cust_id == key.driver_id)
+    }
+
+    pub fn set_handover_ready(&self, key: HandoverKey, ready: bool) {
+        if self.can_mark_ready(key) {
+            self.publish(Event::HandoverReady { key, ready });
+        }
+    }
+
     /// Folds a canned set of events straight into the store, for `--demo`.
     ///
     /// Demo mode has no relay and no team, so every sync-fed surface — the
@@ -164,12 +179,21 @@ impl TeamSync {
     pub fn demo_seed(&mut self, events: &[(f64, Event)]) {
         for (seq, (session_time, event)) in events.iter().enumerate() {
             let seq = u32::try_from(seq).unwrap_or(u32::MAX).saturating_add(1);
-            self.state.apply(&Envelope { producer: 1, seq, session_time: *session_time, event: event.clone() });
+            let producer = if let Event::HandoverReady { key, .. } = event { key.driver_id } else { 1 };
+            self.state.apply(&Envelope { producer, seq, session_time: *session_time, event: event.clone() });
             if matches!(event, Event::DriverScalars { .. }) {
                 self.last_driver_scalar_session_time = Some(*session_time);
                 self.last_driver_scalar_received_at = Some(Instant::now());
             }
             self.last_session_time = self.last_session_time.max(*session_time);
+        }
+    }
+
+    /// Keep the fixed demo measurement current while rendering, even on a slow first frame.
+    /// Only demo mode calls this; live data keeps its five-second expiry.
+    pub fn refresh_demo(&mut self, now: Instant) {
+        if self.last_driver_scalar_session_time.is_some() {
+            self.last_driver_scalar_received_at = Some(now);
         }
     }
 
@@ -229,7 +253,7 @@ impl TeamSync {
             // Synthetic identity for a local write; preserve the same clock
             // sent to the relay, even if the frame clock has since advanced.
             self.state.apply(&Envelope {
-                producer: 0,
+                producer: self.connection_identity.as_ref().map_or(0, |identity| identity.cust_id),
                 seq: 0,
                 session_time: outgoing.session_time,
                 event: outgoing.event,
