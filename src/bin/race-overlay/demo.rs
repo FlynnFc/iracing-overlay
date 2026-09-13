@@ -470,6 +470,8 @@ fn standings() -> Vec<StandingsEntry> {
                 best_lap_secs: row.best,
                 last_lap_secs: row.last,
                 gap_to_leader_secs: row.gap,
+                leader_gap: (row.laps_down == 0)
+                    .then_some(crate::telemetry::snapshot::LeaderGap { secs: row.gap, estimated: false }),
                 scoring_gap_to_leader_secs: None,
                 net_gap_from_scoring: false,
                 net_uses_estimated_stint: false,
@@ -814,6 +816,34 @@ pub fn apply_state(snapshot: &mut TelemetrySnapshot, state: &str) {
                 entry.stops_remaining = None;
                 entry.stops_remaining_range = None;
                 entry.net_uses_estimated_stint = true;
+            }
+        }
+        // Exercise all gap units in a late endurance-race timing table.
+        "long-gaps" => {
+            snapshot.relative_meta.race_elapsed_secs = 23.0 * 3600.0 + 35.0 * 60.0;
+            snapshot.relative_meta.race_remain_secs = Some(25.0 * 60.0);
+            snapshot.relative_meta.session_length_secs = Some(24.0 * 3600.0);
+            snapshot.relative_meta.current_lap = 570;
+            snapshot.relative_meta.predicted_total_laps = Some(584);
+            let class_id = snapshot.standings.iter().find(|entry| entry.is_focus).map(|entry| entry.car_class_id);
+            let examples = [
+                (0.0, 0, false),
+                (8.4, 0, false),
+                (42.8, 0, false),
+                (204.0, 1, false),
+                (1087.0, 7, false),
+                (3972.0, 26, false),
+                (25199.0, 189, true),
+                (25212.0, 189, true),
+                (25218.0, 189, true),
+                (25239.0, 189, true),
+            ];
+            for (entry, (secs, laps, estimated)) in
+                snapshot.standings.iter_mut().filter(|entry| Some(entry.car_class_id) == class_id).zip(examples)
+            {
+                entry.leader_gap = Some(crate::telemetry::snapshot::LeaderGap { secs, estimated });
+                entry.gap_to_leader_secs = secs;
+                entry.laps_down = laps;
             }
         }
         // Team entries expose a compact rank mark beside iRating. One roster

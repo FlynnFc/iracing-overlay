@@ -206,6 +206,14 @@ programs when the overlay starts** to get the same from double-clicking
   clicking the GAP/INT/AUTO heading cycles all three. INT compares consecutive classified cars in the same
   class, including cars on different laps.
 
+  GAP keeps the full time deficit to the class leader even when a car is lapped:
+  `+18:07` with a small, muted `7L` means 18 minutes 7 seconds behind, including
+  those seven laps. Values below a minute keep tenths; longer gaps use `m:ss`
+  or `h:mm:ss`. Hover for the full seconds value and lap deficit. Fresh scoring
+  supplies the measured total; a live track-progress estimate is prefixed `~`.
+  If neither source is usable, the time shows `-` while the lap label remains.
+  The column stays the same width in GAP, INT and Auto.
+
   An unrendered car keeps its official scored position if live position data is unavailable. `TOW`
   requires a positive `PlayerCarTowTime` for the player's own car and shows time remaining. No rival
   tow is inferred from a renderer blink or disconnect. Relative still requires current nearby-car data;

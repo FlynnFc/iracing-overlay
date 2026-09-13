@@ -110,15 +110,21 @@ and an overall number reads as a driver being fourteenth in a race they are lead
 
 <img src="docs/features/img/standings-default.png" alt="The Standings panel" width="820">
 
-Your own class in full on the left, other classes' leaders on the right, with the session badge and clock
-across the top. Rows tumble to their new slot when positions change, so a change is seen to happen rather
-than the table silently being different.
+The compact view keeps a class-relative selection around the driver or watched car, with optional leaders
+from other classes and the session badge and clock across the top. Rows tumble to their new slot when
+positions change, so a change is seen to happen rather than the table silently being different.
 
 **GAP / INT.** Choose the class leader, the next classified car, or **Auto** in Settings → Standings →
 Content. Auto alternates the two readings every five seconds by default (configurable from 1 to 120 seconds)
 and marks the active heading `AUTO`. Clicking the heading also cycles modes while the overlay is interactive.
 Intervals remain useful when both cars are laps behind the leader. Position numbers use shared scoring instead
 of the locally rendered subset. SOF is a fixed estimate from the session roster.
+
+<img src="docs/features/img/standings-long-gaps.png" alt="Standings showing total GAPs in seconds, minutes and hours" width="820">
+
+**Long total gaps.** GAP stays a total deficit: tenths below a minute, `M:SS` below an hour, then
+`H:MM:SS`. A small, muted `nL` suffix preserves the lap deficit. Hover for the full seconds value.
+`~+` identifies an estimated total; `-` means a usable time gap is unavailable.
 
 **Watching a race.** Settings → Standings → Content can keep a full classified table for a spectator or
 team-mate seat. Click **FULL** in the standings heading to expand it immediately; the fixed headings remain
@@ -132,6 +138,8 @@ uses an inferred stint or scorer fallback, and the summary shows a stop range in
 **Team-driver strength.** In team races, the iRating badge carries up to three green or red chevrons when
 the current driver can be ranked among drivers seen for that entry's team. Hover it for the rank, whether it
 uses iRating or clean completed-stint pace, and the provisional known-driver list.
+
+<img src="docs/features/img/standings-team-strength.png" alt="Ranked team-mates shown beside their iRating in Standings" width="820">
 
 An unrendered car keeps its scored standings row. `TOW` requires the player's positive iRacing tow timer;
 rival absence alone never claims a tow. The countdown shows time remaining, not time since a car vanished.

@@ -73,7 +73,12 @@ const MIN_CLASS_ROWS: i32 = TOP_N + 1 + WINDOW_BEFORE + WINDOW_AFTER;
 /// as a long name is worth a wider panel.
 pub const DESIGN_NAME_WIDTH: f32 = 440.0;
 pub const NAME_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 300.0..=560.0;
-const RIGHT_WIDTH: f32 = 286.0;
+const GAP_WIDTH: f32 = 128.0;
+const GAP_TIME_RIGHT: f32 = 90.0;
+const GAP_LAPS_LEFT: f32 = 94.0;
+const GAP_TIME_SIZE: f32 = 14.0;
+const GAP_LAPS_SIZE: f32 = 10.0;
+const RIGHT_WIDTH: f32 = 230.0 + GAP_WIDTH;
 
 /// The optional tyre column tacked onto the timing band's right edge: the
 /// column's width, the compound circle's radius within it, and the letter
@@ -1358,7 +1363,7 @@ fn draw_right_top_bar(
     let columns = timing_columns(metrics, rect, order);
     let gap_header = Rect::from_min_max(
         egui::pos2(columns[0].1 - metrics.px(4.0), rect.top()),
-        egui::pos2(columns[0].1 + metrics.px(56.0), rect.bottom()),
+        egui::pos2(columns[0].1 + metrics.px(GAP_WIDTH - 8.0), rect.bottom()),
     );
     let gap_response = ui.interact(gap_header, ui.id().with("standings-gap-mode"), egui::Sense::click()).on_hover_text(
         "Click to cycle GAP, INT and AUTO. Auto alternates the class-leader gap and interval on its configured timer.",
@@ -1367,8 +1372,8 @@ fn draw_right_top_bar(
         let label = if index == 0 { gap.mode.header_label() } else { label };
         paint_text(
             ui,
-            egui::pos2(x, middle),
-            egui::Align2::LEFT_CENTER,
+            egui::pos2(if index == 0 { x + metrics.px(GAP_TIME_RIGHT) } else { x }, middle),
+            if index == 0 { egui::Align2::RIGHT_CENTER } else { egui::Align2::LEFT_CENTER },
             RichText::new(label).size(metrics.px(COLUMN_LABEL_SIZE)).color(if index == 0 && gap_response.hovered() {
                 ACCENT
             } else {
@@ -1378,7 +1383,7 @@ fn draw_right_top_bar(
         if index == 0 && gap.automatic {
             paint_text(
                 ui,
-                egui::pos2(x + metrics.px(30.0), middle),
+                egui::pos2(x + metrics.px(GAP_LAPS_LEFT), middle),
                 egui::Align2::LEFT_CENTER,
                 RichText::new("AUTO").monospace().size(metrics.px(8.0)).strong().color(text_tertiary()),
             );
@@ -1415,7 +1420,7 @@ fn timing_columns(
     let mut x = rect.left() + metrics.px(12.0);
     for column in order {
         let (index, width) = match column {
-            C::Gap => (0, 56.0),
+            C::Gap => (0, GAP_WIDTH),
             C::Fastest => (1, 102.0),
             C::Last => (2, 102.0),
         };
@@ -1861,15 +1866,7 @@ fn draw_right_row(
                 .color(theme::caution()),
         );
     } else {
-        paint_text(
-            ui,
-            egui::pos2(columns[0].1, middle),
-            egui::Align2::LEFT_CENTER,
-            RichText::new(gap_text(entry, gap_mode, snapshot))
-                .monospace()
-                .size(metrics.px(TIME_SIZE))
-                .color(text_color),
-        );
+        draw_gap(ui, metrics, rect, columns[0].1, entry, gap_mode, snapshot, text_color);
     }
 
     // The fastest lap receives a soft inset tint. Its semantic accent is
@@ -2269,19 +2266,40 @@ fn next_classified_car<'a>(snapshot: &'a TelemetrySnapshot, entry: &StandingsEnt
         .max_by_key(|candidate| candidate.class_position)
 }
 
-/// The selected comparison: a leader deficit in the normal view, or the
-/// interval to the classified car immediately ahead. Two cars a lap down can
-/// still be seconds apart, so interval only uses a lap count when they are on
-/// different laps behind their class leader.
+/// A compact total duration with tenths below one minute and whole seconds
+/// thereafter. Round before choosing units so 59.96 never becomes `+60.0`
+/// and a minute/hour boundary never produces a `:60` field.
+fn compact_gap(seconds: f32, estimated: bool) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "-".to_owned();
+    }
+    let prefix = if estimated { "~+" } else { "+" };
+    if seconds < 59.95 {
+        return format!("{prefix}{seconds:.1}");
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "finite nonnegative seconds are deliberately rounded for the display"
+    )]
+    let total = seconds.round() as u64;
+    if total < 3600 {
+        format!("{prefix}{}:{:02}", total / 60, total % 60)
+    } else {
+        format!("{prefix}{}:{:02}:{:02}", total / 3600, total / 60 % 60, total % 60)
+    }
+}
+
+/// GAP keeps total time as its main value even when the car is laps down.
+/// The lap deficit is painted separately as quiet context. INT retains its
+/// classified comparison and uses a lap count for cars on different laps.
 fn gap_text(entry: &StandingsEntry, mode: StandingsGapMode, snapshot: &TelemetrySnapshot) -> String {
     match mode {
         StandingsGapMode::Leader => {
-            if entry.laps_down > 0 {
-                format!("{}L", entry.laps_down)
-            } else if entry.class_position <= 1 {
+            if entry.class_position <= 1 {
                 "-".to_owned()
             } else {
-                format!("{:.1}", entry.gap_to_leader_secs)
+                entry.leader_gap.map_or_else(|| "-".to_owned(), |gap| compact_gap(gap.secs, gap.estimated))
             }
         }
         StandingsGapMode::NextClassified => {
@@ -2293,11 +2311,80 @@ fn gap_text(entry: &StandingsEntry, mode: StandingsGapMode, snapshot: &Telemetry
                 return format!("{lap_delta}L");
             }
             let interval = entry.gap_to_leader_secs - ahead.gap_to_leader_secs;
-            if interval.is_finite() && interval >= 0.0 { format!("{interval:.1}") } else { "-".to_owned() }
+            compact_gap(interval, false)
         }
         // Rendering resolves Auto once per frame before it reaches a row.
         // This fallback keeps the helper truthful for direct callers too.
         StandingsGapMode::Auto => gap_text(entry, StandingsGapMode::Leader, snapshot),
+    }
+}
+
+fn gap_detail(entry: &StandingsEntry) -> String {
+    if entry.class_position == 1 {
+        return "Class leader".to_owned();
+    }
+    let mut detail = match entry.leader_gap.filter(|gap| gap.secs.is_finite() && gap.secs >= 0.0) {
+        Some(gap) => {
+            let seconds = format!("{:.1}", gap.secs);
+            let seconds = seconds.strip_suffix(".0").unwrap_or(&seconds);
+            let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
+            let grouped: String = whole
+                .chars()
+                .enumerate()
+                .flat_map(|(i, c)| {
+                    let comma = i > 0 && (whole.len() - i).is_multiple_of(3);
+                    comma.then_some(',').into_iter().chain(std::iter::once(c))
+                })
+                .collect();
+            let decimal = if fraction.is_empty() { String::new() } else { format!(".{fraction}") };
+            format!(
+                "{}total gap to class leader: {grouped}{decimal} seconds",
+                if gap.estimated { "Estimated " } else { "" }
+            )
+        }
+        None => "Time gap to class leader unavailable".to_owned(),
+    };
+    if entry.laps_down > 0 {
+        let _ = write!(detail, " · {} lap{} down", entry.laps_down, if entry.laps_down == 1 { "" } else { "s" });
+    }
+    detail
+}
+
+#[expect(clippy::too_many_arguments, reason = "the gap cell uses the existing timing row context")]
+fn draw_gap(
+    ui: &mut Ui,
+    metrics: Metrics,
+    row: Rect,
+    left: f32,
+    entry: &StandingsEntry,
+    mode: StandingsGapMode,
+    snapshot: &TelemetrySnapshot,
+    color: Color32,
+) {
+    paint_text(
+        ui,
+        egui::pos2(left + metrics.px(GAP_TIME_RIGHT), row.center().y),
+        egui::Align2::RIGHT_CENTER,
+        RichText::new(gap_text(entry, mode, snapshot)).monospace().size(metrics.px(GAP_TIME_SIZE)).color(color),
+    );
+    if mode != StandingsGapMode::NextClassified {
+        if entry.class_position > 1 && entry.laps_down > 0 {
+            paint_text(
+                ui,
+                egui::pos2(left + metrics.px(GAP_LAPS_LEFT), row.center().y),
+                egui::Align2::LEFT_CENTER,
+                RichText::new(format!("{}L", entry.laps_down))
+                    .monospace()
+                    .size(metrics.px(GAP_LAPS_SIZE))
+                    .color(text_tertiary()),
+            );
+        }
+        let cell = Rect::from_min_max(
+            egui::pos2(left, row.top()),
+            egui::pos2(left + metrics.px(GAP_WIDTH - 8.0), row.bottom()),
+        );
+        ui.interact(cell, ui.id().with(("standings-gap-detail", entry.car_idx)), egui::Sense::hover())
+            .on_hover_text(gap_detail(entry));
     }
 }
 
@@ -2417,6 +2504,7 @@ mod tests {
             best_lap_secs: 98.0,
             last_lap_secs: 99.0,
             gap_to_leader_secs: gap,
+            leader_gap: Some(crate::telemetry::snapshot::LeaderGap { secs: gap, estimated: false }),
             scoring_gap_to_leader_secs: None,
             net_gap_from_scoring: false,
             net_uses_estimated_stint: false,
@@ -3059,15 +3147,72 @@ mod tests {
 
     #[test]
     fn a_gap_on_the_lead_lap_reads_in_seconds() {
-        assert_eq!(leader_gap_text(&entry(2, 0.9, 0)), "0.9");
-        assert_eq!(leader_gap_text(&entry(9, 32.0, 0)), "32.0");
+        assert_eq!(leader_gap_text(&entry(2, 0.9, 0)), "+0.9");
+        assert_eq!(leader_gap_text(&entry(9, 32.0, 0)), "+32.0");
     }
 
-    /// A car eleven laps down has no meaningful time gap, so the lap count
-    /// takes the column instead — the mockup's `11L`.
     #[test]
-    fn a_lapped_car_reads_in_laps() {
-        assert_eq!(leader_gap_text(&entry(15, 400.0, 11)), "11L");
+    fn a_lapped_car_keeps_its_full_time_deficit() {
+        assert_eq!(leader_gap_text(&entry(15, 1087.0, 7)), "+18:07");
+    }
+
+    #[test]
+    fn long_gap_units_round_cleanly_across_minute_and_hour_boundaries() {
+        for (secs, expected) in [
+            (8.4, "+8.4"),
+            (59.94, "+59.9"),
+            (59.96, "+1:00"),
+            (204.0, "+3:24"),
+            (3599.6, "+1:00:00"),
+            (3972.0, "+1:06:12"),
+            (89999.0, "+24:59:59"),
+        ] {
+            assert_eq!(compact_gap(secs, false), expected);
+        }
+        assert_eq!(compact_gap(3972.0, true), "~+1:06:12");
+        for invalid in [f32::NAN, f32::INFINITY, -1.0] {
+            assert_eq!(compact_gap(invalid, false), "-");
+        }
+    }
+
+    #[test]
+    fn a_missing_time_preserves_the_lap_context_without_fabricating_seconds() {
+        let mut car = entry(15, 0.0, 7);
+        car.leader_gap = None;
+        assert_eq!(leader_gap_text(&car), "-");
+        assert_eq!(gap_detail(&car), "Time gap to class leader unavailable · 7 laps down");
+        car.leader_gap = Some(crate::telemetry::snapshot::LeaderGap { secs: 1087.3, estimated: true });
+        assert_eq!(leader_gap_text(&car), "~+18:07");
+        assert_eq!(gap_detail(&car), "Estimated total gap to class leader: 1,087.3 seconds · 7 laps down");
+    }
+
+    #[test]
+    fn hours_and_lap_suffix_fit_one_row_without_overlap_at_small_scale() {
+        for scale in [0.9, 1.0, 1.5] {
+            let ctx = egui::Context::default();
+            crate::app::install_fonts(&ctx);
+            let metrics = Metrics::new(scale);
+            let mut car = entry(15, 89999.0, 589);
+            car.leader_gap.as_mut().unwrap().estimated = true;
+            let snapshot = crate::demo::snapshot();
+            let row = Rect::from_min_size(egui::pos2(20.0, 20.0), metrics.vec2(GAP_WIDTH, ROW_HEIGHT));
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    draw_gap(ui, metrics, row, row.left(), &car, StandingsGapMode::Leader, &snapshot, text_primary());
+                });
+            });
+            let text: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| if let egui::Shape::Text(text) = &shape.shape { Some(text) } else { None })
+                .collect();
+            let time = text.iter().find(|text| text.galley.text() == "~+24:59:59").unwrap();
+            let laps = text.iter().find(|text| text.galley.text() == "589L").unwrap();
+            assert!(time.pos.x >= row.left() - 1.0);
+            assert!(time.pos.x + time.galley.size().x < laps.pos.x);
+            assert!(laps.pos.x + laps.galley.size().x <= row.right() - metrics.px(7.0));
+            assert!(time.pos.y + time.galley.size().y <= row.bottom());
+        }
     }
 
     #[test]
@@ -3079,8 +3224,8 @@ mod tests {
         let mut snapshot = crate::demo::snapshot();
         snapshot.standings = vec![leader, ahead, me.clone()];
 
-        assert_eq!(gap_text(&me, StandingsGapMode::Leader, &snapshot), "1L");
-        assert_eq!(gap_text(&me, StandingsGapMode::NextClassified, &snapshot), "6.7");
+        assert_eq!(gap_text(&me, StandingsGapMode::Leader, &snapshot), "+1:49");
+        assert_eq!(gap_text(&me, StandingsGapMode::NextClassified, &snapshot), "+6.7");
     }
 
     #[test]
@@ -3091,7 +3236,7 @@ mod tests {
         me.car_idx = 4;
         let mut snapshot = crate::demo::snapshot();
         snapshot.standings = vec![leader, ahead, me.clone()];
-        assert_eq!(gap_text(&me, StandingsGapMode::NextClassified, &snapshot), "4.2");
+        assert_eq!(gap_text(&me, StandingsGapMode::NextClassified, &snapshot), "+4.2");
 
         snapshot.standings[1].gap_to_leader_secs = 51.0;
         assert_eq!(gap_text(&me, StandingsGapMode::NextClassified, &snapshot), "-");

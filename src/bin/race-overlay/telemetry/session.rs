@@ -21,8 +21,8 @@ use super::session_info::{
 };
 use super::snapshot::{Approaching, EnduranceMeta, FasterClassSnapshot, Seat, SessionKind, is_lone_qualifying};
 use super::snapshot::{
-    CarAdjustments, CarSnapshot, ClassSection, GridStatus, PitProjection, RadarCar, RadarSide, RadarSnapshot,
-    RelativeMeta, StandingsEntry, TelemetrySnapshot, TrackWetness, TyreInfo, TyreState, WeatherSnapshot,
+    CarAdjustments, CarSnapshot, ClassSection, GridStatus, LeaderGap, PitProjection, RadarCar, RadarSide,
+    RadarSnapshot, RelativeMeta, StandingsEntry, TelemetrySnapshot, TrackWetness, TyreInfo, TyreState, WeatherSnapshot,
     track_location_from_raw,
 };
 use super::team_driver_pace as driver_pace;
@@ -2671,6 +2671,7 @@ unsafe fn build_snapshot(
         under_caution,
     );
     let net_gaps = live_net_gaps(&standings, laps, lap_dist_pcts, &trackers.lap_curve, my_car_class_id);
+    annotate_leader_gaps(&mut standings, &net_gaps);
     let mut endurance_meta = annotate_endurance(
         &mut standings,
         laps_remaining,
@@ -3249,6 +3250,50 @@ fn live_net_gaps(
         }
     }
     gaps
+}
+
+/// Publishes total class-leader deficits for GAP without changing any legacy
+/// same-lap/F2 or NET inputs.
+///
+/// Fresh scorer Time values are total deficits to one overall origin, so
+/// subtracting the classified class leader's value preserves lapped distance.
+/// A local progress value is only a fallback and is explicitly marked as an
+/// estimate. In particular, a missing value never becomes a zero gap.
+fn annotate_leader_gaps(standings: &mut [StandingsEntry], live_gaps: &HashMap<i32, f32>) {
+    let mut scoring_origin: HashMap<i32, f32> = HashMap::new();
+    let mut live_origin: HashMap<i32, f32> = HashMap::new();
+    for entry in standings.iter().filter(|entry| entry.class_position == 1) {
+        if let Some(gap) = entry.scoring_gap_to_leader_secs.filter(|gap| gap.is_finite() && *gap >= 0.0) {
+            scoring_origin.insert(entry.car_class_id, gap);
+        }
+        if let Some(gap) = live_gaps.get(&entry.car_idx).copied().filter(|gap| gap.is_finite() && *gap >= 0.0) {
+            live_origin.insert(entry.car_class_id, gap);
+        }
+    }
+    for entry in standings {
+        let scorer_gap = scoring_origin
+            .get(&entry.car_class_id)
+            .and_then(|leader_gap| {
+                entry
+                    .scoring_gap_to_leader_secs
+                    .filter(|gap| gap.is_finite() && *gap >= 0.0)
+                    .map(|gap| gap - leader_gap)
+            })
+            .filter(|gap| gap.is_finite() && *gap >= 0.0)
+            // A lapped nonleader with zero scorer deficit is an incomplete
+            // classification value, never a total gap of zero.
+            .filter(|gap| entry.class_position == 1 || entry.laps_down == 0 || *gap > 0.0)
+            .map(|secs| LeaderGap { secs, estimated: false });
+        // live_net_gaps is measured from the furthest visible class car. It
+        // must be rebased to the classified leader, and has no usable origin
+        // at all while that leader is unavailable.
+        let live_gap = live_origin
+            .get(&entry.car_class_id)
+            .and_then(|origin| live_gaps.get(&entry.car_idx).map(|gap| gap - origin))
+            .filter(|gap| gap.is_finite() && *gap >= 0.0)
+            .map(|secs| LeaderGap { secs, estimated: true });
+        entry.leader_gap = scorer_gap.or(live_gap);
+    }
 }
 
 /// The race's remaining laps, using whichever finish limit arrives first.
@@ -4217,6 +4262,7 @@ fn build_standings(
                     .filter(|&t| t > 0.0)
                     .unwrap_or(row.last_time),
                 gap_to_leader_secs: scoring_gap_to_leader_secs.unwrap_or(0.0),
+                leader_gap: None,
                 // Validated independently from YAML lap advances before NET.
                 // Raw F2 can remain frozen for an unavailable car.
                 scoring_gap_to_leader_secs: None,
@@ -6644,6 +6690,70 @@ mod tests {
     }
 
     #[test]
+    fn total_gap_uses_fresh_scoring_and_rebased_live_origins() {
+        let mut leader = test_entry(1, 20, 100.0);
+        leader.car_idx = 0;
+        leader.scoring_gap_to_leader_secs = Some(100.0);
+        let mut lapped = test_entry(1, 18, 100.0);
+        lapped.car_idx = 1;
+        lapped.class_position = 2;
+        lapped.laps_down = 2;
+        lapped.track_location = TrackLocation::NotInWorld;
+        lapped.scoring_gap_to_leader_secs = Some(365.5);
+        let mut missing = test_entry(1, 17, 100.0);
+        missing.car_idx = 2;
+        missing.class_position = 3;
+        missing.track_location = TrackLocation::NotInWorld;
+
+        let mut live_leader = test_entry(2, 20, 100.0);
+        live_leader.car_idx = 3;
+        let mut live_second = test_entry(2, 20, 100.0);
+        live_second.car_idx = 4;
+        live_second.class_position = 2;
+        // The classified leader is absent, while the visible rival is the
+        // live-progress origin. It must not be presented as class P1's zero.
+        let mut absent_leader = test_entry(3, 20, 100.0);
+        absent_leader.car_idx = 5;
+        absent_leader.track_location = TrackLocation::NotInWorld;
+        let mut visible_rival = test_entry(3, 20, 100.0);
+        visible_rival.car_idx = 6;
+        visible_rival.class_position = 2;
+        // Negative rebasing data is invalid, never clamped into a zero gap.
+        let mut invalid_leader = test_entry(4, 20, 100.0);
+        invalid_leader.car_idx = 7;
+        let mut invalid_rival = test_entry(4, 20, 100.0);
+        invalid_rival.car_idx = 8;
+        invalid_rival.class_position = 2;
+        let mut entries = vec![
+            leader,
+            lapped,
+            missing,
+            live_leader,
+            live_second,
+            absent_leader,
+            visible_rival,
+            invalid_leader,
+            invalid_rival,
+        ];
+        let live = HashMap::from([(3, 4.0), (4, 23.5), (6, 0.0), (7, 2.0), (8, 1.0)]);
+        annotate_leader_gaps(&mut entries, &live);
+
+        assert_eq!(entries[0].leader_gap, Some(LeaderGap { secs: 0.0, estimated: false }));
+        assert_eq!(
+            entries[1].leader_gap,
+            Some(LeaderGap { secs: 265.5, estimated: false }),
+            "the scorer total already contains two lapped laps"
+        );
+        assert_eq!(entries[2].leader_gap, None, "an absent car without fresh scorer data stays unknown");
+        assert_eq!(entries[3].leader_gap, Some(LeaderGap { secs: 0.0, estimated: true }));
+        assert_eq!(entries[4].leader_gap, Some(LeaderGap { secs: 19.5, estimated: true }));
+        assert_eq!(entries[5].leader_gap, None);
+        assert_eq!(entries[6].leader_gap, None, "a visible rival cannot become the absent classified leader");
+        assert_eq!(entries[7].leader_gap, Some(LeaderGap { secs: 0.0, estimated: true }));
+        assert_eq!(entries[8].leader_gap, None, "negative live rebase remains unknown");
+    }
+
+    #[test]
     fn an_unscored_race_still_produces_standings() {
         let mut info = SessionInfoCache::default();
         info.drivers.insert(0, test_driver(10, true));
@@ -6690,6 +6800,7 @@ mod tests {
             best_lap_secs,
             last_lap_secs: 0.0,
             gap_to_leader_secs: 0.0,
+            leader_gap: None,
             scoring_gap_to_leader_secs: None,
             net_gap_from_scoring: false,
             net_uses_estimated_stint: false,

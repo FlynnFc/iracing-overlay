@@ -165,6 +165,7 @@ try {
   Invoke-Shot -Name 'standings-full'      -Panel standings -State 'spectating' -PanelLines "spectator_full = true`nfull_rows = 8`nshow_other_classes = true"
   Invoke-Shot -Name 'standings-estimated' -Panel standings -State 'spectating,estimated' -PanelLines "spectator_full = true`nfull_rows = 8`nshow_other_classes = false"
   Invoke-Shot -Name 'standings-auto'      -Panel standings -PanelLines "gap_mode = 'auto'`ngap_auto_seconds = 5"
+  Invoke-Shot -Name 'standings-long-gaps' -Panel standings -State 'spectating,long-gaps,estimated' -PanelLines "spectator_full = true`nfull_rows = 8`nshow_other_classes = false`nendurance_mode = 'off'"
   Invoke-Shot -Name 'standings-team-strength' -Panel standings -State 'spectating,team-strength' -PanelLines "spectator_full = true`nfull_rows = 8`nshow_other_classes = false"
   Invoke-Shot -Name 'radar-default'       -Panel radar -Scale 0.6
   Invoke-Shot -Name 'radar-numbers'       -Panel radar -Scale 0.6 -PanelLines "show_numbers = true"

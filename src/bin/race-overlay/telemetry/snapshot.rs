@@ -171,6 +171,10 @@ pub struct StandingsEntry {
     pub last_lap_secs: f32,
     /// Gap to the session leader, in seconds.
     pub gap_to_leader_secs: f32,
+    /// Total elapsed deficit to this car's classified class leader. The
+    /// scorer value includes whole laps; it is never reconstructed by adding
+    /// the separate laps-down count to a same-lap gap.
+    pub leader_gap: Option<LeaderGap>,
     /// Global YAML ResultsPositions.Time deficit, validated by this car's
     /// completed-lap advance and bounded in age. NET can use it provisionally
     /// when a classified car lacks local live track progress. Raw F2 values
@@ -205,8 +209,8 @@ pub struct StandingsEntry {
     /// nothing about most of the field's races.
     pub is_class_fastest: bool,
     /// How many laps behind this class's leader this car is, or zero when on
-    /// the lead lap. Shown in place of a time gap, which is meaningless once
-    /// a car has been lapped.
+    /// the lead lap. A compact GAP suffix may show it alongside the total
+    /// elapsed class-leader deficit.
     pub laps_down: i32,
     /// The car's full display name, e.g. `"McLaren 720S GT3 EVO"`, used to
     /// pick a manufacturer mark (see `ui::logos`).
@@ -247,6 +251,17 @@ pub struct StandingsEntry {
     /// when it was there before the green. `None` outside races, and for a
     /// car not yet scored; see `telemetry::session::PositionChangeTracker`.
     pub race_position_change: Option<i32>,
+}
+
+/// A total class-leader deficit for the Standings GAP column.
+///
+/// A live progress calculation is useful when the official scorer has not
+/// published a fresh common origin, but remains an estimate. None means
+/// neither source could establish an honest total.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LeaderGap {
+    pub secs: f32,
+    pub estimated: bool,
 }
 
 /// One car class's summary, for the Standings widget's section headers.

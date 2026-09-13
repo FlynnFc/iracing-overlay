@@ -19,7 +19,7 @@ the user's existing settings file and rendered demo frames. It does not represen
 | Leader vanished or falsely showed TOW | A zero/missing live position sent an officially scored leader to the back; any mid-session `NotInWorld` transition started a fake tow clock. | Fall back to the official row's position when live scoring is unavailable. Remove rival absence-based tow detection. Only a positive player `PlayerCarTowTime` supplies a confirmed TOW countdown. |
 | NET after early stops | Stale scoring gaps could disagree with a newly paid stop; incomplete fields and mixed gap reference points could promote an unrendered car or a visible follower incorrectly. | Forecast all expected remaining stops through the finish. Use complete live class progress when available; otherwise use a consistent scorer source for the entire class and mark it `~NET`. Include transit plus service once. |
 | SOF changed during the race | It was recalculated from changing visible/classified subsets. | Latch each class's estimate from the session roster once every listed competitor has a usable iRating. Renderer changes and subsequent driver swaps cannot move it. |
-| GAP over whole laps | Leader gaps such as `1L` obscured the interval between adjacent classified cars. | Persisted class-leader, next-classified and automatic modes. Auto alternates GAP/INT every configured 1?120 seconds (five by default). |
+| GAP over whole laps | Lap-only gaps hid the total time deficit and the interval between adjacent classified cars. | GAP shows total time in seconds, minutes or hours with a muted lap label. Fresh scorer totals keep the class-leader reference; live fallbacks are marked `~` and require that leader. Auto alternates GAP/INT every 1 to 120 seconds (five by default). |
 | Relative numbers vibrated | Interpolated row coordinates could leave numeric glyphs between physical pixels, especially at fractional scale. | Snap numeric baselines to physical pixels and finish/snap tiny row movements. Names/icons keep their usual rendering. The code path is fixed; the original race-time symptom has not been reproduced live. |
 | Relative presentation | Driver name consumed a separate line; status frame included the external badges and crossed its label. | Inline driver name beside SOF, frame around the card only, label above it. Confirmed pit exits show `OUT` until the next lap crossing. |
 | Settings and binds reset | Deserializing numeric customer-ID keys under `[danger]` through `toml::Value` failed and discarded the entire configuration. | Explicitly parse TOML string keys as customer IDs. The existing file now loads the saved width 580, scale 0.9, three rows ahead/behind, all seven binds and one danger mark. |
@@ -102,8 +102,8 @@ freshness and command non-replay. Config regressions cover numeric danger keys, 
 concurrent edits and removals. The real saved file was inspected through `--check-config` without exposing
 sync credentials. Rendered QA uses a temporary APPDATA, so preview runs cannot alter the user's settings.
 
-- `cargo test -q --all-targets`: 655 overlay tests and nine shared-library tests passed.
-- `cargo test -q --all-targets --no-default-features`: 653 overlay tests and nine shared-library tests passed.
+- `cargo test -q --all-targets`: 659 overlay tests and nine shared-library tests passed.
+- `cargo test -q --all-targets --no-default-features`: 657 overlay tests and nine shared-library tests passed.
 - `cargo clippy --all-targets --no-default-features -- -D warnings`: passed without warnings.
 - `cargo fmt --all --check`: passed.
 - Optimized unlicensed candidate builds in `target/endurance-build/release/`, with the review package
@@ -115,7 +115,8 @@ Rendered examples: [OUT badge](features/img/relative-outlap.png),
 [full spectator standings](features/img/standings-full.png),
 [estimated stints](features/img/standings-estimated.png),
 [team-driver strength](features/img/standings-team-strength.png), and
-[automatic GAP/INT](features/img/standings-auto.png).
+[automatic GAP/INT](features/img/standings-auto.png), and
+[total leader gaps](features/img/standings-long-gaps.png).
 
 ## Live rehearsal
 
