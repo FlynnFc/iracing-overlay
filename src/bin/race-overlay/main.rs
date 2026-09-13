@@ -110,7 +110,7 @@ fn run_early_diagnostic() -> bool {
 /// Starts the ordinary overlay after no command-line diagnostic was selected.
 fn start_overlay() {
     let demo = std::env::args().any(|arg| arg == "--demo");
-    let demo_states = demo_states();
+    let mut demo_states = demo_states();
     // Reproducible settings previews, e.g. --demo --demo-settings=standings
     // --screenshot=settings.png. This flag never opens settings in a live run.
     let demo_settings = std::env::args().find_map(|arg| arg.strip_prefix("--demo-settings=").map(str::to_owned));
@@ -124,6 +124,13 @@ fn start_overlay() {
             }
             page
         });
+
+    if demo
+        && demo_page == Some(ui::blackbox::Page::Stints)
+        && !demo_states.iter().any(|state| state == "stints" || state.starts_with("handover"))
+    {
+        demo_states.push("stints".to_owned());
+    }
 
     // `--screenshot=<path>` writes one rendered frame to a PNG and quits.
     // The overlay's window is layered and drawn by OpenGL, which every

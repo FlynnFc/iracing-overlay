@@ -335,14 +335,14 @@ impl Page {
     }
 
     /// Whether this page has anything honest to show from `seat`; see
-    /// [`pages_for`].
-    fn available_from(self, seat: &Seat, synced: Option<&crate::sync::store::SyncedCar>) -> bool {
+    /// [`configured_pages`].
+    fn available_from(self, seat: &Seat, synced: Option<&crate::sync::store::SyncedCar>, stints: bool) -> bool {
         let spectating = matches!(seat, Seat::Spectating(_) | Seat::TeamMate(_));
         match self {
             // The Relative follows whichever car is being watched, and the
             // weather is the session's.
             Self::Relative | Self::Weather => true,
-            Self::Stints => crate::iraceplan::available(),
+            Self::Stints => stints,
             // The stop plan is about the player's own race, whoever is
             // driving it — and, while spectating, the team car's, once sync is
             // feeding its fuel. The traffic and pace it also reads come from
@@ -472,12 +472,21 @@ impl PageSet {
 /// about the seat itself — tyres, in-car — step aside until the player is
 /// back in it.
 #[must_use]
+#[cfg(test)]
 pub fn pages_for(snapshot: Option<&TelemetrySnapshot>, synced: Option<&crate::sync::store::SyncedCar>) -> PageSet {
+    pages_with_stints(snapshot, synced, crate::iraceplan::available(snapshot))
+}
+
+fn pages_with_stints(
+    snapshot: Option<&TelemetrySnapshot>,
+    synced: Option<&crate::sync::store::SyncedCar>,
+    stints: bool,
+) -> PageSet {
     let driving = Seat::Driving;
     let seat = snapshot.map_or(&driving, |s| &s.seat);
     let mut offered = 0_u16;
     for page in Page::ALL {
-        if page.available_from(seat, synced) {
+        if page.available_from(seat, synced, stints) {
             offered |= 1 << page.ordinal();
         }
     }
@@ -490,8 +499,9 @@ pub fn configured_pages(
     snapshot: Option<&TelemetrySnapshot>,
     synced: Option<&crate::sync::store::SyncedCar>,
     config: &crate::config::BlackBoxConfig,
+    session: Option<&TelemetrySnapshot>,
 ) -> PageSet {
-    let mut pages = pages_for(snapshot, synced);
+    let mut pages = pages_with_stints(snapshot, synced, crate::iraceplan::available(session));
     let mut seen = 0_u16;
     let mut index = 0;
     for page in config.page_order.iter().copied().chain(Page::ALL) {
@@ -3484,11 +3494,21 @@ mod tests {
 
     #[test]
     fn connected_stints_page_participates_in_wheel_order() {
-        let mut pages = pages_for(None, None);
-        pages.mask |= 1 << Page::Stints.ordinal();
+        let pages = pages_with_stints(None, None, true);
         assert_eq!(pages.stepped(Page::Weather, 1), Page::Stints);
         assert_eq!(pages.stepped(Page::Stints, 1), Page::Relative);
         assert_eq!(pages.stepped(Page::Relative, -1), Page::Stints);
+    }
+
+    #[test]
+    fn leaving_the_matching_session_hides_stints_and_moves_to_relative() {
+        let mut black_box = BlackBox::showing(Page::Stints);
+        assert_eq!(black_box.settle_page(pages_with_stints(None, None, true)), Page::Stints);
+        let unavailable = pages_with_stints(None, None, false);
+        assert!(!unavailable.contains(Page::Stints));
+        assert_eq!(black_box.settle_page(unavailable), Page::Relative);
+        assert_eq!(unavailable.stepped(Page::Weather, 1), Page::Relative);
+        assert!(!configured_pages(None, None, &crate::config::BlackBoxConfig::default(), None).contains(Page::Stints));
     }
 
     /// No snapshot at all is a driver's view.

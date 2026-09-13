@@ -977,13 +977,19 @@ impl OverlayApp {
         if let Some(page) = preview_page {
             preview_config.hidden_pages.retain(|hidden| *hidden != page);
         }
-        let pages = blackbox::configured_pages(latest, synced.as_ref(), &preview_config);
+        let pages = blackbox::configured_pages(
+            latest, synced.as_ref(), &preview_config, self.fresh_snapshot(Instant::now()),
+        );
         let black_box = if preview_page.is_some() { &mut self.preview_black_box } else { &mut self.black_box };
         black_box.settle_page(pages);
         let handover_synced = self.team_sync.synced_car();
         let mut layout = blackbox::layout_for(
             black_box.page(),
-            if black_box.page() == blackbox::Page::Stints && !telemetry_fresh { None } else { latest },
+            if black_box.page() == blackbox::Page::Stints {
+                self.latest.as_ref().filter(|_| telemetry_fresh)
+            } else {
+                latest
+            },
             &self.config.blackbox,
             black_box.auto_fuel_litres(),
             black_box.box_called(),
@@ -1240,6 +1246,9 @@ impl EguiOverlay for OverlayApp {
             self.demo || self.latest_at.is_some_and(|at| now.saturating_duration_since(at) < SNAPSHOT_STALE);
         let sync_snapshot = self.latest.as_ref().filter(|_| telemetry_fresh);
         self.team_sync.update(&sync_config, sync_snapshot, now);
+        if !self.demo {
+            crate::iraceplan::observe_session(self.fresh_snapshot(now));
+        }
         if self.demo {
             self.team_sync.refresh_demo(now);
         }
@@ -1331,7 +1340,9 @@ impl EguiOverlay for OverlayApp {
         // so its controls build correct requests from the driver's real fuel.
         let bb_snapshot = self.synced_blackbox_snapshot();
         let bb = bb_snapshot.as_ref().or(self.latest.as_ref());
-        let pages = blackbox::configured_pages(bb, synced.as_ref(), &self.config.blackbox);
+        let pages = blackbox::configured_pages(
+            bb, synced.as_ref(), &self.config.blackbox, self.fresh_snapshot(Instant::now()),
+        );
         self.black_box.settle_page(pages);
 
         let binds = self.config.binds.pairs();

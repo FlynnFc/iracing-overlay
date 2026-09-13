@@ -230,7 +230,9 @@ of rival strategy; see [the calculation and its limits](docs/net-position.md).
 
 ## iRacePlan stints & handovers
 
-Choose a race and strategy in **Settings > Black Box > Content** to add the **Stints** page.
+Join an iRacing session and the overlay automatically checks iRacePlan for its stint plan.
+**Stints** appears when the event's track, team, car and dates match. It uses the strategy named in
+iRacePlan's schedule, with no race or strategy selection required.
 It shows the current or upcoming driver, planned end/start countdown, fuel target versus measured burn,
 next driver change, and the next three stints on a time-based board. The right-hand card gives the
 incoming driver, estimated change time, laps remaining and Ready status their own space. Times use
@@ -271,7 +273,11 @@ team-sync fuel with your fuel reserve. Without live fuel, it explicitly says **P
 
 </details>
 
-The plan refreshes every 30 seconds. Estimated times stay in the overlay: the documented API does not
+Every new session gets one schedule check, followed by details for any matching candidates.
+A detected plan refreshes every 30 seconds. With no match, Stints stays hidden and there are no
+further background requests until another join. Disconnecting also hides Stints and stops requests.
+Tabs and redraws never make requests.
+Estimated times stay in the overlay: the documented API does not
 support strategy edits, so revise the website plan in iRacePlan. All teammates and the relay need sync
 protocol **9** for shared Ready. See [connection setup and estimate limits](docs/iraceplan.md).
 
@@ -441,7 +447,7 @@ panel behind the window is the preview — and are saved once they settle.
 | Logos | Manufacturer mark style and colour, with every known brand drawn as it will appear and a per-brand override. |
 | Radar Bars | Car length, range in car lengths and in time, bar size, the gap between the capsules, gaps in metres. |
 | Faster Class | Visibility, scale, warn/alert gaps and flash. |
-| Black Box | Page order and visibility, Auto Fuel and its margin, tyre bar mode, and the iRacePlan connection with race/strategy selection. |
+| Black Box | Page order and visibility, Auto Fuel and its margin, tyre bar mode, and automatic iRacePlan detection and API-key settings. |
 | Team Sync | On/off, **host the relay from this PC** and its port, relay URL, invite code, and the pit-control consent. |
 | Binds | One row per wheel action, with press-to-capture. A control already bound elsewhere is taken anyway and the clash shown on both rows. |
 | Launcher | The programs to start with the overlay. |

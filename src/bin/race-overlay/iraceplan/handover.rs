@@ -13,6 +13,7 @@ const ALERT_LAPS: f64 = 3.0;
 
 /// A labelled demo on the incoming driver's spectator screen; no network or writes.
 pub fn seed_demo(snapshot: &mut TelemetrySnapshot) {
+    snapshot.identity.subsession = Some(1);
     snapshot.identity.track_id = Some(341);
     snapshot.identity.team_id = Some(1);
     snapshot.identity.player_cust_id = Some(2);
@@ -116,7 +117,14 @@ pub fn current(
     let snapshot = snapshot?;
     let feed = super::feed();
     let plan = feed.plan.as_ref()?;
-    let mut handover = evaluate(plan, Utc::now(), snapshot, synced, reserve_laps)?;
+    if feed.subsession != snapshot.identity.subsession {
+        return None;
+    }
+    let now = Utc::now();
+    if !super::session::Context::from_snapshot(snapshot).is_some_and(|context| context.matches(plan, now)) {
+        return None;
+    }
+    let mut handover = evaluate(plan, now, snapshot, synced, reserve_laps)?;
     handover.stale = feed.stale();
     if handover.stale {
         "PLAN STALE · verify handover with crew".clone_into(&mut handover.detail);
@@ -138,7 +146,11 @@ pub fn plan_car<'a>(plan: &Plan, snapshot: &'a TelemetrySnapshot) -> Option<&'a 
     }
     let matches = |car: &&CarSnapshot| {
         let team = car.team_id.or_else(|| car.is_focus.then_some(snapshot.identity.team_id).flatten());
-        team == Some(plan.planning.registrable.iracing_id) && car.car_screen_name.as_ref() == plan.planning.car
+        let registrable = match plan.planning.kind {
+            super::Registration::Team => team,
+            super::Registration::Individual => car.cust_id,
+        };
+        registrable == Some(plan.planning.registrable.iracing_id) && car.car_screen_name.as_ref() == plan.planning.car
     };
     let focus = snapshot.relative.get(snapshot.focus_index).filter(matches);
     focus.or_else(|| (snapshot.seat != Seat::Driving).then(|| snapshot.relative.iter().find(matches)).flatten())

@@ -1,6 +1,7 @@
 # iRacePlan Stints and handovers
 
-The Black Box gains a **Stints** page after the selected strategy loads. It shows
+The Black Box automatically finds the current session's iRacePlan event and shows
+**Stints** when it has a matching stint plan. It shows
 current/upcoming driver, planned start/end and countdown, driver fuel target versus
 measured burn, next driver change, and the next three stints. Driver colours connect the current
 card, incoming-driver countdown and a time-based calendar. Planned stint blocks
@@ -11,10 +12,11 @@ stints remain separate blocks. Times use the computer's local timezone.
 
 ## Connection
 
-Open **Settings > Black Box > Content**, enable iRacePlan, choose **Find my team
-races**, select a race and strategy by name, then save the connection. Manual IDs
-remain available. Selection is explicit so an alternative strategy cannot silently
-replace the chosen one.
+Detection is enabled by default and uses the key supplied with the build or your
+saved credential. Join iRacing and the overlay looks for that event in iRacePlan.
+There is no race or strategy selector: it uses the stint strategy named in the
+website's schedule. **Settings > Black Box > Content** lets you disable detection
+or save a different API key.
 
 Credentials are resolved in this order: runtime `IRACEPLAN` environment variable,
 Windows Credential Manager entry `race-overlay/iraceplan`, then the bundled key.
@@ -22,20 +24,45 @@ A blank password field preserves the saved credential. The GitHub release workfl
 builds with `--features bundled-iraceplan` and the repository secret `IRACEPLAN`.
 The key is deliberately embedded for shared team setup and is recoverable from the
 binary. Ordinary builds without that feature do not embed it. No key is stored in
-source, the selection file, or team sync.
+source, the settings file, or team sync.
 
-Selection lives in `%APPDATA%\race\iraceplan.toml`:
+The enable switch lives in `%APPDATA%\race\iraceplan.toml`:
 
 ```toml
 enabled = true
-planning_id = 123
-strategy_id = 456
 ```
 
-The background connection reads the selected planning every 30 seconds with a
-10-second timeout. Failed updates retain a visibly **STALE** plan; changing the
-selection clears it on the next poll. Disabling the connection removes the page
-and stops requests. Settings reload while the overlay runs.
+Old `planning_id` and `strategy_id` settings are ignored.
+
+Matching uses the track/configuration ID, team ID (or driver ID for an individual
+entry), car name and event dates. The
+event window includes 30 minutes before and after the API's session times, or the
+stint schedule if session times are absent. This allows the event's practice and
+qualifying sessions. Spectators can watch another car as long as the planned team
+car is present. The matched plan is tied to the current iRacing room, so a cached
+plan cannot appear in another room before its discovery check. An event's name
+alone is insufficient to distinguish different teams, circuits or race dates.
+
+There are no background API requests while disconnected. Each new join makes one
+schedule request covering the previous seven days and the next 30 minutes, so a
+24-hour race remains discoverable when joining on its second day. Unlike the
+planning-history list, this endpoint is not restricted to the 100 most recently
+created plans. The overlay fetches details only for entries with a stint strategy,
+an applicable event time and a matching car, then verifies the track and team IDs.
+No match means no further requests until another join. If multiple plans match,
+the page stays hidden and settings report the duplicate plans to resolve on the
+website. Only a confirmed match starts the 30-second refresh, with a 10-second
+request timeout. Leaving, losing telemetry or joining an unrelated session hides
+Stints, moves an open Stints page back to an available page, and stops refreshes.
+A request already in flight may finish. Opening tabs and repainting use cached
+data and never trigger requests.
+
+Failed updates during a matching session retain a visibly **STALE** plan. A failed
+initial discovery is not retried until another join or an explicit connection
+save. Refreshes read only the detected planning and retain its scheduled strategy
+ID for that room. Saving the connection reruns discovery when a session is present.
+Disabling the connection removes the page and stops requests.
+Settings reload while the overlay runs.
 
 ## Handover and Ready
 
@@ -79,5 +106,6 @@ race-overlay.exe --demo --demo-page=stints --demo-state=handover --screenshot=ha
 ```
 
 The demo uses synthetic drivers and a labelled demo plan, without API requests.
-Automated tests cover estimate fallbacks, repeated stints, camera changes, Ready
-clicks and relay replay. A live race remains the final operational validation.
+Automated tests cover automatic event and strategy discovery, session matching and refresh transitions, tab withdrawal,
+estimate fallbacks, repeated stints, camera changes, Ready clicks and relay replay.
+A live race remains the final operational validation.
